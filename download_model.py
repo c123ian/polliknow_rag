@@ -1,6 +1,6 @@
-# ---
+# ----
 # args: ["--force-download"]
-# ---
+# ----
 import modal
 app = modal.App("my_App_chatbot")
 
