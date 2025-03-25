@@ -83,7 +83,7 @@ image = modal.Image.debian_slim(python_version="3.10") \
         "torch"
     )
 # already created via embedding_colpali.py
-# bee_volume = modal.Volume.from_name("bee_pdfs", create_if_missing=True)
+bee_volume = modal.Volume.from_name("bee_pdfs", create_if_missing=False)
 
 try:
     db_volume = modal.Volume.lookup("db_data", create_if_missing=True)
