@@ -19,9 +19,9 @@ from colpali_engine.models import ColQwen2, ColQwen2Processor
 # Constants
 MODELS_DIR = "/Qwen"
 MODEL_NAME = "Qwen2.5-7B-Instruct-1M"
-DATA_DIR = "/bee_pdfs"
-UPLOADED_PDFS_DIR = "/bee_pdfs/uploaded_pdfs"
-PDF_IMAGES_DIR = "/bee_pdfs/pdf_images"
+DATA_DIR = "/bee_pdf"
+UPLOADED_PDFS_DIR = "/bee_pdf/uploaded_pdfs"
+PDF_IMAGES_DIR = "/bee_pdf/pdf_images"
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 COLPALI_MODEL_NAME = "vidore/colqwen2-v1.0"  # Added ColPali model name
 USERNAME = "c123ian"
@@ -83,7 +83,7 @@ image = modal.Image.debian_slim(python_version="3.10") \
         "torch"
     )
 # already created via embedding_colpali.py
-bee_volume = modal.Volume.from_name("bee_pdfs", create_if_missing=False)
+bee_volume = modal.Volume.from_name("bee_pdf", create_if_missing=False)
 
 try:
     db_volume = modal.Volume.lookup("db_data", create_if_missing=True)
@@ -154,7 +154,7 @@ def serve_vllm():
         tokenizer=tokenizer_path,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.95,
-        max_model_len=367584
+        max_model_len=94192
     )
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -570,10 +570,10 @@ def serve_fasthtml():
             # Calculate similarities with all pages
             similarities = []
             for idx, page_emb in enumerate(colpali_embeddings):
-                # Convert page embedding to tensor
-                page_tensor = torch.tensor(page_emb, device=colpali_model.device)
+                # Convert page embedding to tensor with matching dtype to the query embeddings
+                page_tensor = torch.tensor(page_emb, device=colpali_model.device, dtype=query_embeddings.dtype)
                 
-                # Score using ColPali's scoring method
+                # Score using ColPali's native scoring method
                 score = float(colpali_processor.score_multi_vector(
                     query_embeddings,
                     page_tensor.unsqueeze(0)  # Add batch dimension
@@ -702,7 +702,7 @@ Conversation History:
 Assistant:"""
 
         system_prompt = (
-            "You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question."
+            "You are an ecologist assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question."
             "If you don't know the answer, just say that you don't know."
             "Use three sentences maximum and keep the answer concise."
         )
