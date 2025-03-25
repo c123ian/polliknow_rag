@@ -61,7 +61,7 @@ try:
 except modal.exception.NotFoundError:
     raise Exception("Download models first with the appropriate script")
 
-# Update: add colpali-engine to the install list
+# Update: add colpali-engine with interpretability extras to the install list
 image = modal.Image.debian_slim(python_version="3.10") \
     .pip_install(
         "vllm==0.7.2",
@@ -79,8 +79,9 @@ image = modal.Image.debian_slim(python_version="3.10") \
         "nltk",
         "sqlalchemy",
         "pdf2image",
-        "colpali-engine",  # Add ColPali dependency
-        "torch"
+        "colpali-engine[interpretability]",  # Add interpretability extras
+        "torch",
+        "matplotlib"
     )
 # already created via embedding_colpali.py
 bee_volume = modal.Volume.from_name("bee_pdf", create_if_missing=False)
@@ -271,10 +272,15 @@ def serve_fasthtml():
     from rank_bm25 import BM25Okapi
     from fastapi.responses import FileResponse, Response, HTMLResponse
     from io import BytesIO
-    import base64
     from PIL import Image
     from pdf2image import convert_from_path
     from colpali_engine.models import ColQwen2, ColQwen2Processor
+    from colpali_engine.interpretability import (
+        get_similarity_maps_from_embeddings,
+        plot_similarity_map,
+        plot_all_similarity_maps
+    )
+    from matplotlib import pyplot as plt
 
     NLTK_DATA_DIR = "/tmp/nltk_data"
     os.makedirs(NLTK_DATA_DIR, exist_ok=True)
@@ -461,18 +467,64 @@ def serve_fasthtml():
         
         return Response(content="Image not found", media_type="text/plain", status_code=404)
 
-    def chat_top_sources(top_sources):
-        carousel_items = [
-            Div(
-                Img(
-                    src=f"/pdf-image/{source['image_key']}",
-                    cls="w-full rounded-lg border border-zinc-700"
-                ),
-                id=f"item{i+1}",
-                cls="carousel-item w-full"
+    # Add new endpoint for serving heatmap images
+    @fasthtml_app.get("/heatmap-image/{filename}")
+    async def get_heatmap_image(filename: str):
+        heatmap_dir = os.path.join(PDF_IMAGES_DIR, "heatmaps")
+        heatmap_path = os.path.join(heatmap_dir, filename)
+        
+        if os.path.exists(heatmap_path):
+            return FileResponse(heatmap_path, media_type="image/png")
+        else:
+            return Response(content="Heatmap not found", media_type="text/plain", status_code=404)
+
+    def chat_top_sources(top_sources, heatmap_paths=None):
+        if heatmap_paths is None:
+            heatmap_paths = {}
+        
+        carousel_items = []
+        
+        for i, source in enumerate(top_sources):
+            image_key = source['image_key']
+            
+            # Create the main document image
+            doc_image = Img(
+                src=f"/pdf-image/{image_key}",
+                cls="w-full rounded-lg border border-zinc-700"
             )
-            for i, source in enumerate(top_sources)
-        ]
+            
+            carousel_item = [doc_image]
+            
+            # Add heatmaps if available
+            if image_key in heatmap_paths and heatmap_paths[image_key]:
+                heatmap_section = Div(
+                    H3("Query Token Heatmaps", cls="text-sm text-zinc-400 font-semibold mt-2"),
+                    cls="w-full"
+                )
+                
+                heatmap_images = Div(cls="flex flex-wrap justify-center gap-2 mt-2")
+                
+                for heatmap in heatmap_paths[image_key]:
+                    heatmap_img = Div(
+                        Img(
+                            src=f"/heatmap-image/{heatmap['path']}",
+                            cls="w-32 h-32 rounded border border-zinc-700"
+                        ),
+                        P(f"'{heatmap['token']}' ({heatmap['score']:.2f})", cls="text-xs text-center"),
+                        cls="flex flex-col items-center"
+                    )
+                    heatmap_images.append(heatmap_img)
+                
+                heatmap_section.append(heatmap_images)
+                carousel_item.append(heatmap_section)
+            
+            carousel_items.append(
+                Div(
+                    *carousel_item,
+                    id=f"item{i+1}",
+                    cls="carousel-item w-full"
+                )
+            )
 
         # Navigation buttons for each image
         carousel_controls = Div(
@@ -573,7 +625,7 @@ def serve_fasthtml():
                 # Convert page embedding to tensor with matching dtype to the query embeddings
                 page_tensor = torch.tensor(page_emb, device=colpali_model.device, dtype=query_embeddings.dtype)
                 
-                # Score using ColPali's native scoring method
+                # Score using ColPali's scoring method
                 score = float(colpali_processor.score_multi_vector(
                     query_embeddings,
                     page_tensor.unsqueeze(0)  # Add batch dimension
@@ -612,6 +664,162 @@ def serve_fasthtml():
             # Use the top results for context
             final_top_sources = top_sources_data[:3]
             context = "\n\n".join(retrieved_paragraphs[:3])
+            
+            # For each top retrieved page, generate similarity heatmaps
+            heatmap_paths = {}
+            if using_colpali:
+                # Create a directory for heatmaps if it doesn't exist
+                heatmap_dir = os.path.join(PDF_IMAGES_DIR, "heatmaps")
+                os.makedirs(heatmap_dir, exist_ok=True)
+                
+                # Process the query tokens
+                query_tokens = colpali_processor.tokenizer.tokenize(msg)
+                
+                for source in final_top_sources:
+                    try:
+                        image_key = source['image_key']
+                        image_path = page_images[image_key]
+                        
+                        # Load the original image
+                        image = Image.open(image_path)
+                        
+                        # For ColQwen2, let's directly use the number of image tokens
+                        # rather than calculating patches manually
+                        
+                        # Get the number of patches from the batch_images input_ids
+                        input_shape = batch_images.pixel_values.shape
+                        batch_size, num_channels, height, width = input_shape
+                        
+                        # Calculate a reasonable grid size that approximates the sqrt of tokens
+                        # ColQwen2 uses a different approach - the embeddings are 1D flattened
+                        num_tokens = batch_images.attention_mask.sum().item()
+                        grid_size = int(round(num_tokens ** 0.5))
+                        
+                        # Create a grid shape that's more representative of the aspect ratio
+                        aspect_ratio = width / height
+                        grid_height = int(round(grid_size / aspect_ratio ** 0.5))
+                        grid_width = int(round(grid_size * aspect_ratio ** 0.5))
+                        
+                        # Make sure the total is close to the number of tokens
+                        while grid_height * grid_width > num_tokens:
+                            if grid_height > grid_width:
+                                grid_height -= 1
+                            else:
+                                grid_width -= 1
+                        
+                        n_patches = (grid_height, grid_width)
+                        logging.info(f"Using grid size {n_patches} for image with {num_tokens} tokens")
+                        
+                        # Get image mask
+                        batch_images = colpali_processor.process_images([image]).to(colpali_model.device)
+                        image_mask = colpali_processor.get_image_mask(batch_images)
+                        
+                        # Forward pass for the image
+                        with torch.no_grad():
+                            image_embeddings = colpali_model(**batch_images)
+                        
+                        try:
+                            # Generate similarity maps
+                            batched_similarity_maps = get_similarity_maps_from_embeddings(
+                                image_embeddings=image_embeddings,
+                                query_embeddings=query_embeddings,
+                                n_patches=n_patches,
+                                image_mask=image_mask,
+                            )
+                        except Exception as e:
+                            logging.error(f"Error in get_similarity_maps_from_embeddings: {e}")
+                            # Fallback approach: Generate a simple heatmap without using similarity maps
+                            # This won't have token-specific highlighting but will at least show the image
+                            batched_similarity_maps = None
+                        
+                        image_heatmaps = []
+                        
+                        if batched_similarity_maps is not None:
+                            try:
+                                # Get the similarity map for our image
+                                similarity_maps = batched_similarity_maps[0]  # (query_length, n_patches_x, n_patches_y)
+                                
+                                # Calculate maximum similarity score for each token
+                                token_sims = []
+                                stopwords = set(["<bos>", "<eos>", "<pad>", "a", "an", "the", "in", "on", "at", "of", "for", "with", "by", "to", "from"])
+                                
+                                for token_idx, token in enumerate(query_tokens):
+                                    # Skip tokens that are just part of words or stopwords
+                                    if token in stopwords or len(token) <= 1:
+                                        continue
+                                        
+                                    token_clean = token[1:] if token.startswith("▁") else token
+                                    if token_clean and len(token_clean) > 1:
+                                        if token_idx < similarity_maps.shape[0]:  # Check if token index is within bounds
+                                            max_sim = similarity_maps[token_idx].max().item()
+                                            token_sims.append((token_idx, token, max_sim))
+                                
+                                # Sort by similarity score and take top 3
+                                token_sims.sort(key=lambda x: x[2], reverse=True)
+                                top_tokens = token_sims[:3]
+                                
+                                # Generate and save heatmaps
+                                for token_idx, token, score in top_tokens:
+                                    # Generate heatmap
+                                    fig, ax = plot_similarity_map(
+                                        image=image,
+                                        similarity_map=similarity_maps[token_idx],
+                                        figsize=(8, 8),
+                                        show_colorbar=False,
+                                    )
+                                    
+                                    # Set title
+                                    token_display = token[1:] if token.startswith("▁") else token
+                                    ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
+                                    
+                                    # Save the heatmap
+                                    heatmap_filename = f"{image_key}_token_{token_idx}.png"
+                                    heatmap_path = os.path.join(heatmap_dir, heatmap_filename)
+                                    fig.savefig(heatmap_path, bbox_inches='tight')
+                                    plt.close(fig)
+                                    
+                                    # Add to the list
+                                    image_heatmaps.append({
+                                        "token": token_display,
+                                        "score": score,
+                                        "path": heatmap_filename
+                                    })
+                            except Exception as e:
+                                logging.error(f"Error processing similarity maps: {e}")
+                        
+                        # If we couldn't generate proper heatmaps, create a fallback overlay
+                        if not image_heatmaps:
+                            try:
+                                # Create a simple overlay showing the document was retrieved
+                                fig, ax = plt.subplots(figsize=(8, 8))
+                                ax.imshow(image)
+                                ax.set_title(f"Retrieved for query: '{msg[:30]}...'", fontsize=12)
+                                ax.axis('off')
+                                
+                                # Add text annotation about the match
+                                ax.text(0.5, 0.95, f"Score: {source['semantic_score']:.2f}", 
+                                        transform=ax.transAxes, fontsize=10, ha='center',
+                                        bbox=dict(facecolor='white', alpha=0.8))
+                                
+                                # Save the basic overlay
+                                heatmap_filename = f"{image_key}_overview.png"
+                                heatmap_path = os.path.join(heatmap_dir, heatmap_filename)
+                                fig.savefig(heatmap_path, bbox_inches='tight')
+                                plt.close(fig)
+                                
+                                # Add to the list
+                                image_heatmaps.append({
+                                    "token": "Overview",
+                                    "score": source['semantic_score'],
+                                    "path": heatmap_filename
+                                })
+                            except Exception as e:
+                                logging.error(f"Error creating fallback overlay: {e}")
+                        
+                        # Store the heatmap information
+                        heatmap_paths[image_key] = image_heatmaps
+                    except Exception as e:
+                        logging.error(f"Error generating heatmap for {image_key}: {e}")
             
         else:
             # Original retrieval logic
@@ -675,6 +883,8 @@ def serve_fasthtml():
                 final_top_sources.append(source_info)
 
             context = "\n\n".join(retrieved_paragraphs[:2])
+            # Empty heatmap paths since we're not using ColPali
+            heatmap_paths = {}
 
         def build_conversation(messages, max_length=2000):
             conversation = ''
@@ -702,7 +912,7 @@ Conversation History:
 Assistant:"""
 
         system_prompt = (
-            "You are an ecologist assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question."
+            "You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question."
             "If you don't know the answer, just say that you don't know."
             "Use three sentences maximum and keep the answer concise."
         )
@@ -752,7 +962,8 @@ Assistant:"""
                     messages.append({"role": "assistant", "content": error_message})
                     await send(Div(chat_message(len(messages) - 1, messages=messages), id="messages", hx_swap_oob="beforeend"))
 
-        await send(Div(chat_top_sources(final_top_sources), id="top-sources", hx_swap_oob="innerHTML", cls="flex gap-4"))
+        # Update to pass heatmap paths to the chat_top_sources function
+        await send(Div(chat_top_sources(final_top_sources, heatmap_paths), id="top-sources", hx_swap_oob="innerHTML", cls="flex gap-4"))
         await send(chat_form(disabled=False))
 
     return fasthtml_app
