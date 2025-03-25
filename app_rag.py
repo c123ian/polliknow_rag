@@ -13,16 +13,19 @@ from starlette.middleware.sessions import SessionMiddleware
 import aiohttp
 import os
 import sqlite3
+import torch
+from colpali_engine.models import ColQwen2, ColQwen2Processor
 
 # Constants
 MODELS_DIR = "/Qwen"
 MODEL_NAME = "Qwen2.5-7B-Instruct-1M"
-FAISS_DATA_DIR = "/faiss_data_pdfs"
-UPLOADED_PDFS_DIR = "/faiss_data_pdfs/uploaded_pdfs"
-PDF_IMAGES_DIR = "/faiss_data_pdfs/pdf_images"
+DATA_DIR = "/bee_pdfs"
+UPLOADED_PDFS_DIR = "/bee_pdfs/uploaded_pdfs"
+PDF_IMAGES_DIR = "/bee_pdfs/pdf_images"
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+COLPALI_MODEL_NAME = "vidore/colqwen2-v1.0"  # Added ColPali model name
 USERNAME = "c123ian"
-APP_NAME = "rag"
+APP_NAME = "polliknow-rag"
 DATABASE_DIR = "/db_rag_advan"
 
 db_path = os.path.join(DATABASE_DIR, 'chat_history.db')
@@ -58,7 +61,7 @@ try:
 except modal.exception.NotFoundError:
     raise Exception("Download models first with the appropriate script")
 
-# Update: add pdf2image to the install list
+# Update: add colpali-engine to the install list
 image = modal.Image.debian_slim(python_version="3.10") \
     .pip_install(
         "vllm==0.7.2",
@@ -75,11 +78,12 @@ image = modal.Image.debian_slim(python_version="3.10") \
         "rank-bm25",
         "nltk",
         "sqlalchemy",
-        "pdf2image"
+        "pdf2image",
+        "colpali-engine",  # Add ColPali dependency
+        "torch"
     )
-
-# Replace the old faiss_volume definition with the new one
-faiss_volume = modal.Volume.from_name("faiss_data_pdfs", create_if_missing=True)
+# already created via embedding_colpali.py
+# bee_volume = modal.Volume.from_name("bee_pdfs", create_if_missing=True)
 
 try:
     db_volume = modal.Volume.lookup("db_data", create_if_missing=True)
@@ -90,7 +94,7 @@ app = modal.App(APP_NAME)
 
 @app.function(
     image=image,
-    gpu=modal.gpu.A100(count=1, size="40GB"),
+    gpu=modal.gpu.A10G(count=1),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=100,
@@ -168,17 +172,16 @@ def serve_vllm():
 
     models = OpenAIServingModels(engine_client=engine, model_config=model_config, base_model_paths={MODEL_NAME: model_path})
     request_logger = RequestLogger(max_log_len=256)
-    # openai_serving_chat = OpenAIServingChat(engine, model_config, models, "assistant", request_logger, None, "string")
 
     openai_serving_chat = OpenAIServingChat(
-    engine_client=engine,  # ✅ First positional argument
-    model_config=model_config,  # ✅ Second positional argument
-    models=models,  # ✅ Added models argument
-    response_role="assistant",  # ✅ Third positional argument
-    request_logger=request_logger,  # ✅ Fourth positional argument
-    chat_template=None,  
-    chat_template_content_format="string",  
-)
+        engine_client=engine,  # ✅ First positional argument
+        model_config=model_config,  # ✅ Second positional argument
+        models=models,  # ✅ Added models argument
+        response_role="assistant",  # ✅ Third positional argument
+        request_logger=request_logger,  # ✅ Fourth positional argument
+        chat_template=None,  
+        chat_template_content_format="string",  
+    )
 
     @web_app.post("/v1/completions")
     async def completion_generator(request: fastapi.Request) -> StreamingResponse:
@@ -240,7 +243,7 @@ def serve_vllm():
 @app.function(
     image=image,
     volumes={
-        FAISS_DATA_DIR: faiss_volume,
+        DATA_DIR: bee_volume,
         DATABASE_DIR: db_volume
     },
     secrets=[modal.Secret.from_name("my-custom-secret-3")]
@@ -271,6 +274,7 @@ def serve_fasthtml():
     import base64
     from PIL import Image
     from pdf2image import convert_from_path
+    from colpali_engine.models import ColQwen2, ColQwen2Processor
 
     NLTK_DATA_DIR = "/tmp/nltk_data"
     os.makedirs(NLTK_DATA_DIR, exist_ok=True)
@@ -278,9 +282,9 @@ def serve_fasthtml():
     nltk.download("punkt", download_dir=NLTK_DATA_DIR)
     nltk.download("punkt_tab", download_dir=NLTK_DATA_DIR)
 
-    print(f"Contents of FAISS_DATA_DIR ({FAISS_DATA_DIR}):")
-    if os.path.exists(FAISS_DATA_DIR):
-        print(f"  Directory exists, contains: {os.listdir(FAISS_DATA_DIR)}")
+    print(f"Contents of DATA_DIR ({DATA_DIR}):")
+    if os.path.exists(DATA_DIR):
+        print(f"  Directory exists, contains: {os.listdir(DATA_DIR)}")
     else:
         print(f"  Directory does not exist!")
 
@@ -290,19 +294,61 @@ def serve_fasthtml():
     else:
         print(f"  Directory does not exist!")
 
-    FAISS_INDEX_PATH = os.path.join(FAISS_DATA_DIR, "faiss_index.bin")
-    DATA_PICKLE_PATH = os.path.join(FAISS_DATA_DIR, "data.pkl")
-    PDF_PAGE_IMAGES_PATH = os.path.join(FAISS_DATA_DIR, "pdf_page_image_paths.pkl")
+    # Path definitions
+    # FAISS_INDEX_PATH = os.path.join(FAISS_DATA_DIR, "faiss_index.bin")
+    DATA_PICKLE_PATH = os.path.join(DATA_DIR, "data.pkl")
+    PDF_PAGE_IMAGES_PATH = os.path.join(DATA_DIR, "pdf_page_image_paths.pkl")
+    COLPALI_EMBEDDINGS_PATH = os.path.join(DATA_DIR, "colpali_embeddings.pkl")
 
-    print(f"Loading FAISS index from {FAISS_INDEX_PATH}")
-    print(f"  File exists: {os.path.exists(FAISS_INDEX_PATH)}")
-    index = faiss.read_index(FAISS_INDEX_PATH)
-
+    # Check if we're using ColPali embeddings
+    using_colpali = os.path.exists(COLPALI_EMBEDDINGS_PATH)
+    
+    if using_colpali:
+        print(f"Loading ColPali embeddings from {COLPALI_EMBEDDINGS_PATH}")
+        with open(COLPALI_EMBEDDINGS_PATH, "rb") as f:
+            colpali_embeddings = pickle.load(f)
+        print(f"Loaded {len(colpali_embeddings)} ColPali embeddings")
+        
+        # Load ColPali model for query embedding
+        print(f"Loading ColPali model ({COLPALI_MODEL_NAME})...")
+        colpali_model = ColQwen2.from_pretrained(
+            COLPALI_MODEL_NAME,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda" if torch.cuda.is_available() else "cpu"
+        ).eval()
+        colpali_processor = ColQwen2Processor.from_pretrained(COLPALI_MODEL_NAME)
+        print("ColPali model loaded successfully")
+    else:
+        print("ColPali embeddings not found")
+        # Load original embeddings with FAISS
+        #print(f"Loading FAISS index from {INDEX_PATH}")
+        #print(f"  File exists: {os.path.exists(FAISS_INDEX_PATH)}")
+        #index = faiss.read_index(FAISS_INDEX_PATH)
+        
+        # Load original embedding model
+        emb_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        
+        # Load BM25 index 
+        try:
+            with open(os.path.join(DATA_DIR, "bm25_index.pkl"), "rb") as f:
+                bm25_index = pickle.load(f)
+            with open(os.path.join(DATA_DIR, "tokenized_paragraphs.pkl"), "rb") as f:
+                tokenized_docs = pickle.load(f)
+        except Exception as e:
+            print(f"Error loading BM25 index: {e}")
+            def create_bm25_index(documents):
+                tokenized_docs = [word_tokenize(doc.lower()) for doc in documents]
+                bm25_index = BM25Okapi(tokenized_docs)
+                return bm25_index, tokenized_docs
+            docs = []
+            bm25_index, tokenized_docs = create_bm25_index(docs)
+    
+    # Load data frame with metadata
     print(f"Loading DataFrame from {DATA_PICKLE_PATH}")
     print(f"  File exists: {os.path.exists(DATA_PICKLE_PATH)}")
     df = pd.read_pickle(DATA_PICKLE_PATH)
-    docs = df['text'].tolist()
-
+    
+    # Load image paths
     print(f"Loading image paths from {PDF_PAGE_IMAGES_PATH}")
     print(f"  File exists: {os.path.exists(PDF_PAGE_IMAGES_PATH)}")
     page_images = {}
@@ -310,21 +356,9 @@ def serve_fasthtml():
         with open(PDF_PAGE_IMAGES_PATH, "rb") as f:
             page_images = pickle.load(f)
         print(f"  Loaded {len(page_images)} image paths")
-        for key, path in list(page_images.items())[:2]:
-            print(f"  Image key: {key}, path: {path}")
-            print(f"  Path exists: {os.path.exists(path)}")
     except Exception as e:
         print(f"  Error loading image paths: {e}")
         logging.error(f"Error loading PDF page images: {e}")
-
-    emb_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-    def create_bm25_index(documents):
-        tokenized_docs = [word_tokenize(doc.lower()) for doc in documents]
-        bm25_index = BM25Okapi(tokenized_docs)
-        return bm25_index, tokenized_docs
-
-    bm25_index, tokenized_docs = create_bm25_index(docs)
 
     fasthtml_app, rt = fast_app(
         hdrs=(
@@ -461,64 +495,7 @@ def serve_fasthtml():
             ),
             cls="w-full max-w-2xl mx-auto bg-zinc-800 rounded-md mt-6 p-6"
         )
-
-
-
-
-
-    @rt("/debug")
-    async def debug_info():
-        html = ["<h1>Debug Information</h1>"]
-        directories = [
-            FAISS_DATA_DIR,
-            PDF_IMAGES_DIR,
-            UPLOADED_PDFS_DIR
-        ]
-        html.append("<h2>Directories:</h2><ul>")
-        for directory in directories:
-            if os.path.exists(directory):
-                items = os.listdir(directory)
-                html.append(f"<li>✅ {directory}: {len(items)} items</li>")
-                html.append("<ul>")
-                for item in items[:10]:
-                    full_path = os.path.join(directory, item)
-                    is_dir = os.path.isdir(full_path)
-                    html.append(f"<li>{'📁' if is_dir else '📄'} {item}</li>")
-                if len(items) > 10:
-                    html.append(f"<li>... and {len(items) - 10} more</li>")
-                html.append("</ul>")
-            else:
-                html.append(f"<li>❌ {directory}: Not found</li>")
-        html.append("</ul>")
-
-        html.append("<h2>Image Paths:</h2>")
-        if page_images:
-            html.append(f"<p>Found {len(page_images)} image paths</p>")
-            html.append("<ul>")
-            for key, path in list(page_images.items())[:5]:
-                exists = os.path.exists(path)
-                html.append(f"<li>{key} → {path} {'✅' if exists else '❌'}</li>")
-            html.append("</ul>")
-
-            if page_images:
-                test_key = next(iter(page_images.keys()))
-                test_path = page_images[test_key]
-                html.append(f"<h3>Testing image: {test_key}</h3>")
-                if os.path.exists(test_path):
-                    try:
-                        with open(test_path, "rb") as img_file:
-                            img_data = img_file.read()
-                            base64_data = base64.b64encode(img_data).decode('utf-8')
-                            html.append("<p>✅ Image loaded successfully</p>")
-                            html.append(f'<img src="data:image/png;base64,{base64_data}" style="max-width:300px; border:1px solid #ccc;">')
-                    except Exception as e:
-                        html.append(f"<p>❌ Error reading image: {e}</p>")
-                else:
-                    html.append(f"<p>❌ Image not found at path: {test_path}</p>")
-        else:
-            html.append("<p>No image paths loaded</p>")
-
-        return HTMLResponse(content="<br>".join(html))
+       
 
     @rt("/")
     async def get(session):
@@ -529,7 +506,6 @@ def serve_fasthtml():
         return Div(
             H1("Chat with PDF Documents", cls="text-3xl font-bold mb-4 text-white"),
             Div(f"Session ID: {session_id}", cls="text-white mb-4"),
-            A("Debug Info", href="/debug", cls="text-blue-500 underline mb-4", target="_blank"),
             chat(session_id=session_id, messages=messages),
             Div(Span("Model status: "), Span("⚫", id="model-status-emoji"), cls="model-status text-white mt-4"),
             Div(id="top-sources"),
@@ -583,66 +559,122 @@ def serve_fasthtml():
         await send(chat_form(disabled=False))
         await send(Div(chat_message(message_index, messages=messages), id="messages", hx_swap_oob="beforeend"))
 
-        query_embedding = emb_model.encode([msg], normalize_embeddings=True).astype('float32')
-        K = 10
-        distances, indices = index.search(query_embedding, K)
-        tokenized_query = word_tokenize(msg.lower())
-        bm25_scores = bm25_index.get_scores(tokenized_query)
-        top_bm25_indices = np.argsort(bm25_scores)[-K:][::-1]
+        # Document retrieval section - use ColPali if available
+        if using_colpali:
+            # Process query with ColPali
+            logging.info("Using ColPali for query embedding...")
+            processed_query = colpali_processor.process_queries([msg]).to(colpali_model.device)
+            with torch.no_grad():
+                query_embeddings = colpali_model(**processed_query)
+            
+            # Calculate similarities with all pages
+            similarities = []
+            for idx, page_emb in enumerate(colpali_embeddings):
+                # Convert page embedding to tensor
+                page_tensor = torch.tensor(page_emb, device=colpali_model.device)
+                
+                # Score using ColPali's scoring method
+                score = float(colpali_processor.score_multi_vector(
+                    query_embeddings,
+                    page_tensor.unsqueeze(0)  # Add batch dimension
+                )[0])
+                
+                similarities.append((idx, score))
+            
+            # Sort by similarity and get top K
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            K = 10
+            top_indices = [idx for idx, _ in similarities[:K]]
+            
+            # Get documents based on top indices
+            retrieved_paragraphs = []
+            top_sources_data = []
+            
+            for rank, (idx, score) in enumerate(similarities[:K]):
+                if idx < len(df):
+                    filename = df.iloc[idx]['filename']
+                    page_num = df.iloc[idx]['page']
+                    image_key = df.iloc[idx]['image_key']
+                    paragraph_text = df.iloc[idx]['text']
+                    
+                    retrieved_paragraphs.append(paragraph_text)
+                    top_sources_data.append({
+                        'filename': filename,
+                        'page': page_num,
+                        'semantic_score': score,
+                        'keyword_score': 0.0,  # Not using BM25 anymore
+                        'combined_score': score,
+                        'image_key': image_key,
+                        'idx': idx,
+                        'reranker_score': score
+                    })
+            
+            # Use the top results for context
+            final_top_sources = top_sources_data[:3]
+            context = "\n\n".join(retrieved_paragraphs[:3])
+            
+        else:
+            # Original retrieval logic
+            query_embedding = emb_model.encode([msg], normalize_embeddings=True).astype('float32')
+            K = 10
+            distances, indices = index.search(query_embedding, K)
+            tokenized_query = word_tokenize(msg.lower())
+            bm25_scores = bm25_index.get_scores(tokenized_query)
+            top_bm25_indices = np.argsort(bm25_scores)[-K:][::-1]
 
-        all_candidate_indices = list(set(indices[0].tolist() + top_bm25_indices.tolist()))
+            all_candidate_indices = list(set(indices[0].tolist() + top_bm25_indices.tolist()))
 
-        retrieved_paragraphs = []
-        top_sources_data = []
-        docs_for_reranking = []
-        semantic_scores = {}
-        keyword_scores = {}
+            retrieved_paragraphs = []
+            top_sources_data = []
+            docs_for_reranking = []
+            semantic_scores = {}
+            keyword_scores = {}
 
-        for idx in all_candidate_indices:
-            paragraph_text = df.iloc[idx]['text']
-            pdf_filename = df.iloc[idx]['filename']
-            page_num = df.iloc[idx]['page']
-            image_key = df.iloc[idx]['image_key']
+            for idx in all_candidate_indices:
+                paragraph_text = df.iloc[idx]['text']
+                pdf_filename = df.iloc[idx]['filename']
+                page_num = df.iloc[idx]['page']
+                image_key = df.iloc[idx]['image_key']
 
-            if idx in indices[0]:
-                i = np.where(indices[0] == idx)[0][0]
-                semantic_score = float(1 - distances[0][i])
-                semantic_scores[idx] = semantic_score
-            else:
-                semantic_scores[idx] = 0.0
+                if idx in indices[0]:
+                    i = np.where(indices[0] == idx)[0][0]
+                    semantic_score = float(1 - distances[0][i])
+                    semantic_scores[idx] = semantic_score
+                else:
+                    semantic_scores[idx] = 0.0
 
-            keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
-            keyword_scores[idx] = keyword_score
+                keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
+                keyword_scores[idx] = keyword_score
 
-            alpha = 0.6
-            combined_score = alpha * semantic_scores[idx] + (1 - alpha) * keyword_scores[idx]
+                alpha = 0.6
+                combined_score = alpha * semantic_scores[idx] + (1 - alpha) * keyword_scores[idx]
 
-            retrieved_paragraphs.append(paragraph_text)
-            top_sources_data.append({
-                'filename': pdf_filename,
-                'page': page_num,
-                'semantic_score': semantic_scores[idx],
-                'keyword_score': keyword_scores[idx],
-                'combined_score': combined_score,
-                'image_key': image_key,
-                'idx': idx
-            })
-            docs_for_reranking.append(paragraph_text)
+                retrieved_paragraphs.append(paragraph_text)
+                top_sources_data.append({
+                    'filename': pdf_filename,
+                    'page': page_num,
+                    'semantic_score': semantic_scores[idx],
+                    'keyword_score': keyword_scores[idx],
+                    'combined_score': combined_score,
+                    'image_key': image_key,
+                    'idx': idx
+                })
+                docs_for_reranking.append(paragraph_text)
 
-        ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
-        ranked_results = ranker.rank(query=msg, docs=docs_for_reranking)
-        top_ranked_docs = ranked_results.top_k(3)
+            ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
+            ranked_results = ranker.rank(query=msg, docs=docs_for_reranking)
+            top_ranked_docs = ranked_results.top_k(3)
 
-        final_retrieved_paragraphs = []
-        final_top_sources = []
-        for ranked_doc in top_ranked_docs:
-            ranked_idx = docs_for_reranking.index(ranked_doc.text)
-            final_retrieved_paragraphs.append(ranked_doc.text)
-            source_info = top_sources_data[ranked_idx]
-            source_info['reranker_score'] = ranked_doc.score
-            final_top_sources.append(source_info)
+            final_retrieved_paragraphs = []
+            final_top_sources = []
+            for ranked_doc in top_ranked_docs:
+                ranked_idx = docs_for_reranking.index(ranked_doc.text)
+                final_retrieved_paragraphs.append(ranked_doc.text)
+                source_info = top_sources_data[ranked_idx]
+                source_info['reranker_score'] = ranked_doc.score
+                final_top_sources.append(source_info)
 
-        context = "\n\n".join(retrieved_paragraphs[:2])
+            context = "\n\n".join(retrieved_paragraphs[:2])
 
         def build_conversation(messages, max_length=2000):
             conversation = ''
