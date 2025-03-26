@@ -61,7 +61,7 @@ try:
 except modal.exception.NotFoundError:
     raise Exception("Download models first with the appropriate script")
 
-# Update: add colpali-engine with interpretability extras to the install list
+# Update: add colpali-engine to the install list
 image = modal.Image.debian_slim(python_version="3.10") \
     .pip_install(
         "vllm==0.7.2",
@@ -79,7 +79,7 @@ image = modal.Image.debian_slim(python_version="3.10") \
         "nltk",
         "sqlalchemy",
         "pdf2image",
-        "colpali-engine[interpretability]",  # Add interpretability extras
+        "colpali-engine[interpretability]>=0.3.2",  # Add interpretability extras
         "torch",
         "matplotlib"
     )
@@ -247,6 +247,7 @@ def serve_vllm():
         DATA_DIR: bee_volume,
         DATABASE_DIR: db_volume
     },
+    gpu=modal.gpu.A10G(count=1),  # Explicitly request GPU for ColPali
     secrets=[modal.Secret.from_name("my-custom-secret-3")]
 )
 @modal.asgi_app()
@@ -272,15 +273,14 @@ def serve_fasthtml():
     from rank_bm25 import BM25Okapi
     from fastapi.responses import FileResponse, Response, HTMLResponse
     from io import BytesIO
+    import base64
     from PIL import Image
     from pdf2image import convert_from_path
     from colpali_engine.models import ColQwen2, ColQwen2Processor
-    from colpali_engine.interpretability import (
-        get_similarity_maps_from_embeddings,
-        plot_similarity_map,
-        plot_all_similarity_maps
-    )
-    from matplotlib import pyplot as plt
+    from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
+    import io
+    from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+    import matplotlib.pyplot as plt
 
     NLTK_DATA_DIR = "/tmp/nltk_data"
     os.makedirs(NLTK_DATA_DIR, exist_ok=True)
@@ -315,6 +315,12 @@ def serve_fasthtml():
             colpali_embeddings = pickle.load(f)
         print(f"Loaded {len(colpali_embeddings)} ColPali embeddings")
         
+        # Verify CUDA is available
+        if torch.cuda.is_available():
+            print(f"CUDA is available: {torch.cuda.get_device_name(0)}")
+        else:
+            print("WARNING: CUDA is NOT available, ColPali will run on CPU which is slower")
+        
         # Load ColPali model for query embedding
         print(f"Loading ColPali model ({COLPALI_MODEL_NAME})...")
         colpali_model = ColQwen2.from_pretrained(
@@ -323,7 +329,7 @@ def serve_fasthtml():
             device_map="cuda" if torch.cuda.is_available() else "cpu"
         ).eval()
         colpali_processor = ColQwen2Processor.from_pretrained(COLPALI_MODEL_NAME)
-        print("ColPali model loaded successfully")
+        print(f"ColPali model loaded successfully on device: {colpali_model.device}")
     else:
         print("ColPali embeddings not found")
         # Load original embeddings with FAISS
@@ -365,6 +371,118 @@ def serve_fasthtml():
     except Exception as e:
         print(f"  Error loading image paths: {e}")
         logging.error(f"Error loading PDF page images: {e}")
+
+    # Function to create token selector component
+    def token_list_component(tokens, image_key):
+        """
+        Create the token selector component with the fetched tokens
+        """
+        return Select(
+            *[Option(f"{t['idx']}: {t['token']}", value=t['idx']) for t in tokens],
+            id=f"token-selector-{image_key}",
+            cls="select select-bordered w-full max-w-xs bg-zinc-800 text-white mb-2"
+        )
+
+    # Function to create similarity map viewer component
+    def similarity_map_viewer(image_key):
+        """
+        Create a UI component for viewing similarity maps
+        """
+        return Div(
+            Div("Token Similarity Maps", cls="text-zinc-400 text-sm font-semibold mb-2"),
+            
+            # Token selector
+            Div(
+                Select(
+                    Option("Loading tokens...", value="", disabled=True),
+                    id=f"token-selector-{image_key}",
+                    cls="select select-bordered w-full max-w-xs bg-zinc-800 text-white mb-2",
+                    hx_get=f"/token-list/{image_key}",
+                    hx_trigger="load",
+                    hx_swap="innerHTML"
+                ),
+                cls="mb-4"
+            ),
+            
+            # Map display area - empty initially
+            Div(
+                Div("Select a token to view its similarity map", cls="text-zinc-400"),
+                id=f"similarity-map-container-{image_key}",
+                cls="w-full h-96 flex items-center justify-center bg-zinc-800 rounded-md overflow-hidden"
+            ),
+            
+            # Script to handle token selection
+            Script(
+                f"""
+                document.addEventListener('htmx:afterSwap', function(evt) {{
+                    if (evt.detail.target.id === 'token-selector-{image_key}') {{
+                        const tokenSelector = document.getElementById('token-selector-{image_key}');
+                        
+                        if (tokenSelector) {{
+                            tokenSelector.addEventListener('change', function() {{
+                                const selectedToken = this.value;
+                                const mapContainer = document.getElementById('similarity-map-container-{image_key}');
+                                
+                                if (mapContainer && selectedToken) {{
+                                    // Show loading indicator
+                                    mapContainer.innerHTML = '<div class="text-white">Loading map...</div>';
+                                    
+                                    // Load the similarity map image
+                                    mapContainer.innerHTML = `<img src="/similarity-map/{image_key}/${{selectedToken}}" 
+                                                                class="max-w-full max-h-full object-contain" />`;
+                                }}
+                            }});
+                        }}
+                    }}
+                }});
+                """
+            ),
+            
+            cls="w-full bg-zinc-800 rounded-md p-4 mt-4"
+        )
+
+    # Function to display top sources with similarity maps
+    def chat_top_sources(top_sources):
+        carousel_items = [
+            Div(
+                Img(
+                    src=f"/pdf-image/{source['image_key']}",
+                    cls="w-full rounded-lg border border-zinc-700"
+                ),
+                id=f"item{i+1}",
+                cls="carousel-item w-full"
+            )
+            for i, source in enumerate(top_sources)
+        ]
+
+        # Navigation buttons for each image
+        carousel_controls = Div(
+            *[
+                A(str(i+1), href=f"#item{i+1}", cls="btn btn-xs")
+                for i in range(len(top_sources))
+            ],
+            cls="flex w-full justify-center gap-2 py-2"
+        )
+        
+        # Create similarity map viewers for each source
+        similarity_viewers = [
+            similarity_map_viewer(source['image_key'])
+            for source in top_sources
+        ] if using_colpali else []
+
+        return Div(
+            Div(
+                Div("Top Sources", cls="text-zinc-400 text-sm font-semibold"),
+                Div(
+                    Div(*carousel_items, cls="carousel w-full"),
+                    carousel_controls,  # Buttons for navigation
+                    cls="flex flex-col w-full"
+                ),
+                *similarity_viewers,  # Add similarity map viewers if ColPali is available
+                cls="flex flex-col w-full gap-6"
+            ),
+            cls="w-full max-w-2xl mx-auto bg-zinc-800 rounded-md mt-6 p-6"
+        )
 
     fasthtml_app, rt = fast_app(
         hdrs=(
@@ -467,87 +585,175 @@ def serve_fasthtml():
         
         return Response(content="Image not found", media_type="text/plain", status_code=404)
 
-    # Add new endpoint for serving heatmap images
-    @fasthtml_app.get("/heatmap-image/{filename}")
-    async def get_heatmap_image(filename: str):
-        heatmap_dir = os.path.join(PDF_IMAGES_DIR, "heatmaps")
-        heatmap_path = os.path.join(heatmap_dir, filename)
+    @fasthtml_app.get("/token-list/{image_key}")
+    async def get_token_list(image_key: str):
+        from fastapi.responses import HTMLResponse, JSONResponse
         
-        if os.path.exists(heatmap_path):
-            return FileResponse(heatmap_path, media_type="image/png")
-        else:
-            return Response(content="Heatmap not found", media_type="text/plain", status_code=404)
-
-    def chat_top_sources(top_sources, heatmap_paths=None):
-        if heatmap_paths is None:
-            heatmap_paths = {}
+        logging.info(f"Token list request for image: {image_key}")
         
-        carousel_items = []
-        
-        for i, source in enumerate(top_sources):
-            image_key = source['image_key']
-            
-            # Create the main document image
-            doc_image = Img(
-                src=f"/pdf-image/{image_key}",
-                cls="w-full rounded-lg border border-zinc-700"
+        if not using_colpali:
+            return HTMLResponse(
+                content="<div>Token visualization not available - requires ColPali/ColQwen model</div>",
+                status_code=400
             )
-            
-            carousel_item = [doc_image]
-            
-            # Add heatmaps if available
-            if image_key in heatmap_paths and heatmap_paths[image_key]:
-                heatmap_section = Div(
-                    H3("Query Token Heatmaps", cls="text-sm text-zinc-400 font-semibold mt-2"),
-                    cls="w-full"
+        
+        try:
+            # Get the most recent query
+            latest_query = None
+            for conv in sqlalchemy_session.query(Conversation).filter(
+                Conversation.role == 'user'
+            ).order_by(Conversation.created_at.desc()):
+                latest_query = conv.content
+                break
+                
+            if not latest_query:
+                return HTMLResponse(
+                    content="<div>No query found in history</div>",
+                    status_code=400
                 )
-                
-                heatmap_images = Div(cls="flex flex-wrap justify-center gap-2 mt-2")
-                
-                for heatmap in heatmap_paths[image_key]:
-                    heatmap_img = Div(
-                        Img(
-                            src=f"/heatmap-image/{heatmap['path']}",
-                            cls="w-32 h-32 rounded border border-zinc-700"
-                        ),
-                        P(f"'{heatmap['token']}' ({heatmap['score']:.2f})", cls="text-xs text-center"),
-                        cls="flex flex-col items-center"
-                    )
-                    heatmap_images.append(heatmap_img)
-                
-                heatmap_section.append(heatmap_images)
-                carousel_item.append(heatmap_section)
             
-            carousel_items.append(
-                Div(
-                    *carousel_item,
-                    id=f"item{i+1}",
-                    cls="carousel-item w-full"
-                )
+            # Process the query with ColPali to get tokens
+            processed_query = colpali_processor.process_queries([latest_query]).to(colpali_model.device)
+            
+            # Extract and decode query tokens
+            query_content = colpali_processor.decode(processed_query.input_ids[0]).replace(
+                colpali_processor.tokenizer.pad_token, "")
+            query_content = query_content.replace(
+                getattr(colpali_processor, 'query_augmentation_token', ''), "").strip()
+            query_tokens = colpali_processor.tokenizer.tokenize(query_content)
+            
+            # Create token list for the selector
+            tokens = [{"idx": idx, "token": token} for idx, token in enumerate(query_tokens)]
+            
+            # Generate HTML for the token selector
+            token_selector_html = token_list_component(tokens, image_key).to_html()
+            
+            return HTMLResponse(content=token_selector_html)
+            
+        except Exception as e:
+            logging.error(f"Error getting token list: {e}")
+            return HTMLResponse(
+                content=f"<div>Error getting token list: {str(e)}</div>",
+                status_code=500
             )
 
-        # Navigation buttons for each image
-        carousel_controls = Div(
-            *[
-                A(str(i+1), href=f"#item{i+1}", cls="btn btn-xs")
-                for i in range(len(top_sources))
-            ],
-            cls="flex w-full justify-center gap-2 py-2"
-        )
-
-        return Div(
-            Div(
-                Div("Top Sources", cls="text-zinc-400 text-sm font-semibold"),
-                Div(
-                    Div(*carousel_items, cls="carousel w-full"),
-                    carousel_controls,  # Buttons for navigation
-                    cls="flex flex-col w-full"
-                ),
-                cls="flex flex-col w-full gap-6"
-            ),
-            cls="w-full max-w-2xl mx-auto bg-zinc-800 rounded-md mt-6 p-6"
-        )
-       
+    @fasthtml_app.get("/similarity-map/{image_key}/{token_idx}")
+    async def get_similarity_map(image_key: str, token_idx: int):
+        logging.info(f"Similarity map request for image: {image_key}, token: {token_idx}")
+        
+        # Check if we're using ColPali
+        if not using_colpali:
+            return Response(content="Similarity maps only available with ColPali/ColQwen models", 
+                        media_type="text/plain", status_code=400)
+                        
+        try:
+            # Get the original image
+            if image_key in page_images:
+                image_path = page_images[image_key]
+                if os.path.exists(image_path):
+                    image = Image.open(image_path)
+                else:
+                    return Response(content=f"Image file not found: {image_path}", 
+                                media_type="text/plain", status_code=404)
+            else:
+                return Response(content=f"Image key not found: {image_key}", 
+                            media_type="text/plain", status_code=404)
+            
+            # Find the index of this image in our data
+            idx = None
+            for i, row in df.iterrows():
+                if row['image_key'] == image_key:
+                    idx = i
+                    break
+                    
+            if idx is None:
+                return Response(content=f"Image metadata not found", 
+                            media_type="text/plain", status_code=404)
+            
+            # Get the query (use the most recent one from this session)
+            session_id = None
+            latest_query = None
+            for conv in sqlalchemy_session.query(Conversation).filter(
+                Conversation.role == 'user'
+            ).order_by(Conversation.created_at.desc()):
+                latest_query = conv.content
+                session_id = conv.session_id
+                break
+                
+            if not latest_query:
+                return Response(content="No query found in history", 
+                            media_type="text/plain", status_code=400)
+            
+            # Process the query and image with ColPali
+            processed_image = colpali_processor.process_images([image]).to(colpali_model.device)
+            processed_query = colpali_processor.process_queries([latest_query]).to(colpali_model.device)
+            
+            # Forward pass to get embeddings
+            with torch.no_grad():
+                image_embedding = colpali_model(**processed_image)
+                query_embedding = colpali_model(**processed_query)
+            
+            # Get the number of image patches
+            n_patches = colpali_processor.get_n_patches(
+                image_size=image.size,
+                patch_size=colpali_model.patch_size,
+                spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
+            )
+            
+            # Get the image mask
+            image_mask = colpali_processor.get_image_mask(processed_image)
+            
+            # Generate the similarity maps
+            similarity_maps = get_similarity_maps_from_embeddings(
+                image_embeddings=image_embedding,
+                query_embeddings=query_embedding,
+                n_patches=n_patches,
+                image_mask=image_mask
+            )[0]  # Get the first (and only) item from the batch
+            
+            # Get tokens for reference (in case we want to show the token text)
+            query_content = colpali_processor.decode(processed_query.input_ids[0]).replace(
+                colpali_processor.tokenizer.pad_token, "")
+            query_content = query_content.replace(
+                getattr(colpali_processor, 'query_augmentation_token', ''), "").strip()
+            query_tokens = colpali_processor.tokenizer.tokenize(query_content)
+            
+            # Safety check for token index
+            if token_idx < 0 or token_idx >= len(query_tokens):
+                return Response(content=f"Token index out of range: {token_idx}, max: {len(query_tokens)-1}", 
+                            media_type="text/plain", status_code=400)
+            
+            # Get the similarity map for the specific token
+            token_similarity_map = similarity_maps[int(token_idx)]
+            
+            # Generate the visualization
+            fig, ax = plot_similarity_map(
+                image=image,
+                similarity_map=token_similarity_map,
+                figsize=(10, 10),
+                show_colorbar=True
+            )
+            
+            # Add a title with the token
+            token_text = query_tokens[int(token_idx)] if int(token_idx) < len(query_tokens) else "Unknown"
+            max_sim = token_similarity_map.max().item()
+            ax.set_title(f"Token: '{token_text}' (MaxSim: {max_sim:.2f})")
+            
+            # Convert plot to image
+            buf = io.BytesIO()
+            canvas = FigureCanvas(fig)
+            canvas.print_png(buf)
+            buf.seek(0)
+            
+            # Return the image
+            return Response(content=buf.getvalue(), media_type="image/png")
+            
+        except Exception as e:
+            logging.error(f"Error generating similarity map: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response(content=f"Error generating similarity map: {str(e)}", 
+                        media_type="text/plain", status_code=500)
 
     @rt("/")
     async def get(session):
@@ -622,8 +828,8 @@ def serve_fasthtml():
             # Calculate similarities with all pages
             similarities = []
             for idx, page_emb in enumerate(colpali_embeddings):
-                # Convert page embedding to tensor with matching dtype to the query embeddings
-                page_tensor = torch.tensor(page_emb, device=colpali_model.device, dtype=query_embeddings.dtype)
+                # Convert page embedding to tensor
+                page_tensor = torch.tensor(page_emb, device=colpali_model.device, dtype=torch.bfloat16)
                 
                 # Score using ColPali's scoring method
                 score = float(colpali_processor.score_multi_vector(
@@ -664,162 +870,6 @@ def serve_fasthtml():
             # Use the top results for context
             final_top_sources = top_sources_data[:3]
             context = "\n\n".join(retrieved_paragraphs[:3])
-            
-            # For each top retrieved page, generate similarity heatmaps
-            heatmap_paths = {}
-            if using_colpali:
-                # Create a directory for heatmaps if it doesn't exist
-                heatmap_dir = os.path.join(PDF_IMAGES_DIR, "heatmaps")
-                os.makedirs(heatmap_dir, exist_ok=True)
-                
-                # Process the query tokens
-                query_tokens = colpali_processor.tokenizer.tokenize(msg)
-                
-                for source in final_top_sources:
-                    try:
-                        image_key = source['image_key']
-                        image_path = page_images[image_key]
-                        
-                        # Load the original image
-                        image = Image.open(image_path)
-                        
-                        # For ColQwen2, let's directly use the number of image tokens
-                        # rather than calculating patches manually
-                        
-                        # Get the number of patches from the batch_images input_ids
-                        input_shape = batch_images.pixel_values.shape
-                        batch_size, num_channels, height, width = input_shape
-                        
-                        # Calculate a reasonable grid size that approximates the sqrt of tokens
-                        # ColQwen2 uses a different approach - the embeddings are 1D flattened
-                        num_tokens = batch_images.attention_mask.sum().item()
-                        grid_size = int(round(num_tokens ** 0.5))
-                        
-                        # Create a grid shape that's more representative of the aspect ratio
-                        aspect_ratio = width / height
-                        grid_height = int(round(grid_size / aspect_ratio ** 0.5))
-                        grid_width = int(round(grid_size * aspect_ratio ** 0.5))
-                        
-                        # Make sure the total is close to the number of tokens
-                        while grid_height * grid_width > num_tokens:
-                            if grid_height > grid_width:
-                                grid_height -= 1
-                            else:
-                                grid_width -= 1
-                        
-                        n_patches = (grid_height, grid_width)
-                        logging.info(f"Using grid size {n_patches} for image with {num_tokens} tokens")
-                        
-                        # Get image mask
-                        batch_images = colpali_processor.process_images([image]).to(colpali_model.device)
-                        image_mask = colpali_processor.get_image_mask(batch_images)
-                        
-                        # Forward pass for the image
-                        with torch.no_grad():
-                            image_embeddings = colpali_model(**batch_images)
-                        
-                        try:
-                            # Generate similarity maps
-                            batched_similarity_maps = get_similarity_maps_from_embeddings(
-                                image_embeddings=image_embeddings,
-                                query_embeddings=query_embeddings,
-                                n_patches=n_patches,
-                                image_mask=image_mask,
-                            )
-                        except Exception as e:
-                            logging.error(f"Error in get_similarity_maps_from_embeddings: {e}")
-                            # Fallback approach: Generate a simple heatmap without using similarity maps
-                            # This won't have token-specific highlighting but will at least show the image
-                            batched_similarity_maps = None
-                        
-                        image_heatmaps = []
-                        
-                        if batched_similarity_maps is not None:
-                            try:
-                                # Get the similarity map for our image
-                                similarity_maps = batched_similarity_maps[0]  # (query_length, n_patches_x, n_patches_y)
-                                
-                                # Calculate maximum similarity score for each token
-                                token_sims = []
-                                stopwords = set(["<bos>", "<eos>", "<pad>", "a", "an", "the", "in", "on", "at", "of", "for", "with", "by", "to", "from"])
-                                
-                                for token_idx, token in enumerate(query_tokens):
-                                    # Skip tokens that are just part of words or stopwords
-                                    if token in stopwords or len(token) <= 1:
-                                        continue
-                                        
-                                    token_clean = token[1:] if token.startswith("▁") else token
-                                    if token_clean and len(token_clean) > 1:
-                                        if token_idx < similarity_maps.shape[0]:  # Check if token index is within bounds
-                                            max_sim = similarity_maps[token_idx].max().item()
-                                            token_sims.append((token_idx, token, max_sim))
-                                
-                                # Sort by similarity score and take top 3
-                                token_sims.sort(key=lambda x: x[2], reverse=True)
-                                top_tokens = token_sims[:3]
-                                
-                                # Generate and save heatmaps
-                                for token_idx, token, score in top_tokens:
-                                    # Generate heatmap
-                                    fig, ax = plot_similarity_map(
-                                        image=image,
-                                        similarity_map=similarity_maps[token_idx],
-                                        figsize=(8, 8),
-                                        show_colorbar=False,
-                                    )
-                                    
-                                    # Set title
-                                    token_display = token[1:] if token.startswith("▁") else token
-                                    ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
-                                    
-                                    # Save the heatmap
-                                    heatmap_filename = f"{image_key}_token_{token_idx}.png"
-                                    heatmap_path = os.path.join(heatmap_dir, heatmap_filename)
-                                    fig.savefig(heatmap_path, bbox_inches='tight')
-                                    plt.close(fig)
-                                    
-                                    # Add to the list
-                                    image_heatmaps.append({
-                                        "token": token_display,
-                                        "score": score,
-                                        "path": heatmap_filename
-                                    })
-                            except Exception as e:
-                                logging.error(f"Error processing similarity maps: {e}")
-                        
-                        # If we couldn't generate proper heatmaps, create a fallback overlay
-                        if not image_heatmaps:
-                            try:
-                                # Create a simple overlay showing the document was retrieved
-                                fig, ax = plt.subplots(figsize=(8, 8))
-                                ax.imshow(image)
-                                ax.set_title(f"Retrieved for query: '{msg[:30]}...'", fontsize=12)
-                                ax.axis('off')
-                                
-                                # Add text annotation about the match
-                                ax.text(0.5, 0.95, f"Score: {source['semantic_score']:.2f}", 
-                                        transform=ax.transAxes, fontsize=10, ha='center',
-                                        bbox=dict(facecolor='white', alpha=0.8))
-                                
-                                # Save the basic overlay
-                                heatmap_filename = f"{image_key}_overview.png"
-                                heatmap_path = os.path.join(heatmap_dir, heatmap_filename)
-                                fig.savefig(heatmap_path, bbox_inches='tight')
-                                plt.close(fig)
-                                
-                                # Add to the list
-                                image_heatmaps.append({
-                                    "token": "Overview",
-                                    "score": source['semantic_score'],
-                                    "path": heatmap_filename
-                                })
-                            except Exception as e:
-                                logging.error(f"Error creating fallback overlay: {e}")
-                        
-                        # Store the heatmap information
-                        heatmap_paths[image_key] = image_heatmaps
-                    except Exception as e:
-                        logging.error(f"Error generating heatmap for {image_key}: {e}")
             
         else:
             # Original retrieval logic
@@ -883,8 +933,6 @@ def serve_fasthtml():
                 final_top_sources.append(source_info)
 
             context = "\n\n".join(retrieved_paragraphs[:2])
-            # Empty heatmap paths since we're not using ColPali
-            heatmap_paths = {}
 
         def build_conversation(messages, max_length=2000):
             conversation = ''
@@ -962,8 +1010,7 @@ Assistant:"""
                     messages.append({"role": "assistant", "content": error_message})
                     await send(Div(chat_message(len(messages) - 1, messages=messages), id="messages", hx_swap_oob="beforeend"))
 
-        # Update to pass heatmap paths to the chat_top_sources function
-        await send(Div(chat_top_sources(final_top_sources, heatmap_paths), id="top-sources", hx_swap_oob="innerHTML", cls="flex gap-4"))
+        await send(Div(chat_top_sources(final_top_sources), id="top-sources", hx_swap_oob="innerHTML", cls="flex gap-4"))
         await send(chat_form(disabled=False))
 
     return fasthtml_app
