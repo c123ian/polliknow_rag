@@ -397,6 +397,114 @@ def serve_fasthtml():
     except Exception as e:
         print(f"  Error loading image paths: {e}")
         logging.error(f"Error loading PDF page images: {e}")
+    
+    # Function to create token selector component
+    def token_list_component(tokens, image_key):
+        """Create the token selector component with the fetched tokens"""
+        return Select(
+            *[Option(f"{t['idx']}: {t['token']}", value=t['idx']) for t in tokens],
+            id=f"token-selector-{image_key}",
+            cls="select select-bordered w-full max-w-xs bg-zinc-800 text-white mb-2"
+        )
+
+    # Function to create similarity map viewer component
+    def similarity_map_viewer(image_key):
+        """Create a UI component for viewing similarity maps"""
+        return Div(
+            Div("Token Similarity Maps", cls="text-zinc-400 text-sm font-semibold mb-2"),
+            
+            # Token selector
+            Div(
+                Select(
+                    Option("Loading tokens...", value="", disabled=True),
+                    id=f"token-selector-{image_key}",
+                    cls="select select-bordered w-full max-w-xs bg-zinc-800 text-white mb-2",
+                    hx_get=f"/token-list/{image_key}",
+                    hx_trigger="load",
+                    hx_swap="innerHTML"
+                ),
+                cls="mb-4"
+            ),
+            
+            # Map display area - empty initially
+            Div(
+                Div("Select a token to view its similarity map", cls="text-zinc-400"),
+                id=f"similarity-map-container-{image_key}",
+                cls="w-full h-96 flex items-center justify-center bg-zinc-800 rounded-md overflow-hidden"
+            ),
+            
+            # Script to handle token selection
+            Script(
+                f"""
+                document.addEventListener('htmx:afterSwap', function(evt) {{
+                    if (evt.detail.target.id === 'token-selector-{image_key}') {{
+                        const tokenSelector = document.getElementById('token-selector-{image_key}');
+                        
+                        if (tokenSelector) {{
+                            tokenSelector.addEventListener('change', function() {{
+                                const selectedToken = this.value;
+                                const mapContainer = document.getElementById('similarity-map-container-{image_key}');
+                                
+                                if (mapContainer && selectedToken) {{
+                                    // Show loading indicator
+                                    mapContainer.innerHTML = '<div class="text-white">Loading map...</div>';
+                                    
+                                    // Load the similarity map image
+                                    mapContainer.innerHTML = `<img src="/similarity-map/{image_key}/${{selectedToken}}" 
+                                                                class="max-w-full max-h-full object-contain" />`;
+                                }}
+                            }});
+                        }}
+                    }}
+                }});
+                """
+            ),
+            
+            cls="w-full bg-zinc-800 rounded-md p-4 mt-4"
+        )
+
+    # Function to display top sources with similarity maps
+    def chat_top_sources(top_sources):
+        carousel_items = [
+            Div(
+                Img(
+                    src=f"/pdf-image/{source['image_key']}",
+                    cls="w-full rounded-lg border border-zinc-700"
+                ),
+                id=f"item{i+1}",
+                cls="carousel-item w-full"
+            )
+            for i, source in enumerate(top_sources)
+        ]
+
+        # Navigation buttons for each image
+        carousel_controls = Div(
+            *[
+                A(str(i+1), href=f"#item{i+1}", cls="btn btn-xs")
+                for i in range(len(top_sources))
+            ],
+            cls="flex w-full justify-center gap-2 py-2"
+        )
+        
+        # Create similarity map viewers for each source
+        similarity_viewers = [
+            similarity_map_viewer(source['image_key'])
+            for source in top_sources
+        ] if using_colpali else []
+
+        return Div(
+            Div(
+                Div("Top Sources", cls="text-zinc-400 text-sm font-semibold"),
+                Div(
+                    Div(*carousel_items, cls="carousel w-full"),
+                    carousel_controls,  # Buttons for navigation
+                    cls="flex flex-col w-full"
+                ),
+                *similarity_viewers,  # Add similarity map viewers if ColPali is available
+                cls="flex flex-col w-full gap-6"
+            ),
+            cls="w-full max-w-2xl mx-auto bg-zinc-800 rounded-md mt-6 p-6"
+        )
 
     fasthtml_app, rt = fast_app(
         hdrs=(
@@ -458,32 +566,78 @@ def serve_fasthtml():
             session['session_id'] = str(uuid.uuid4())
         session_id = session['session_id']
         
-        # Hard-code the query for similarity maps
-        hardcoded_query = "Classify the species"
-        
+        # Add selector for different views
         return Div(
             H1("Document Visual Analysis", cls="text-3xl font-bold mb-4 text-white"),
             Div(f"Session ID: {session_id}", cls="text-white mb-4"),
             
-            # Instead of chat, just show the top image with similarity map
-            Div(id="top-source-view", cls="flex flex-col w-full max-w-2xl items-center"),
+            # View selector tabs
+            Div(
+                Button(
+                    "Simple Analysis",
+                    hx_get="/simple-view",
+                    hx_target="#main-content",
+                    cls="bg-zinc-700 hover:bg-zinc-600 text-white px-4 py-2 rounded-tl-md rounded-tr-md"
+                ),
+                Button(
+                    "Chat Interface",
+                    hx_get="/chat-view",
+                    hx_target="#main-content",
+                    cls="bg-zinc-800 hover:bg-zinc-600 text-white px-4 py-2 rounded-tl-md rounded-tr-md ml-2"
+                ),
+                cls="flex border-b border-zinc-700 mb-6"
+            ),
             
-            # Add a button to process the query
-            Button(
-                "Analyze with query: 'Classify the species'",
-                hx_post="/process-hardcoded-query",
-                hx_target="#top-source-view",
-                cls="bg-green-500 hover:bg-green-600 text-white rounded-md py-2 px-4 mt-4"
+            # Main content area - loads the simple view by default
+            Div(
+                id="main-content",
+                hx_get="/simple-view",
+                hx_trigger="load",
+                cls="w-full max-w-2xl"
             ),
             
             Div(Span("Model status: "), Span("⚫", id="model-status-emoji"), cls="model-status text-white mt-4"),
             cls="flex flex-col items-center min-h-screen bg-black",
         )
 
+    @fasthtml_app.get("/simple-view")
+    async def simple_view():
+        # This is our simplified view with the hardcoded query
+        return Div(
+            H2("Simplified Analysis", cls="text-2xl font-bold mb-4 text-white"),
+            P("Run a predefined query to analyze document patches.", cls="text-zinc-300 mb-4"),
+            
+            # Analysis area
+            Div(id="analysis-area", cls="flex flex-col w-full max-w-2xl items-center"),
+            
+            # Add a button to process the query
+            Button(
+                "Analyze with query: 'Classify the species'",
+                hx_post="/process-hardcoded-query",
+                hx_target="#analysis-area",
+                cls="bg-green-500 hover:bg-green-600 text-white rounded-md py-2 px-4 mt-4"
+            ),
+            
+            cls="flex flex-col items-center w-full"
+        )
+
+    @fasthtml_app.get("/chat-view")
+    async def chat_view(session):
+        session_id = session.get('session_id', str(uuid.uuid4()))
+        messages = await load_chat_history(session_id)
+        
+        return Div(
+            H2("Chat Interface", cls="text-2xl font-bold mb-4 text-white"),
+            P("Chat with your documents and explore token-level similarity maps.", cls="text-zinc-300 mb-4"),
+            chat(session_id=session_id, messages=messages),
+            Div(id="top-sources"),
+            cls="flex flex-col items-center w-full"
+        )
+
     @fasthtml_app.post("/process-hardcoded-query")
     async def process_hardcoded_query():
         # Use the hardcoded query
-        query = "Classify the species bumblebee"
+        query = "Classify the species"
         
         # Process query with ColPali/ColQwen
         processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
@@ -564,6 +718,7 @@ def serve_fasthtml():
         if classify_idx is None:
             classify_idx = 0
             
+        # Get the
         # Get the similarity map for the specific token
         token_similarity_map = similarity_maps[classify_idx]
         
@@ -608,8 +763,273 @@ def serve_fasthtml():
                 cls="w-full"
             ),
             
+            # Add a full token list for interactive exploration
+            Div(
+                H3("Explore Other Tokens:", cls="text-lg font-medium text-white mt-6 mb-2"),
+                Select(
+                    *[Option(f"{i}: {token}", value=str(i)) for i, token in enumerate(query_tokens)],
+                    id="token-selector",
+                    hx_get=f"/update-similarity-map/{image_key}",
+                    hx_trigger="change",
+                    hx_target="#dynamic-similarity-map",
+                    cls="w-full p-2 bg-zinc-700 text-white rounded mb-4"
+                ),
+                Div(id="dynamic-similarity-map"),
+                cls="w-full mt-4"
+            ),
+            
             cls="flex flex-col items-center w-full"
         )
+    
+    @fasthtml_app.get("/update-similarity-map/{image_key}")
+    async def update_similarity_map(image_key: str, request: fastapi.Request):
+        token_idx = int(request.query_params.get("token-selector", "0"))
+        
+        # Get the image path
+        image_path = page_images.get(image_key)
+        if not image_path or not os.path.exists(image_path):
+            return Div("Image not found", cls="text-white")
+        
+        # Open the image
+        image = Image.open(image_path)
+        
+        # Use hardcoded query for simplicity in this view
+        query = "Classify the species"
+        
+        # Process query and image with ColPali
+        processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
+        processed_image = colpali_processor.process_images([image]).to(colpali_model.device)
+        
+        # Forward pass
+        with torch.no_grad():
+            image_embedding = colpali_model(**processed_image)
+            query_embeddings = colpali_model(**processed_query)
+        
+        # Get the number of image patches
+        n_patches = colpali_processor.get_n_patches(
+            image_size=image.size,
+            patch_size=colpali_model.patch_size,
+            spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
+        )
+        
+        # Get the image mask
+        image_mask = colpali_processor.get_image_mask(processed_image)
+        
+        # Generate the similarity maps
+        similarity_maps = get_similarity_maps_from_embeddings(
+            image_embeddings=image_embedding,
+            query_embeddings=query_embeddings,
+            n_patches=n_patches,
+            image_mask=image_mask
+        )[0]  # Get the first item from the batch
+        
+        # Get tokens for reference
+        query_content = colpali_processor.decode(processed_query.input_ids[0]).replace(
+            colpali_processor.tokenizer.pad_token, "")
+        query_content = query_content.replace(
+            getattr(colpali_processor, 'query_augmentation_token', ''), "").strip()
+        query_tokens = colpali_processor.tokenizer.tokenize(query_content)
+        
+        # Get the similarity map for the selected token
+        token_similarity_map = similarity_maps[token_idx]
+        
+        # Generate the visualization
+        fig, ax = plot_similarity_map(
+            image=image,
+            similarity_map=token_similarity_map,
+            figsize=(10, 10),
+            show_colorbar=True
+        )
+        
+        # Add a title with the token
+        token_text = query_tokens[token_idx]
+        max_sim = token_similarity_map.max().item()
+        ax.set_title(f"Token: '{token_text}' (MaxSim: {max_sim:.2f})")
+        
+        # Convert plot to image
+        buf = io.BytesIO()
+        canvas = FigureCanvas(fig)
+        canvas.print_png(buf)
+        buf.seek(0)
+        
+        # Convert to base64 for embedding in HTML
+        img_base64 = base64.b64encode(buf.getvalue()).decode()
+        
+        return Div(
+            H3(f"Similarity Map for Token: '{token_text}'", cls="text-lg font-medium text-white mb-2"), 
+            Img(src=f"data:image/png;base64,{img_base64}", cls="w-full max-w-xl rounded-lg border border-zinc-700"),
+            cls="w-full"
+        )
+
+    @fasthtml_app.get("/token-list/{image_key}")
+    async def get_token_list(image_key: str):
+        from fastapi.responses import HTMLResponse, JSONResponse
+        
+        logging.info(f"Token list request for image: {image_key}")
+        
+        if not using_colpali:
+            return HTMLResponse(
+                content="<div>Token visualization not available - requires ColPali/ColQwen model</div>",
+                status_code=400
+            )
+        
+        try:
+            # Get the most recent query
+            latest_query = None
+            for conv in sqlalchemy_session.query(Conversation).filter(
+                Conversation.role == 'user'
+            ).order_by(Conversation.created_at.desc()):
+                latest_query = conv.content
+                break
+                
+            if not latest_query:
+                return HTMLResponse(
+                    content="<div>No query found in history</div>",
+                    status_code=400
+                )
+            
+            # Process the query with ColPali to get tokens
+            processed_query = colpali_processor.process_queries([latest_query]).to(colpali_model.device)
+            
+            # Extract and decode query tokens
+            query_content = colpali_processor.decode(processed_query.input_ids[0]).replace(
+                colpali_processor.tokenizer.pad_token, "")
+            query_content = query_content.replace(
+                getattr(colpali_processor, 'query_augmentation_token', ''), "").strip()
+            query_tokens = colpali_processor.tokenizer.tokenize(query_content)
+            
+            # Create token list for the selector
+            tokens = [{"idx": idx, "token": token} for idx, token in enumerate(query_tokens)]
+            
+            # Generate HTML for the token selector
+            token_selector_html = token_list_component(tokens, image_key).to_html()
+            
+            return HTMLResponse(content=token_selector_html)
+            
+        except Exception as e:
+            logging.error(f"Error getting token list: {e}")
+            return HTMLResponse(
+                content=f"<div>Error getting token list: {str(e)}</div>",
+                status_code=500
+            )
+
+    @fasthtml_app.get("/similarity-map/{image_key}/{token_idx}")
+    async def get_similarity_map(image_key: str, token_idx: int):
+        logging.info(f"Similarity map request for image: {image_key}, token: {token_idx}")
+        
+        # Check if we're using ColPali
+        if not using_colpali:
+            return Response(content="Similarity maps only available with ColPali/ColQwen models", 
+                        media_type="text/plain", status_code=400)
+                        
+        try:
+            # Get the original image
+            if image_key in page_images:
+                image_path = page_images[image_key]
+                if os.path.exists(image_path):
+                    image = Image.open(image_path)
+                else:
+                    return Response(content=f"Image file not found: {image_path}", 
+                                media_type="text/plain", status_code=404)
+            else:
+                return Response(content=f"Image key not found: {image_key}", 
+                            media_type="text/plain", status_code=404)
+            
+            # Find the index of this image in our data
+            idx = None
+            for i, row in df.iterrows():
+                if row['image_key'] == image_key:
+                    idx = i
+                    break
+                    
+            if idx is None:
+                return Response(content=f"Image metadata not found", 
+                            media_type="text/plain", status_code=404)
+            
+            # Get the query (use the most recent one from this session)
+            session_id = None
+            latest_query = None
+            for conv in sqlalchemy_session.query(Conversation).filter(
+                Conversation.role == 'user'
+            ).order_by(Conversation.created_at.desc()):
+                latest_query = conv.content
+                session_id = conv.session_id
+                break
+                
+            if not latest_query:
+                return Response(content="No query found in history", 
+                            media_type="text/plain", status_code=400)
+            
+            # Process the query and image with ColPali
+            processed_image = colpali_processor.process_images([image]).to(colpali_model.device)
+            processed_query = colpali_processor.process_queries([latest_query]).to(colpali_model.device)
+            
+            # Forward pass to get embeddings
+            with torch.no_grad():
+                image_embedding = colpali_model(**processed_image)
+                query_embedding = colpali_model(**processed_query)
+            
+            # Get the number of image patches
+            n_patches = colpali_processor.get_n_patches(
+                image_size=image.size,
+                patch_size=colpali_model.patch_size,
+                spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
+            )
+            
+            # Get the image mask
+            image_mask = colpali_processor.get_image_mask(processed_image)
+            
+            # Generate the similarity maps
+            similarity_maps = get_similarity_maps_from_embeddings(
+                image_embeddings=image_embedding,
+                query_embeddings=query_embedding,
+                n_patches=n_patches,
+                image_mask=image_mask
+            )[0]  # Get the first (and only) item from the batch
+            
+            # Get tokens for reference (in case we want to show the token text)
+            query_content = colpali_processor.decode(processed_query.input_ids[0]).replace(
+                colpali_processor.tokenizer.pad_token, "")
+            query_content = query_content.replace(
+                getattr(colpali_processor, 'query_augmentation_token', ''), "").strip()
+            query_tokens = colpali_processor.tokenizer.tokenize(query_content)
+            
+            # Safety check for token index
+            if token_idx < 0 or token_idx >= len(query_tokens):
+                return Response(content=f"Token index out of range: {token_idx}, max: {len(query_tokens)-1}", 
+                            media_type="text/plain", status_code=400)
+            
+            # Get the similarity map for the specific token
+            token_similarity_map = similarity_maps[int(token_idx)]
+            
+            # Generate the visualization
+            fig, ax = plot_similarity_map(
+                image=image,
+                similarity_map=token_similarity_map,
+                figsize=(10, 10),
+                show_colorbar=True
+            )
+            
+            # Add a title with the token
+            token_text = query_tokens[int(token_idx)] if int(token_idx) < len(query_tokens) else "Unknown"
+            max_sim = token_similarity_map.max().item()
+            ax.set_title(f"Token: '{token_text}' (MaxSim: {max_sim:.2f})")
+            
+            # Convert plot to image
+            buf = io.BytesIO()
+            canvas = FigureCanvas(fig)
+            canvas.print_png(buf)
+            buf.seek(0)
+            
+            # Return the image
+            return Response(content=buf.getvalue(), media_type="image/png")
+            
+        except Exception as e:
+            logging.error(f"Error generating similarity map: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response(content=f"Error generating similarity map: {str(e)}", 
+                        media_type="text/plain", status_code=500)
 
     @fasthtml_app.get("/pdf-image/{image_key}")  # Use FastAPI's native route decorator
     async def get_pdf_image(image_key: str):
@@ -660,8 +1080,246 @@ def serve_fasthtml():
 
     @fasthtml_app.ws("/ws")
     async def ws(msg: str, session_id: str, send):
-        # Keeping this as a placeholder to maintain compatibility
-        pass
+        logging.info(f"WebSocket received - msg: {msg}, session_id: {session_id}")
+        if not session_id:
+            logging.error("No session_id received in WebSocket connection!")
+            return
+        messages = await load_chat_history(session_id)
+        response_received = asyncio.Event()
+        max_tokens = 6000
+
+        async def update_model_status():
+            await asyncio.sleep(3)
+            if not response_received.is_set():
+                for _ in range(25):
+                    if response_received.is_set():
+                        break
+                    await send(Span("🟡", id="model-status-emoji", hx_swap_oob="innerHTML"))
+                    await asyncio.sleep(1)
+                    if response_received.is_set():
+                        break
+                    await send(Span("⚫", id="model-status-emoji", hx_swap_oob="innerHTML"))
+                    await asyncio.sleep(1)
+                else:
+                    if not response_received.is_set():
+                        await send(Span("🔴", id="model-status-emoji", hx_swap_oob="innerHTML"))
+            if response_received.is_set():
+                await send(Span("🟢", id="model-status-emoji", hx_swap_oob="innerHTML"))
+                await asyncio.sleep(600)
+                await send(Span("⚫", id="model-status-emoji", hx_swap_oob="innerHTML"))
+
+        asyncio.create_task(update_model_status())
+
+        messages.append({"role": "user", "content": msg})
+        message_index = len(messages) - 1
+
+        new_message = Conversation(
+            message_id=str(uuid.uuid4()),
+            session_id=session_id,
+            role='user',
+            content=msg
+        )
+        sqlalchemy_session.add(new_message)
+        sqlalchemy_session.commit()
+
+        await send(chat_form(disabled=False))
+        await send(Div(chat_message(message_index, messages=messages), id="messages", hx_swap_oob="beforeend"))
+
+        # Document retrieval section - use ColPali if available
+        if using_colpali:
+            # Process query with ColPali
+            logging.info("Using ColPali for query embedding...")
+            processed_query = colpali_processor.process_queries([msg]).to(colpali_model.device)
+            with torch.no_grad():
+                query_embeddings = colpali_model(**processed_query)
+            
+            # Calculate similarities with all pages
+            similarities = []
+            for idx, page_emb in enumerate(colpali_embeddings):
+                # Convert page embedding to tensor
+                page_tensor = torch.tensor(page_emb, device=colpali_model.device, dtype=torch.bfloat16)
+                
+                # Score using ColPali's scoring method
+                score = float(colpali_processor.score_multi_vector(
+                    query_embeddings,
+                    page_tensor.unsqueeze(0)  # Add batch dimension
+                )[0])
+                
+                similarities.append((idx, score))
+            
+            # Sort by similarity and get top K
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            K = 10
+            top_indices = [idx for idx, _ in similarities[:K]]
+            
+            # Get documents based on top indices
+            retrieved_paragraphs = []
+            top_sources_data = []
+            
+            for rank, (idx, score) in enumerate(similarities[:K]):
+                if idx < len(df):
+                    filename = df.iloc[idx]['filename']
+                    page_num = df.iloc[idx]['page']
+                    image_key = df.iloc[idx]['image_key']
+                    paragraph_text = df.iloc[idx]['text']
+                    
+                    retrieved_paragraphs.append(paragraph_text)
+                    top_sources_data.append({
+                        'filename': filename,
+                        'page': page_num,
+                        'semantic_score': score,
+                        'keyword_score': 0.0,  # Not using BM25 anymore
+                        'combined_score': score,
+                        'image_key': image_key,
+                        'idx': idx,
+                        'reranker_score': score
+                    })
+            
+            # Use the top results for context
+            final_top_sources = top_sources_data[:3]
+            context = "\n\n".join(retrieved_paragraphs[:3])
+            
+        else:
+            # Original retrieval logic
+            query_embedding = emb_model.encode([msg], normalize_embeddings=True).astype('float32')
+            K = 10
+            distances, indices = index.search(query_embedding, K)
+            tokenized_query = word_tokenize(msg.lower())
+            bm25_scores = bm25_index.get_scores(tokenized_query)
+            top_bm25_indices = np.argsort(bm25_scores)[-K:][::-1]
+
+            all_candidate_indices = list(set(indices[0].tolist() + top_bm25_indices.tolist()))
+
+            retrieved_paragraphs = []
+            top_sources_data = []
+            docs_for_reranking = []
+            semantic_scores = {}
+            keyword_scores = {}
+
+            for idx in all_candidate_indices:
+                paragraph_text = df.iloc[idx]['text']
+                pdf_filename = df.iloc[idx]['filename']
+                page_num = df.iloc[idx]['page']
+                image_key = df.iloc[idx]['image_key']
+
+                if idx in indices[0]:
+                    i = np.where(indices[0] == idx)[0][0]
+                    semantic_score = float(1 - distances[0][i])
+                    semantic_scores[idx] = semantic_score
+                else:
+                    semantic_scores[idx] = 0.0
+
+                keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
+                keyword_scores[idx] = keyword_score
+
+                alpha = 0.6
+                combined_score = alpha * semantic_scores[idx] + (1 - alpha) * keyword_scores[idx]
+
+                retrieved_paragraphs.append(paragraph_text)
+                top_sources_data.append({
+                    'filename': pdf_filename,
+                    'page': page_num,
+                    'semantic_score': semantic_scores[idx],
+                    'keyword_score': keyword_scores[idx],
+                    'combined_score': combined_score,
+                    'image_key': image_key,
+                    'idx': idx
+                })
+                docs_for_reranking.append(paragraph_text)
+
+            ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
+            ranked_results = ranker.rank(query=msg, docs=docs_for_reranking)
+            top_ranked_docs = ranked_results.top_k(3)
+
+            final_retrieved_paragraphs = []
+            final_top_sources = []
+            for ranked_doc in top_ranked_docs:
+                ranked_idx = docs_for_reranking.index(ranked_doc.text)
+                final_retrieved_paragraphs.append(ranked_doc.text)
+                source_info = top_sources_data[ranked_idx]
+                source_info['reranker_score'] = ranked_doc.score
+                final_top_sources.append(source_info)
+
+            context = "\n\n".join(retrieved_paragraphs[:2])
+
+        def build_conversation(messages, max_length=2000):
+            conversation = ''
+            total_length = 0
+            for message in reversed(messages):
+                role = message['role']
+                content = message['content']
+                message_text = f"{role.capitalize()}: {content}\n"
+                total_length += len(message_text)
+                if total_length > max_length:
+                    break
+                conversation = message_text + conversation
+            return conversation
+
+        conversation_history = build_conversation(messages)
+
+        def build_prompt(system_prompt, context, conversation_history):
+            return f"""{system_prompt}
+
+Context Information:
+{context}
+
+Conversation History:
+{conversation_history}
+Assistant:"""
+
+        system_prompt = (
+            "You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question."
+            "If you don't know the answer, just say that you don't know."
+            "Use three sentences maximum and keep the answer concise."
+        )
+
+        prompt = build_prompt(system_prompt, context, conversation_history)
+        print(f"Final Prompt being passed to the LLM:\n{prompt}\n")
+
+        vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
+        payload = {
+            "prompt": prompt,
+            "max_tokens": 2000,
+            "stream": True
+        }
+
+        async with aiohttp.ClientSession() as client_session:
+            async with client_session.post(vllm_url, json=payload) as response:
+                messages.append({"role": "assistant", "content": ""})
+                message_index = len(messages) - 1
+                await send(Div(chat_message(message_index, messages=messages), id="messages", hx_swap_oob="beforeend"))
+
+        async with aiohttp.ClientSession() as client_session:
+            async with client_session.post(vllm_url, json=payload) as response:
+                if response.status == 200:
+                    response_received.set()
+                    async for chunk in response.content.iter_chunked(1024):
+                        if chunk:
+                            text = chunk.decode('utf-8').strip()
+                            if text:
+                                if not text.startswith(' ') and messages[message_index]["content"] and not messages[message_index]["content"].endswith(' '):
+                                    text = ' ' + text
+                                messages[message_index]["content"] += text
+                                await send(Span(text, hx_swap_oob="beforeend", id=f"msg-content-{message_index}"))
+                    new_assistant_message = Conversation(
+                        message_id=str(uuid.uuid4()),
+                        session_id=session_id,
+                        role='assistant',
+                        content=messages[message_index]["content"],
+                        top_source_headline=final_top_sources[0]['filename'] if final_top_sources else None,
+                        top_source_url=None,
+                        cosine_sim_score=final_top_sources[0].get('similarity_score', 0) if final_top_sources else None
+                    )
+                    sqlalchemy_session.add(new_assistant_message)
+                    sqlalchemy_session.commit()
+                    logging.info(f"Assistant message committed to DB successfully - Content: {messages[message_index]['content'][:50]}...")
+                else:
+                    error_message = "Error: Unable to get response from LLM."
+                    messages.append({"role": "assistant", "content": error_message})
+                    await send(Div(chat_message(len(messages) - 1, messages=messages), id="messages", hx_swap_oob="beforeend"))
+
+        await send(Div(chat_top_sources(final_top_sources), id="top-sources", hx_swap_oob="innerHTML", cls="flex gap-4"))
+        await send(chat_form(disabled=False))
 
     return fasthtml_app
 
