@@ -649,29 +649,34 @@ def serve_fasthtml():
             # Build the prompt for Qwen
             prompt = f"""You are an expert biologist analyzing visual specimens.
 
-Query: {query}
+    Query: {query}
 
-Provide a detailed, scientifically accurate response with proper taxonomic terminology.
-Keep your answer under 5 sentences but be thorough and precise.
-"""
+    Provide a detailed, scientifically accurate response with proper taxonomic terminology.
+    Keep your answer under 5 sentences but be thorough and precise.
+    """
             
-            # Use vLLM to get Qwen's response
+            # Use streaming approach which is more reliable
             vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
             payload = {
                 "prompt": prompt,
                 "max_tokens": 500,
-                "stream": False  # Non-streaming for easier processing
+                "stream": True  # Always use streaming since that's more reliable
             }
             
-            logging.info(f"Sending request to Qwen LLM: {vllm_url}")
+            logging.info(f"Sending streaming request to Qwen LLM: {vllm_url}")
             
             async with aiohttp.ClientSession() as client_session:
                 async with client_session.post(vllm_url, json=payload) as response:
                     if response.status == 200:
-                        result = await response.json()
-                        qwen_response = result.get("choices", [{}])[0].get("text", "")
-                        logging.info(f"Qwen response received for {analysis_id}")
-                        return qwen_response
+                        # For streamed responses, collect all chunks
+                        full_response = ""
+                        async for chunk in response.content:
+                            if chunk:
+                                text = chunk.decode('utf-8')
+                                full_response += text
+                        
+                        logging.info(f"Collected full response from streaming: {full_response[:100]}...")
+                        return full_response.strip()
                     else:
                         error_text = await response.text()
                         logging.error(f"Error from Qwen: {error_text}")
@@ -682,7 +687,7 @@ Keep your answer under 5 sentences but be thorough and precise.
             import traceback
             traceback.print_exc()
             return f"Error: {str(e)}"
-
+        
     async def generate_similarity_maps(image, query, analysis_id):
         """Generate token similarity maps using ColQwen"""
         logging.info(f"Generating similarity maps for {analysis_id} with query: {query}")
@@ -780,7 +785,7 @@ Keep your answer under 5 sentences but be thorough and precise.
             logging.error(f"Exception in generate_similarity_maps: {str(e)}")
             import traceback
             traceback.print_exc()
-            return None
+            return None    
     
     # Main route for homepage
     @rt("/")
