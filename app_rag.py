@@ -10,6 +10,7 @@ import io
 import sqlite3
 import torch
 import base64
+import datetime
 from modal import Secret
 from fastlite import Database
 from starlette.middleware.sessions import SessionMiddleware
@@ -154,6 +155,7 @@ def serve_vllm():
     import asyncio
     import fastapi
     import uuid
+    import datetime
     from fastapi.responses import StreamingResponse, JSONResponse
     from typing import Optional
 
@@ -948,13 +950,13 @@ def serve_fasthtml():
             confidence = min(similarity_score * 10, 1.0)  # Scale to 0-1
             
             if confidence > 0.7:
-                return f"The image appears to show a biological specimen, possibly an insect or other organism with taxonomic features visible. The specimen has distinctive visual features that can likely be classified according to taxonomic hierarchy."
+                return "The image appears to show a biological specimen, possibly an insect or other organism with taxonomic features visible. The specimen has distinctive visual features that can likely be classified according to taxonomic hierarchy."
             elif confidence > 0.5:
-                return f"The image shows what appears to be a biological specimen or organism. Some distinctive features may be visible for classification purposes."
+                return "The image shows what appears to be a biological specimen or organism. Some distinctive features may be visible for classification purposes."
             elif confidence > 0.3:
-                return f"The image contains visual content that may be related to biological specimens or organisms."
+                return "The image contains visual content that may be related to biological specimens or organisms."
             else:
-                return f"The image contains visual content that may be relevant to the query."
+                return "The image contains visual content that may be relevant to the query."
                 
         except Exception as e:
             logging.error(f"Error generating image description: {str(e)}")
@@ -1041,17 +1043,21 @@ Keep your answer under 5 sentences but be thorough and precise.
                 logging.info(f"Generated image description: {image_description[:100]}...")
                 
                 # Use text endpoint with image description
+                # Create the context part separately
+                context_part = f"Relevant context from scientific literature:\n{context_text}" if context_text else ""
+
+                # Use it in the main f-string
                 text_prompt = f"""{system_prompt}
 
-Query: {query}
+                Query: {query}
 
-Image description: {image_description}
+                Image description: {image_description}
 
-{f"Relevant context from scientific literature:\n{context_text}" if context_text else ""}
+                {context_part}
 
-Provide a detailed, scientifically accurate response with proper taxonomic terminology.
-Keep your answer under 5 sentences but be thorough and precise.
-"""
+                Provide a detailed, scientifically accurate response with proper taxonomic terminology.
+                Keep your answer under 5 sentences but be thorough and precise.
+                """
             else:
                 # Plain text fallback
                 text_prompt = prompt
@@ -1275,7 +1281,7 @@ Keep your answer under 5 sentences but be thorough and precise.
             ),
             
             # JavaScript to handle tab interaction
-            Script("""
+            Script('''
             document.addEventListener('htmx:afterSwap', function() {
                 if (document.getElementById('token-tab-0')) {
                     setTimeout(function() {
@@ -1299,7 +1305,7 @@ Keep your answer under 5 sentences but be thorough and precise.
                     }
                 }
             });
-            """),
+            '''),
             
             cls="mt-6"
         )
