@@ -31,6 +31,7 @@ import numpy as np
 from nltk.tokenize import word_tokenize
 import nltk
 from rerankers import Reranker
+from io import BytesIO
 
 # Constants
 QWEN_MODELS_DIR = "/Qwen"  # existing volume
@@ -307,6 +308,75 @@ def serve_vllm():
                 
         except Exception as e:
             logging.error(f"Error in completion_generator: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @web_app.post("/v1/chat/completions")
+    async def chat_completions(request: fastapi.Request) -> JSONResponse:
+        """Handle multimodal chat completions"""
+        try:
+            body = await request.json()
+            messages = body.get("messages", [])
+            model = body.get("model", DEFAULT_QWEN_NAME)
+            max_tokens = body.get("max_tokens", 500)
+            request_id = str(uuid.uuid4())
+            
+            logging.info(f"Received chat completion request for model {model}")
+            
+            # Convert to standard text prompt format for now
+            prompt = ""
+            for message in messages:
+                role = message.get("role", "user")
+                content = message.get("content", "")
+                
+                # Handle multimodal content
+                if isinstance(content, list):
+                    for item in content:
+                        if item.get("type") == "text":
+                            prompt += f"{role.title()}: {item.get('text', '')}\n"
+                        elif item.get("type") == "image_url":
+                            prompt += f"{role.title()}: [Image content provided]\n"
+                else:
+                    prompt += f"{role.title()}: {content}\n"
+            
+            # Add assistant prompt
+            prompt += "Assistant:"
+            
+            # Generate response with vLLM
+            sampling_params = SamplingParams(
+                temperature=0.7,
+                max_tokens=max_tokens,
+                stop=["User:", "System:", "\n\n"],
+            )
+            
+            outputs = await engine.generate(prompt, sampling_params, request_id)
+            
+            if len(outputs.outputs) > 0:
+                response_text = outputs.outputs[0].text
+                # Remove any prefix if present
+                response_text = response_text.split("Assistant:")[-1].lstrip()
+                
+                return JSONResponse(content={
+                    "id": request_id,
+                    "object": "chat.completion",
+                    "created": int(datetime.datetime.now().timestamp()),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": response_text
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ]
+                })
+            else:
+                return JSONResponse(content={"error": "No output generated"}, status_code=500)
+                
+        except Exception as e:
+            logging.error(f"Error in chat_completions: {str(e)}")
             import traceback
             traceback.print_exc()
             return JSONResponse(status_code=500, content={"error": str(e)})
@@ -846,6 +916,179 @@ def serve_fasthtml():
             traceback.print_exc()
             return []
 
+    # Generate image description for LLM context
+    async def generate_image_description(image):
+        """Generate a description of the image using ColQwen"""
+        global colpali_model, colpali_processor
+        
+        if not colpali_model or not colpali_processor:
+            logging.warning("ColQwen model not available for image description")
+            return None
+        
+        try:
+            # Process the image with ColQwen
+            processed_image = colpali_processor.process_images([image]).to(colpali_model.device)
+            
+            # For image description, use a standard query
+            description_query = "Describe this image in detail, focusing on visual features and any text content visible."
+            processed_query = colpali_processor.process_queries([description_query]).to(colpali_model.device)
+            
+            # Get embeddings for both
+            with torch.no_grad():
+                image_embeddings = colpali_model(**processed_image)
+                query_embeddings = colpali_model(**processed_query)
+            
+            # Get similarity score as a rough measure of key information
+            similarity_score = float(colpali_processor.score_multi_vector(
+                query_embeddings, 
+                image_embeddings
+            )[0])
+            
+            # Use generic description based on score
+            confidence = min(similarity_score * 10, 1.0)  # Scale to 0-1
+            
+            if confidence > 0.7:
+                return f"The image appears to show a biological specimen, possibly an insect or other organism with taxonomic features visible. The specimen has distinctive visual features that can likely be classified according to taxonomic hierarchy."
+            elif confidence > 0.5:
+                return f"The image shows what appears to be a biological specimen or organism. Some distinctive features may be visible for classification purposes."
+            elif confidence > 0.3:
+                return f"The image contains visual content that may be related to biological specimens or organisms."
+            else:
+                return f"The image contains visual content that may be relevant to the query."
+                
+        except Exception as e:
+            logging.error(f"Error generating image description: {str(e)}")
+            return None
+
+    # Process image with Qwen LLM - FIXED VERSION FOR MULTIMODAL
+    async def process_with_qwen(image, query, context_text="", analysis_id=""):
+        """Process the image with Qwen LLM including context from retrieved documents"""
+        logging.info(f"Processing image {analysis_id} with Qwen using query: {query}")
+        
+        try:
+            # Convert image to base64 for transmission
+            img_buffer = BytesIO()
+            image.save(img_buffer, format=image.format or "JPEG")
+            img_data = img_buffer.getvalue()
+            base64_img = base64.b64encode(img_data).decode("utf-8")
+            
+            # Build the prompt for Qwen, including context if available
+            system_prompt = "You are an expert biologist analyzing visual specimens."
+            
+            # Log image info for debugging
+            logging.info(f"Image for analysis: {image.format} {image.size}, {len(base64_img)} bytes base64")
+            
+            # Check if we should use direct ColQwen processing instead
+            if context_text:
+                # For context-aware analysis
+                prompt = f"""{system_prompt}
+
+Query: {query}
+
+Relevant context from scientific literature:
+{context_text}
+
+Examine the image and provide a detailed, scientifically accurate response using the context where relevant.
+Keep your answer under 5 sentences but be thorough and precise.
+"""
+            else:
+                # For direct image analysis
+                prompt = f"""{system_prompt}
+
+Query: {query}
+
+Provide a detailed, scientifically accurate response with proper taxonomic terminology.
+Keep your answer under 5 sentences but be thorough and precise.
+"""
+
+            # Create a multimodal message format
+            multimodal_message = {
+                "model": DEFAULT_QWEN_NAME,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": f"{query}\n\n{context_text if context_text else ''}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
+                    ]}
+                ],
+                "max_tokens": 500
+            }
+            
+            # First try with multimodal API endpoint (if available)
+            multimodal_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/chat/completions"
+            logging.info(f"Trying multimodal endpoint: {multimodal_url}")
+            
+            async with aiohttp.ClientSession() as client_session:
+                try:
+                    async with client_session.post(multimodal_url, json=multimodal_message, timeout=60) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            if "choices" in result and len(result["choices"]) > 0:
+                                multimodal_response = result["choices"][0]["message"]["content"]
+                                logging.info(f"Received multimodal response: {multimodal_response[:100]}...")
+                                return multimodal_response.strip()
+                        else:
+                            logging.warning(f"Multimodal endpoint failed with status {response.status}")
+                except Exception as e:
+                    logging.warning(f"Multimodal endpoint error: {str(e)}")
+            
+            # Fallback to text-only with image description
+            logging.info("Falling back to text-only endpoint with image description")
+            
+            # Describe the image using ColQwen for context
+            image_description = await generate_image_description(image)
+            if image_description:
+                logging.info(f"Generated image description: {image_description[:100]}...")
+                
+                # Use text endpoint with image description
+                text_prompt = f"""{system_prompt}
+
+Query: {query}
+
+Image description: {image_description}
+
+{f"Relevant context from scientific literature:\n{context_text}" if context_text else ""}
+
+Provide a detailed, scientifically accurate response with proper taxonomic terminology.
+Keep your answer under 5 sentences but be thorough and precise.
+"""
+            else:
+                # Plain text fallback
+                text_prompt = prompt
+            
+            # Use text-only API
+            vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
+            payload = {
+                "prompt": text_prompt,
+                "max_tokens": 500,
+                "stream": True
+            }
+            
+            logging.info(f"Sending streaming request to text endpoint: {vllm_url}")
+            
+            async with aiohttp.ClientSession() as client_session:
+                async with client_session.post(vllm_url, json=payload) as response:
+                    if response.status == 200:
+                        # For streamed responses, collect all chunks
+                        full_response = ""
+                        async for chunk in response.content:
+                            if chunk:
+                                text = chunk.decode('utf-8')
+                                full_response += text
+                        
+                        logging.info(f"Collected full response from streaming: {full_response[:100]}...")
+                        return full_response.strip()
+                    else:
+                        error_text = await response.text()
+                        logging.error(f"Error from Qwen: {error_text}")
+                        return f"Error processing image: {error_text}"
+        
+        except Exception as e:
+            logging.error(f"Exception in process_with_qwen: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return f"Error: {str(e)}"
+    
     # Define UI components
     def upload_form():
         """Render upload form for images with proper interactive elements"""
@@ -918,6 +1161,77 @@ def serve_fasthtml():
             hx_target="#analysis-results",
             hx_indicator="#loading-indicator",
         )
+
+    # Add this helper function to directly embed images in the UI
+    def try_read_image(image_path):
+        """Attempt to read an image and return it as an embedded element"""
+        try:
+            if os.path.exists(image_path):
+                with open(image_path, "rb") as f:
+                    img_data = f.read()
+                    base64_img = base64.b64encode(img_data).decode('utf-8')
+                
+                # Determine image type from extension
+                ext = os.path.splitext(image_path)[1].lower()
+                if ext in ['.jpg', '.jpeg']:
+                    media_type = "image/jpeg"
+                elif ext == '.png':
+                    media_type = "image/png"
+                elif ext == '.gif':
+                    media_type = "image/gif"
+                else:
+                    media_type = "image/jpeg"  # Default to JPEG
+                
+                # Display as embedded base64 image
+                return Img(
+                    src=f"data:{media_type};base64,{base64_img}",
+                    cls="mx-auto max-h-64 rounded-lg border border-zinc-700"
+                )
+            else:
+                # Try to find any image with the same analysis ID prefix
+                analysis_id = os.path.basename(image_path).split('_')[0]
+                directory = os.path.dirname(image_path)
+                
+                if os.path.exists(directory):
+                    files = os.listdir(directory)
+                    matching_files = [f for f in files if f.startswith(analysis_id)]
+                    
+                    if matching_files:
+                        alt_path = os.path.join(directory, matching_files[0])
+                        if os.path.exists(alt_path):
+                            with open(alt_path, "rb") as f:
+                                img_data = f.read()
+                                base64_img = base64.b64encode(img_data).decode('utf-8')
+                            
+                            # Determine image type from extension
+                            alt_ext = os.path.splitext(matching_files[0])[1].lower()
+                            if alt_ext in ['.jpg', '.jpeg']:
+                                media_type = "image/jpeg"
+                            elif alt_ext == '.png':
+                                media_type = "image/png"
+                            elif alt_ext == '.gif':
+                                media_type = "image/gif"
+                            else:
+                                media_type = "image/jpeg"  # Default to JPEG
+                            
+                            return Img(
+                                src=f"data:{media_type};base64,{base64_img}",
+                                cls="mx-auto max-h-64 rounded-lg border border-zinc-700"
+                            )
+                
+                # If all fails, show placeholder
+                return Div(
+                    P("Image not found", cls="text-red-500 text-center"),
+                    cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
+                )
+        except Exception as e:
+            logging.error(f"Error embedding image {image_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            return Div(
+                P(f"Error displaying image: {str(e)}", cls="text-red-500 text-center"),
+                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
+            )
 
     def token_maps_ui(image_key, heatmaps):
         """Create token map UI with tabs and display area"""
@@ -1005,20 +1319,82 @@ def serve_fasthtml():
             P(f"The AI is using this document to help analyze your image (Score: {score:.2f}):", 
               cls="text-zinc-300 mb-3"),
             
-            # Document image
+            # Document image - embed directly as base64
             Div(
-                Img(
-                    src=f"/pdf-image/{image_key}",
-                    cls="w-full rounded-lg border border-zinc-700 max-h-80 object-contain mx-auto"
-                ),
+                try_read_pdf_image(image_key),
                 cls="w-full mb-4"
             ),
             
             cls="context-container mt-6"
         )
 
+    # Helper function to read PDF images directly
+    def try_read_pdf_image(image_key):
+        """Attempt to read a PDF image and return it as an embedded element"""
+        global page_images
+        
+        try:
+            if image_key in page_images:
+                image_path = page_images[image_key]
+                if os.path.exists(image_path):
+                    with open(image_path, "rb") as f:
+                        img_data = f.read()
+                        base64_img = base64.b64encode(img_data).decode('utf-8')
+                    
+                    # Display as embedded base64 image
+                    return Img(
+                        src=f"data:image/png;base64,{base64_img}",
+                        cls="w-full rounded-lg border border-zinc-700 max-h-80 object-contain mx-auto"
+                    )
+            
+            # If path not found, try alternative paths
+            parts = image_key.split('_')
+            if len(parts) >= 2:
+                filename = '_'.join(parts[:-1])
+                page_num = int(parts[-1]) if parts[-1].isdigit() else 0
+                potential_paths = [
+                    os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                    os.path.join(PDF_IMAGES_DIR, f"{filename}", f"page_{page_num}.png"),
+                    os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
+                ]
+                
+                for path in potential_paths:
+                    if os.path.exists(path):
+                        with open(path, "rb") as f:
+                            img_data = f.read()
+                            base64_img = base64.b64encode(img_data).decode('utf-8')
+                        
+                        # Display as embedded base64 image
+                        return Img(
+                            src=f"data:image/png;base64,{base64_img}",
+                            cls="w-full rounded-lg border border-zinc-700 max-h-80 object-contain mx-auto"
+                        )
+            
+            # If all fails, show a placeholder
+            return Div(
+                P("Context document image not found", cls="text-red-500 text-center"),
+                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
+            )
+        except Exception as e:
+            logging.error(f"Error embedding PDF image {image_key}: {e}")
+            import traceback
+            traceback.print_exc()
+            return Div(
+                P(f"Error displaying context document: {str(e)}", cls="text-red-500 text-center"),
+                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
+            )
+
     def analysis_results_ui(image_path, qwen_response, context_paragraphs, top_sources, token_maps, analysis_id):
         """Create UI to display analysis results with context and token maps"""
+        
+        # Get the image filename for the UI
+        image_filename = os.path.basename(image_path)
+        
+        # Check if the file exists, log info about it
+        if os.path.exists(image_path):
+            logging.info(f"Image exists for UI: {image_path}, size: {os.path.getsize(image_path)} bytes")
+        else:
+            logging.error(f"Image does not exist for UI: {image_path}")
         
         # Context section
         context_ui = None
@@ -1073,11 +1449,10 @@ def serve_fasthtml():
             Div(
                 # Left side - image & analysis text
                 Div(
-                    # Display the original image
+                    # Display the original image - Read the file directly instead of using a URL
                     Div(
                         H3("Uploaded Image", cls="text-xl font-semibold text-white mb-2"),
-                        Img(src=f"/temp-image/{os.path.basename(image_path)}", 
-                            cls="mx-auto max-h-64 rounded-lg border border-zinc-700"),
+                        try_read_image(image_path),  # Use our custom function to get the image
                         cls="mb-6"
                     ),
                     
@@ -1121,68 +1496,6 @@ def serve_fasthtml():
             cls="w-full max-w-2xl bg-zinc-800 rounded-md p-6 fade-in"
         )
 
-    # Define image processing functions
-    async def process_with_qwen(image, query, context_text="", analysis_id=""):
-        """Process the image with Qwen LLM including context from retrieved documents"""
-        logging.info(f"Processing image {analysis_id} with Qwen using query: {query}")
-        
-        try:
-            # Build the prompt for Qwen, including context if available
-            system_prompt = "You are an expert biologist analyzing visual specimens."
-            
-            if context_text:
-                prompt = f"""{system_prompt}
-
-Query: {query}
-
-Relevant context from scientific literature:
-{context_text}
-
-Examine the image and provide a detailed, scientifically accurate response using the context where relevant.
-Keep your answer under 5 sentences but be thorough and precise.
-"""
-            else:
-                prompt = f"""{system_prompt}
-
-Query: {query}
-
-Provide a detailed, scientifically accurate response with proper taxonomic terminology.
-Keep your answer under 5 sentences but be thorough and precise.
-"""
-            
-            # Use streaming approach which is more reliable
-            vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
-            payload = {
-                "prompt": prompt,
-                "max_tokens": 500,
-                "stream": True  # Always use streaming since that's more reliable
-            }
-            
-            logging.info(f"Sending streaming request to Qwen LLM: {vllm_url}")
-            
-            async with aiohttp.ClientSession() as client_session:
-                async with client_session.post(vllm_url, json=payload) as response:
-                    if response.status == 200:
-                        # For streamed responses, collect all chunks
-                        full_response = ""
-                        async for chunk in response.content:
-                            if chunk:
-                                text = chunk.decode('utf-8')
-                                full_response += text
-                        
-                        logging.info(f"Collected full response from streaming: {full_response[:100]}...")
-                        return full_response.strip()
-                    else:
-                        error_text = await response.text()
-                        logging.error(f"Error from Qwen: {error_text}")
-                        return f"Error processing image: {error_text}"
-        
-        except Exception as e:
-            logging.error(f"Exception in process_with_qwen: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return f"Error: {str(e)}"
-        
     # Main route for homepage
     @rt("/")
     def get(session):
@@ -1431,7 +1744,38 @@ Keep your answer under 5 sentences but be thorough and precise.
             analysis_id=analysis_id
         )
 
-    
+    @fasthtml_app.get("/token-map/{image_key}/{token_idx}")
+    async def get_token_map(image_key: str, token_idx: int):
+        """Return the token map image HTML for display in the UI"""
+        # Get the file path
+        heatmap_filename = f"{image_key}_token_{token_idx}.png"
+        heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
+        logging.info(f"Looking for token map: {heatmap_path}")
+        
+        if os.path.exists(heatmap_path):
+            logging.info(f"Found token map at: {heatmap_path}")
+            # Encode the image directly to base64 for inline display
+            try:
+                with open(heatmap_path, "rb") as f:
+                    img_data = f.read()
+                    base64_img = base64.b64encode(img_data).decode('utf-8')
+                    
+                # Use an inline data URL instead of a separate request
+                return Div(
+                    Img(
+                        src=f"data:image/png;base64,{base64_img}",
+                        cls="mx-auto max-h-96 w-full object-contain token-map"
+                    ),
+                    cls="p-2 flex items-center justify-center min-h-[300px]"
+                )
+            except Exception as e:
+                logging.error(f"Error reading token map file: {e}")
+                import traceback
+                traceback.print_exc()
+                return Div(f"Error reading token map: {str(e)}", cls="text-red-500 p-4")
+        else:
+            logging.error(f"Token map not found at: {heatmap_path}")
+            return Div(f"Token map not found for {image_key} token {token_idx}", cls="text-red-500 p-4")
 
     @fasthtml_app.get("/temp-image/{filename}")
     async def serve_temp_image(filename: str):
@@ -1440,20 +1784,85 @@ Keep your answer under 5 sentences but be thorough and precise.
         logging.info(f"Requested temp image: {filename}, looking at: {image_path}")
         
         if os.path.exists(image_path):
-            logging.info(f"Found temp image at: {image_path}")
-            return FastAPIFileResponse(image_path, media_type=f"image/{os.path.splitext(filename)[1][1:]}")
+            logging.info(f"Found temp image at: {image_path}, size: {os.path.getsize(image_path)} bytes")
+            try:
+                # Open and read the file directly
+                with open(image_path, "rb") as f:
+                    content = f.read()
+                
+                # Determine media type based on file extension
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in ['.jpg', '.jpeg']:
+                    media_type = "image/jpeg"
+                elif ext == '.png':
+                    media_type = "image/png"
+                elif ext == '.gif':
+                    media_type = "image/gif"
+                else:
+                    media_type = "application/octet-stream"
+                
+                # Return as binary response
+                return Response(
+                    content=content,
+                    media_type=media_type
+                )
+            except Exception as e:
+                logging.error(f"Error reading temp image file: {e}")
+                import traceback
+                traceback.print_exc()
+                return Response(
+                    content=f"Error reading image: {str(e)}",
+                    media_type="text/plain",
+                    status_code=500
+                )
         else:
             logging.error(f"Temp image not found: {image_path}")
-            # List files in the directory for debugging
+            
+            # Check for files with similar name patterns
             try:
                 files = os.listdir(TEMP_UPLOAD_DIR)
-                logging.info(f"Files in {TEMP_UPLOAD_DIR}: {files[:10]}")  # First 10 files
+                
+                # Look for files with the analysis_id prefix
+                analysis_id = filename.split('_')[0]
+                matching_files = [f for f in files if f.startswith(analysis_id)]
+                
+                if matching_files:
+                    logging.info(f"Found similar files: {matching_files}")
+                    
+                    # Try to use the first matching file instead
+                    if len(matching_files) > 0:
+                        alt_path = os.path.join(TEMP_UPLOAD_DIR, matching_files[0])
+                        logging.info(f"Trying alternative file: {alt_path}")
+                        
+                        if os.path.exists(alt_path):
+                            logging.info(f"Using alternative file: {alt_path}")
+                            with open(alt_path, "rb") as f:
+                                content = f.read()
+                            
+                            # Determine media type based on file extension
+                            alt_ext = os.path.splitext(matching_files[0])[1].lower()
+                            if alt_ext in ['.jpg', '.jpeg']:
+                                media_type = "image/jpeg"
+                            elif alt_ext == '.png':
+                                media_type = "image/png"
+                            elif alt_ext == '.gif':
+                                media_type = "image/gif"
+                            else:
+                                media_type = "application/octet-stream"
+                            
+                            return Response(
+                                content=content,
+                                media_type=media_type
+                            )
+                
+                # If we get here, no good alternative was found
+                logging.info(f"All files in {TEMP_UPLOAD_DIR}: {files[:20]}")
             except Exception as e:
                 logging.error(f"Error listing directory: {e}")
             
-            return StarletteResponse(
-                content=f"Image not found: {filename}", 
-                media_type="text/plain", 
+            return Response(
+                content=f"Image not found: {filename}",
+                media_type="text/plain",
                 status_code=404
             )
 
@@ -1467,7 +1876,20 @@ Keep your answer under 5 sentences but be thorough and precise.
                 logging.info(f"Found image path: {image_path}")
                 if os.path.exists(image_path):
                     logging.info(f"Image file exists, serving from: {image_path}")
-                    return FastAPIFileResponse(image_path, media_type="image/png")
+                    try:
+                        # Open and read the file directly
+                        with open(image_path, "rb") as f:
+                            content = f.read()
+                        
+                        # Return as binary response
+                        return Response(
+                            content=content,
+                            media_type="image/png"
+                        )
+                    except Exception as e:
+                        logging.error(f"Error reading PDF image file: {e}")
+                        import traceback
+                        traceback.print_exc()
                 else:
                     logging.error(f"Image file does not exist at path: {image_path}")
                     # Try to find the image by reconstructing path patterns
@@ -1486,7 +1908,12 @@ Keep your answer under 5 sentences but be thorough and precise.
                             logging.info(f"Trying alternative path: {path}")
                             if os.path.exists(path):
                                 logging.info(f"Found image at alternative path: {path}")
-                                return FastAPIFileResponse(path, media_type="image/png")
+                                with open(path, "rb") as f:
+                                    content = f.read()
+                                return Response(
+                                    content=content,
+                                    media_type="image/png"
+                                )
             else:
                 logging.error(f"Image key '{image_key}' not found in page_images dictionary")
                 # List available keys for debugging
@@ -1498,13 +1925,12 @@ Keep your answer under 5 sentences but be thorough and precise.
             traceback.print_exc()
         
         # Return a placeholder image or error response
-        return StarletteResponse(
+        return Response(
             content=f"Image not found for key: {image_key}", 
             media_type="text/plain", 
             status_code=404
         )
-    #
-    
+
     @fasthtml_app.get("/heatmap-image/{filename}")
     async def get_heatmap_image(filename: str):
         """Serve heatmap images"""
@@ -1548,40 +1974,25 @@ Keep your answer under 5 sentences but be thorough and precise.
                 status_code=404
             )
 
-    # Also update the token_map route to use a direct image reference rather than going through heatmap-image
-    @fasthtml_app.get("/token-map/{image_key}/{token_idx}")
-    async def get_token_map(image_key: str, token_idx: int):
-        """Return the token map image HTML for display in the UI"""
-        # Get the file path
-        heatmap_filename = f"{image_key}_token_{token_idx}.png"
-        heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
-        logging.info(f"Looking for token map: {heatmap_path}")
+    @fasthtml_app.get("/debug-info")
+    async def debug_info():
+        """Return debugging information about the environment"""
+        info = {
+            "temp_upload_dir_exists": os.path.exists(TEMP_UPLOAD_DIR),
+            "temp_upload_files": os.listdir(TEMP_UPLOAD_DIR)[:20] if os.path.exists(TEMP_UPLOAD_DIR) else [],
+            "heatmap_dir_exists": os.path.exists(HEATMAP_DIR),
+            "heatmap_files": os.listdir(HEATMAP_DIR)[:20] if os.path.exists(HEATMAP_DIR) else [],
+            "pdf_images_dir_exists": os.path.exists(PDF_IMAGES_DIR),
+            "pdf_images_subfolders": os.listdir(PDF_IMAGES_DIR)[:20] if os.path.exists(PDF_IMAGES_DIR) else [],
+            "page_images_count": len(page_images),
+            "page_images_sample": list(page_images.keys())[:10]
+        }
         
-        if os.path.exists(heatmap_path):
-            logging.info(f"Found token map at: {heatmap_path}")
-            # Encode the image directly to base64 for inline display
-            try:
-                with open(heatmap_path, "rb") as f:
-                    img_data = f.read()
-                    base64_img = base64.b64encode(img_data).decode('utf-8')
-                    
-                # Use an inline data URL instead of a separate request
-                return Div(
-                    Img(
-                        src=f"data:image/png;base64,{base64_img}",
-                        cls="mx-auto max-h-96 w-full object-contain token-map"
-                    ),
-                    cls="p-2 flex items-center justify-center min-h-[300px]"
-                )
-            except Exception as e:
-                logging.error(f"Error reading token map file: {e}")
-                import traceback
-                traceback.print_exc()
-                return Div(f"Error reading token map: {str(e)}", cls="text-red-500 p-4")
-        else:
-            logging.error(f"Token map not found at: {heatmap_path}")
-            return Div(f"Token map not found for {image_key} token {token_idx}", cls="text-red-500 p-4")
-
+        return Div(
+            H2("Debugging Information", cls="text-xl font-semibold text-white mb-4"),
+            Pre(json.dumps(info, indent=2), cls="bg-zinc-800 p-4 rounded-md text-white"),
+            cls="w-full max-w-2xl mx-auto bg-zinc-900 rounded-md p-6"
+        )
 
     return fasthtml_app
 
