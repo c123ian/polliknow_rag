@@ -16,23 +16,34 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, Response
+from fastapi import FastAPI, Request, Response as FastAPIResponse
+from fastapi.responses import FileResponse as FastAPIFileResponse
+from starlette.responses import Response as StarletteResponse
 from PIL import Image
 from colpali_engine.models import ColQwen2, ColQwen2Processor
 from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import matplotlib.pyplot as plt
 import json
+import pickle
+import pandas as pd
+import numpy as np
+from nltk.tokenize import word_tokenize
+import nltk
+from rerankers import Reranker
 
 # Constants
 QWEN_MODELS_DIR = "/Qwen"  # existing volume
-COLQWEN_MODELS_DIR = "/ColQwen"  # new volume for ColQwen2 models
+COLQWEN_MODELS_DIR = "/ColQwen"  # volume for ColQwen2 models
 DATA_DIR = "/bee_pdf"
 TEMP_UPLOAD_DIR = "/bee_pdf/temp_uploads"
+HEATMAP_DIR = "/bee_pdf/heatmaps"  # Directory for storing heatmaps
 DEFAULT_QWEN_NAME = "Qwen/Qwen2.5-7B-Instruct-1M"
 DEFAULT_COLQWEN_NAME = "vidore/colqwen2-v1.0"
 USERNAME = "c123ian"
 APP_NAME = "polliknow-rag"
 DATABASE_DIR = "/db_rag_advan"
+PDF_IMAGES_DIR = "/bee_pdf/pdf_images"
 
 # Configure logging
 logging.basicConfig(
@@ -45,20 +56,35 @@ logging.basicConfig(
 db_path = os.path.join(DATABASE_DIR, 'image_analysis.db')
 os.makedirs(DATABASE_DIR, exist_ok=True)
 os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+os.makedirs(HEATMAP_DIR, exist_ok=True)
 
 conn = sqlite3.connect(db_path)
 cursor = conn.cursor()
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS image_analyses (
-        analysis_id TEXT PRIMARY KEY,
-        image_path TEXT NOT NULL,
-        analysis_type TEXT NOT NULL,
-        query TEXT NOT NULL,
-        response TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-''')
-conn.commit()
+# Check if context_source column exists, add it if not
+cursor.execute("PRAGMA table_info(image_analyses)")
+columns = [column[1] for column in cursor.fetchall()]
+if 'image_analyses' not in columns:
+    # Create the table if it doesn't exist
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS image_analyses (
+            analysis_id TEXT PRIMARY KEY,
+            image_path TEXT NOT NULL,
+            analysis_type TEXT NOT NULL,
+            query TEXT NOT NULL,
+            response TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+
+# Don't try to add context_source if it's already there
+if 'context_source' not in columns:
+    try:
+        cursor.execute('ALTER TABLE image_analyses ADD COLUMN context_source TEXT')
+        conn.commit()
+        logging.info("Added context_source column to image_analyses table")
+    except Exception as e:
+        logging.error(f"Error adding context_source column: {e}")
 conn.close()
 
 # Set up volumes
@@ -315,14 +341,33 @@ def serve_fasthtml():
     from sqlalchemy.orm import sessionmaker
     from fastapi.responses import FileResponse, Response, HTMLResponse
     from io import BytesIO
-    import base64
     from PIL import Image
     from colpali_engine.models import ColQwen2, ColQwen2Processor
     from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
+    import nltk
+    from nltk.tokenize import word_tokenize
+    import numpy as np
+    from rank_bm25 import BM25Okapi
+    from pdf2image import convert_from_path
     
-    # Helper function to ensure ColQwen model is loaded
-    def ensure_colqwen_model_loaded():
-        """Ensure the ColQwen2 model is properly loaded"""
+    # Setup NLTK
+    NLTK_DATA_DIR = "/tmp/nltk_data"
+    os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+    nltk.data.path.append(NLTK_DATA_DIR)
+    nltk.download("punkt", download_dir=NLTK_DATA_DIR)
+    
+    # Global variables
+    colpali_model = None
+    colpali_processor = None
+    colpali_embeddings = None
+    df = None
+    page_images = {}
+    bm25_index = None
+    tokenized_docs = None
+    
+    # Load ColPali model and data functions
+    def ensure_colpali_model_loaded():
+        """Ensure the ColQwen2 model is properly loaded from volume if possible"""
         global colpali_model, colpali_processor
         
         # Verify CUDA is available
@@ -364,8 +409,77 @@ def serve_fasthtml():
                 return False
         return True
 
+    def load_data():
+        """Load all data needed for document retrieval"""
+        global colpali_embeddings, df, page_images, bm25_index, tokenized_docs
+        
+        # Path definitions
+        COLPALI_EMBEDDINGS_PATH = os.path.join(DATA_DIR, "colpali_embeddings.pkl")
+        DATA_PICKLE_PATH = os.path.join(DATA_DIR, "data.pkl")
+        PDF_PAGE_IMAGES_PATH = os.path.join(DATA_DIR, "pdf_page_image_paths.pkl")
+        BM25_INDEX_PATH = os.path.join(DATA_DIR, "bm25_index.pkl")
+        TOKENIZED_PARAGRAPHS_PATH = os.path.join(DATA_DIR, "tokenized_paragraphs.pkl")
+        
+        # Load data frame with metadata
+        if os.path.exists(DATA_PICKLE_PATH):
+            try:
+                df = pd.read_pickle(DATA_PICKLE_PATH)
+                logging.info(f"Loaded DataFrame with {len(df)} documents")
+            except Exception as e:
+                logging.error(f"Error loading DataFrame: {e}")
+                df = pd.DataFrame(columns=["filename", "page", "paragraph_size", "text", "image_key", "full_path"])
+        else:
+            logging.error(f"DataFrame not found at {DATA_PICKLE_PATH}")
+            df = pd.DataFrame(columns=["filename", "page", "paragraph_size", "text", "image_key", "full_path"])
+        
+        # Load image paths
+        if os.path.exists(PDF_PAGE_IMAGES_PATH):
+            try:
+                with open(PDF_PAGE_IMAGES_PATH, "rb") as f:
+                    page_images = pickle.load(f)
+                logging.info(f"Loaded {len(page_images)} image paths")
+            except Exception as e:
+                logging.error(f"Error loading image paths: {e}")
+                page_images = {}
+        else:
+            logging.error(f"Image paths file not found at {PDF_PAGE_IMAGES_PATH}")
+            page_images = {}
+        
+        # Load ColPali embeddings
+        if os.path.exists(COLPALI_EMBEDDINGS_PATH):
+            try:
+                with open(COLPALI_EMBEDDINGS_PATH, "rb") as f:
+                    colpali_embeddings = pickle.load(f)
+                logging.info(f"Loaded {len(colpali_embeddings)} ColPali embeddings")
+            except Exception as e:
+                logging.error(f"Error loading ColPali embeddings: {e}")
+                colpali_embeddings = None
+        else:
+            logging.error(f"ColPali embeddings not found at {COLPALI_EMBEDDINGS_PATH}")
+            colpali_embeddings = None
+        
+        # Load BM25 index
+        try:
+            if os.path.exists(BM25_INDEX_PATH) and os.path.exists(TOKENIZED_PARAGRAPHS_PATH):
+                with open(BM25_INDEX_PATH, "rb") as f:
+                    bm25_index = pickle.load(f)
+                with open(TOKENIZED_PARAGRAPHS_PATH, "rb") as f:
+                    tokenized_docs = pickle.load(f)
+                logging.info("Loaded BM25 index successfully")
+            else:
+                logging.warning("BM25 index not found, will create if needed")
+        except Exception as e:
+            logging.error(f"Error loading BM25 index: {e}")
+            bm25_index = None
+            tokenized_docs = None
+
+    # Load models and data at startup
+    ensure_colpali_model_loaded()
+    load_data()
+
     # Make temporary directories
     os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+    os.makedirs(HEATMAP_DIR, exist_ok=True)
 
     # Setup database connection
     db_engine = create_engine(f'sqlite:///{db_path}')
@@ -373,6 +487,7 @@ def serve_fasthtml():
     Session = sessionmaker(bind=db_engine)
     sqlalchemy_session = Session()
 
+    # Define the database model - matching the actual table schema
     class ImageAnalysis(Base):
         __tablename__ = 'image_analyses'
         analysis_id = Column(String, primary_key=True)
@@ -381,6 +496,8 @@ def serve_fasthtml():
         query = Column(String, nullable=False)
         response = Column(String)
         created_at = Column(DateTime, default=datetime.datetime.utcnow)
+        # Only include context_source if we verified it exists
+        context_source = Column(String, nullable=True)
 
     # Initialize the FastHTML app
     fasthtml_app, rt = fast_app(
@@ -414,6 +531,12 @@ def serve_fasthtml():
                     display: none !important;
                 }
                 
+                /* Custom styles for token maps */
+                .token-tab.active {
+                    background-color: #4CAF50;
+                    color: white;
+                }
+                
                 /* Custom animations */
                 .fade-in {
                     animation: fadeIn 0.5s;
@@ -422,6 +545,26 @@ def serve_fasthtml():
                 @keyframes fadeIn {
                     from { opacity: 0; }
                     to { opacity: 1; }
+                }
+                
+                /* Custom styling for token map display */
+                .token-map {
+                    max-height: 350px;
+                    object-fit: contain;
+                }
+                
+                .context-container {
+                    background-color: #2a2a2a;
+                    border: 1px solid #3a3a3a;
+                    border-radius: 8px;
+                    padding: 10px;
+                    margin-bottom: 12px;
+                }
+                
+                .context-header {
+                    color: #aaa;
+                    font-size: 14px;
+                    margin-bottom: 8px;
                 }
             """),
         ),
@@ -446,6 +589,262 @@ def serve_fasthtml():
             "analyze_features": "Analyze the visible features of this organism. Describe its morphology, coloration, and any distinctive anatomical structures."
         }
         return queries.get(analysis_type, queries["classify_insect"])
+
+    # Retrieve relevant documents
+    async def retrieve_relevant_documents(query, top_k=5):
+        """Retrieve most relevant documents using ColPali embeddings and BM25"""
+        global colpali_model, colpali_processor, colpali_embeddings, df, bm25_index, tokenized_docs
+        
+        # Ensure models and data are loaded
+        ensure_colpali_model_loaded()
+        
+        if colpali_embeddings is None or df is None or len(df) == 0:
+            logging.error("No documents or embeddings available for retrieval")
+            return [], []
+            
+        retrieved_paragraphs = []
+        top_sources_data = []
+        
+        # ColPali retrieval (vector search)
+        try:
+            # Process query with ColPali
+            processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
+            with torch.no_grad():
+                query_embeddings = colpali_model(**processed_query)
+            
+            # Calculate similarities with all pages
+            similarities = []
+            for idx, page_emb in enumerate(colpali_embeddings):
+                # Convert page embedding to tensor with matching dtype
+                page_tensor = torch.tensor(page_emb, device=colpali_model.device, dtype=query_embeddings.dtype)
+                
+                # Score using ColPali's scoring method
+                score = float(colpali_processor.score_multi_vector(
+                    query_embeddings,
+                    page_tensor.unsqueeze(0)  # Add batch dimension
+                )[0])
+                
+                similarities.append((idx, score))
+            
+            # Sort by similarity score
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            vector_top_indices = [idx for idx, _ in similarities[:top_k]]
+            
+            # Try BM25 keyword search if available
+            keyword_top_indices = []
+            bm25_scores = None
+            if bm25_index is not None and tokenized_docs is not None:
+                try:
+                    # Tokenize query and get BM25 scores
+                    tokenized_query = word_tokenize(query.lower())
+                    bm25_scores = bm25_index.get_scores(tokenized_query)
+                    keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
+                except Exception as e:
+                    logging.error(f"Error in BM25 scoring: {e}")
+            
+            # Combine results (hybrid retrieval)
+            all_indices = list(set(vector_top_indices + keyword_top_indices))
+            
+            # Get data for reranking
+            docs_for_reranking = []
+            doc_indices = []
+            
+            for idx in all_indices:
+                if idx < len(df):
+                    # Get document info
+                    filename = df.iloc[idx]['filename']
+                    page_num = df.iloc[idx]['page']
+                    image_key = df.iloc[idx]['image_key']
+                    text = df.iloc[idx]['text']
+                    
+                    # Get vector score
+                    vector_score = 0.0
+                    for v_idx, score in similarities:
+                        if v_idx == idx:
+                            vector_score = score
+                            break
+                    
+                    # Get keyword score (if available)
+                    keyword_score = 0.0
+                    if bm25_scores is not None and len(bm25_scores) > idx:
+                        keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
+                    
+                    # Combine scores (weighted)
+                    alpha = 0.7  # Weight for vector search
+                    combined_score = alpha * vector_score + (1 - alpha) * keyword_score
+                    
+                    # Store for reranking
+                    docs_for_reranking.append(text)
+                    doc_indices.append(idx)
+                    
+                    # Add to results
+                    retrieved_paragraphs.append(text)
+                    top_sources_data.append({
+                        'filename': filename,
+                        'page': page_num,
+                        'score': combined_score,
+                        'vector_score': vector_score,
+                        'keyword_score': keyword_score,
+                        'image_key': image_key,
+                        'idx': idx
+                    })
+            
+            # Rerank results if we have documents
+            if docs_for_reranking:
+                try:
+                    # Use a cross-encoder reranker
+                    from rerankers import Reranker
+                    ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
+                    ranked_results = ranker.rank(query=query, docs=docs_for_reranking)
+                    top_ranked = ranked_results.top_k(min(3, len(docs_for_reranking)))
+                    
+                    # Get the final top documents after reranking
+                    final_retrieved_paragraphs = []
+                    final_top_sources = []
+                    
+                    for ranked_doc in top_ranked:
+                        ranked_idx = docs_for_reranking.index(ranked_doc.text)
+                        doc_idx = doc_indices[ranked_idx]
+                        source_info = next((s for s in top_sources_data if s['idx'] == doc_idx), None)
+                        if source_info:
+                            source_info['reranker_score'] = ranked_doc.score
+                            final_top_sources.append(source_info)
+                            final_retrieved_paragraphs.append(ranked_doc.text)
+                    
+                    return final_retrieved_paragraphs, final_top_sources
+                    
+                except Exception as e:
+                    logging.error(f"Error in reranking: {e}")
+            
+            # If reranking fails, sort by combined score
+            sorted_indices = sorted(range(len(top_sources_data)), 
+                                   key=lambda i: top_sources_data[i]['score'], 
+                                   reverse=True)
+            sorted_paragraphs = [retrieved_paragraphs[i] for i in sorted_indices[:3]]
+            sorted_sources = [top_sources_data[i] for i in sorted_indices[:3]]
+            
+            return sorted_paragraphs, sorted_sources
+            
+        except Exception as e:
+            logging.error(f"Error in document retrieval: {e}")
+            import traceback
+            traceback.print_exc()
+            return [], []
+
+    # Generate similarity maps for context document
+    async def generate_similarity_maps(query, image_key):
+        """Generate token similarity maps for a retrieved document"""
+        global colpali_model, colpali_processor, page_images
+        
+        if not image_key or image_key not in page_images:
+            logging.error(f"Invalid image key: {image_key}")
+            return []
+            
+        try:
+            # Get image path and load image
+            image_path = page_images[image_key]
+            if not os.path.exists(image_path):
+                logging.error(f"Image file not found: {image_path}")
+                return []
+                
+            # Load the image
+            image = Image.open(image_path)
+            
+            # Process query and image with ColPali
+            processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
+            batch_images = colpali_processor.process_images([image]).to(colpali_model.device)
+            
+            # Forward passes to get embeddings
+            with torch.no_grad():
+                query_embeddings = colpali_model(**processed_query)
+                image_embeddings = colpali_model(**batch_images)
+            
+            # Get the number of image patches
+            n_patches = colpali_processor.get_n_patches(
+                image_size=image.size,
+                patch_size=colpali_model.patch_size,
+                spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
+            )
+            
+            # Get image mask
+            image_mask = colpali_processor.get_image_mask(batch_images)
+            
+            # Generate similarity maps
+            batched_similarity_maps = get_similarity_maps_from_embeddings(
+                image_embeddings=image_embeddings,
+                query_embeddings=query_embeddings,
+                n_patches=n_patches,
+                image_mask=image_mask
+            )
+            
+            # Get the similarity map for this image
+            similarity_maps = batched_similarity_maps[0]  # (query_length, n_patches_x, n_patches_y)
+            
+            # Get tokens for the query
+            query_tokens = colpali_processor.tokenizer.tokenize(query)
+            
+            # Filter to meaningful tokens
+            token_sims = []
+            stopwords = set(["<bos>", "<eos>", "<pad>", "a", "an", "the", "in", "on", "at", "of", "for", "with", "by", "to", "from"])
+            
+            for token_idx, token in enumerate(query_tokens):
+                if token_idx >= similarity_maps.shape[0]:
+                    continue
+                    
+                # Skip stopwords and short tokens
+                if token in stopwords or len(token) <= 1:
+                    continue
+                    
+                token_clean = token[1:] if token.startswith("▁") else token
+                if token_clean and len(token_clean) > 1:
+                    max_sim = similarity_maps[token_idx].max().item()
+                    token_sims.append((token_idx, token, max_sim))
+            
+            # Sort by similarity score and take top tokens
+            token_sims.sort(key=lambda x: x[2], reverse=True)
+            top_tokens = token_sims[:6]  # Get top 6 tokens
+            
+            # Generate and save heatmaps
+            image_heatmaps = []
+            for token_idx, token, score in top_tokens:
+                # Skip if score is very low
+                if score < 0.1:
+                    continue
+                    
+                # Generate heatmap
+                fig, ax = plot_similarity_map(
+                    image=image,
+                    similarity_map=similarity_maps[token_idx],
+                    figsize=(8, 8),
+                    show_colorbar=False,
+                )
+                
+                # Clean token for display
+                token_display = token[1:] if token.startswith("▁") else token
+                ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
+                
+                # Save heatmap
+                heatmap_filename = f"{image_key}_token_{token_idx}.png"
+                heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
+                fig.savefig(heatmap_path, bbox_inches='tight')
+                plt.close(fig)
+                
+                # Add to list
+                image_heatmaps.append({
+                    "token": token_display,
+                    "score": score,
+                    "path": heatmap_filename,
+                    "token_idx": token_idx
+                })
+            
+            logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
+            return image_heatmaps
+            
+        except Exception as e:
+            logging.error(f"Error generating similarity maps: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     # Define UI components
     def upload_form():
@@ -520,72 +919,151 @@ def serve_fasthtml():
             hx_indicator="#loading-indicator",
         )
 
-    def analysis_results_ui(image_path, qwen_response, token_maps, analysis_id):
-        """Create UI to display analysis results"""
-        
-        # Create token map tabs
-        token_tabs = None
-        if token_maps:
-            # Create tab-style navigation for token maps
-            tab_buttons = [
-                Button(
-                    map_data['token'],
-                    hx_get=f"/get-token-map/{os.path.basename(map_data['path'])}",
-                    hx_target="#token-map-display",
-                    hx_trigger="click",
-                    cls=f"btn {'btn-primary' if i == 0 else 'btn-outline btn-secondary'} btn-sm m-1",
-                    id=f"token-tab-{i}"
-                )
-                for i, map_data in enumerate(token_maps)
-            ]
+    def token_maps_ui(image_key, heatmaps):
+        """Create token map UI with tabs and display area"""
+        if not heatmaps:
+            return Div("No token maps available", cls="text-zinc-400 text-center")
             
-            # Main token exploration UI
-            token_tabs = Div(
+        # Create a list of button elements first
+        tab_buttons = []
+        
+        # Create the tabs
+        for i, heatmap in enumerate(heatmaps):
+            token_class = "btn btn-sm token-tab " + ("btn-primary active" if i == 0 else "btn-outline")
+            token_tab = Button(
+                heatmap['token'],
+                cls=token_class,
+                hx_get=f"/token-map/{image_key}/{heatmap['token_idx']}",
+                hx_target="#token-map-display",
+                hx_swap="innerHTML",
+                id=f"token-tab-{i}"
+            )
+            # Add the button to our list
+            tab_buttons.append(token_tab)
+        
+        # Create token tabs Div with all buttons at once
+        token_tabs = Div(*tab_buttons, cls="flex flex-wrap gap-2 mb-4")
+        
+        # Create the full token maps container
+        return Div(
+            H3("Token Similarity Maps", cls="text-xl font-semibold text-white mb-2"),
+            P("See how the model focuses on different parts of the context document for each word in the query:", 
+              cls="text-zinc-300 mb-3"),
+            
+            # Token tabs navigation - using our complete Div with all buttons
+            token_tabs,
+            
+            # Token map display area
+            Div(
+                Div("Select a token above to see its heatmap", cls="text-zinc-400 text-center py-8"),
+                id="token-map-display",
+                cls="w-full bg-zinc-700 rounded-md overflow-hidden"
+            ),
+            
+            # JavaScript to handle tab interaction
+            Script("""
+            document.addEventListener('htmx:afterSwap', function() {
+                if (document.getElementById('token-tab-0')) {
+                    setTimeout(function() {
+                        document.getElementById('token-tab-0').click();
+                    }, 300);
+                }
+            });
+            
+            document.addEventListener('htmx:afterRequest', function(evt) {
+                if (evt.detail.target && evt.detail.target.id === 'token-map-display') {
+                    // Remove active class from all tabs
+                    document.querySelectorAll('[id^="token-tab-"]').forEach(function(tab) {
+                        tab.classList.remove('btn-primary', 'active');
+                        tab.classList.add('btn-outline');
+                    });
+                    
+                    // Add active class to clicked tab
+                    if (evt.detail.requestConfig.triggeringElement) {
+                        evt.detail.requestConfig.triggeringElement.classList.remove('btn-outline');
+                        evt.detail.requestConfig.triggeringElement.classList.add('btn-primary', 'active');
+                    }
+                }
+            });
+            """),
+            
+            cls="mt-6"
+        )
+
+    def context_document_ui(top_source):
+        """Create UI for displaying the context document"""
+        if not top_source:
+            return Div("No context document available", cls="text-zinc-400 text-center")
+            
+        # Get document info
+        image_key = top_source['image_key']
+        score = top_source.get('score', 0.0)
+        
+        # Create the document display
+        return Div(
+            H3("Context Document", cls="text-xl font-semibold text-white mb-2"),
+            P(f"The AI is using this document to help analyze your image (Score: {score:.2f}):", 
+              cls="text-zinc-300 mb-3"),
+            
+            # Document image
+            Div(
+                Img(
+                    src=f"/pdf-image/{image_key}",
+                    cls="w-full rounded-lg border border-zinc-700 max-h-80 object-contain mx-auto"
+                ),
+                cls="w-full mb-4"
+            ),
+            
+            cls="context-container mt-6"
+        )
+
+    def analysis_results_ui(image_path, qwen_response, context_paragraphs, top_sources, token_maps, analysis_id):
+        """Create UI to display analysis results with context and token maps"""
+        
+        # Context section
+        context_ui = None
+        if top_sources and context_paragraphs:
+            top_source = top_sources[0]
+            context_text = context_paragraphs[0] if context_paragraphs else ""
+            
+            context_ui = Div(
+                H3("Retrieved Context", cls="text-lg font-semibold text-white mb-2"),
+                
+                # Context container
+                Div(
+                    Div("The AI used this information to enhance its analysis:", cls="context-header"),
+                    P(context_text, cls="text-white text-sm"),
+                    cls="context-container"
+                ),
+                
+                # Context document display
+                context_document_ui(top_source),
+                
+                cls="mb-6"
+            )
+        
+        # Token maps section - with improved error handling
+        token_maps_section = None
+        if top_sources and token_maps and len(top_sources) > 0:
+            try:
+                top_source = top_sources[0]
+                image_key = top_source.get('image_key')
+                
+                if image_key and image_key in token_maps and token_maps[image_key]:
+                    token_maps_section = token_maps_ui(image_key, token_maps[image_key])
+            except Exception as e:
+                logging.error(f"Error rendering token maps: {e}")
+                token_maps_section = Div(
+                    H3("Token Similarity Maps", cls="text-xl font-semibold text-white mb-2"),
+                    P(f"Error displaying token maps: {str(e)}", cls="text-red-500"),
+                    cls="bg-zinc-800 p-4 rounded-md"
+                )
+        
+        if token_maps_section is None:
+            token_maps_section = Div(
                 H3("Token Similarity Maps", cls="text-xl font-semibold text-white mb-2"),
-                P("See how the model focuses on different parts of the image for each word in the query:", 
-                  cls="text-zinc-300 mb-3"),
-                
-                # Token tabs navigation
-                Div(
-                    *tab_buttons,
-                    cls="flex flex-wrap gap-2 mb-4"
-                ),
-                
-                # Token map display area
-                Div(
-                    Div("Select a token above to see its heatmap", cls="text-zinc-400 text-center py-8"),
-                    id="token-map-display",
-                    cls="w-full bg-zinc-700 rounded-md overflow-hidden"
-                ),
-                
-                Script("""
-                // Set up token tab clicks
-                document.addEventListener('htmx:afterSwap', function() {
-                    if (document.getElementById('token-tab-0')) {
-                        setTimeout(function() {
-                            document.getElementById('token-tab-0').click();
-                        }, 300);
-                    }
-                });
-                
-                document.addEventListener('htmx:afterRequest', function(evt) {
-                    if (evt.detail.target && evt.detail.target.id === 'token-map-display') {
-                        // Remove active class from all tabs
-                        document.querySelectorAll('[id^="token-tab-"]').forEach(function(tab) {
-                            tab.classList.remove('btn-primary');
-                            tab.classList.add('btn-outline', 'btn-secondary');
-                        });
-                        
-                        // Add active class to clicked tab
-                        if (evt.detail.requestConfig.triggeringElement) {
-                            evt.detail.requestConfig.triggeringElement.classList.remove('btn-outline', 'btn-secondary');
-                            evt.detail.requestConfig.triggeringElement.classList.add('btn-primary');
-                        }
-                    }
-                });
-                """),
-                
-                cls="mt-8"
+                P("No token maps available for this analysis.", cls="text-zinc-400"),
+                cls="bg-zinc-800 p-4 rounded-md"
             )
         
         return Div(
@@ -613,12 +1091,15 @@ def serve_fasthtml():
                         cls="mb-6"
                     ),
                     
+                    # Display context if available
+                    context_ui if context_ui else "",
+                    
                     cls="lg:w-1/2 lg:pr-4 mb-6 lg:mb-0"
                 ),
                 
-                # Right side - token maps (if available)
+                # Right side - token maps (with error handling)
                 Div(
-                    token_tabs if token_tabs else "",
+                    token_maps_section,
                     cls="lg:w-1/2 lg:pl-4"
                 ),
                 
@@ -641,19 +1122,33 @@ def serve_fasthtml():
         )
 
     # Define image processing functions
-    async def process_with_qwen(image, query, analysis_id):
-        """Process the image with Qwen LLM"""
+    async def process_with_qwen(image, query, context_text="", analysis_id=""):
+        """Process the image with Qwen LLM including context from retrieved documents"""
         logging.info(f"Processing image {analysis_id} with Qwen using query: {query}")
         
         try:
-            # Build the prompt for Qwen
-            prompt = f"""You are an expert biologist analyzing visual specimens.
+            # Build the prompt for Qwen, including context if available
+            system_prompt = "You are an expert biologist analyzing visual specimens."
+            
+            if context_text:
+                prompt = f"""{system_prompt}
 
-    Query: {query}
+Query: {query}
 
-    Provide a detailed, scientifically accurate response with proper taxonomic terminology.
-    Keep your answer under 5 sentences but be thorough and precise.
-    """
+Relevant context from scientific literature:
+{context_text}
+
+Examine the image and provide a detailed, scientifically accurate response using the context where relevant.
+Keep your answer under 5 sentences but be thorough and precise.
+"""
+            else:
+                prompt = f"""{system_prompt}
+
+Query: {query}
+
+Provide a detailed, scientifically accurate response with proper taxonomic terminology.
+Keep your answer under 5 sentences but be thorough and precise.
+"""
             
             # Use streaming approach which is more reliable
             vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
@@ -688,105 +1183,6 @@ def serve_fasthtml():
             traceback.print_exc()
             return f"Error: {str(e)}"
         
-    async def generate_similarity_maps(image, query, analysis_id):
-        """Generate token similarity maps using ColQwen"""
-        logging.info(f"Generating similarity maps for {analysis_id} with query: {query}")
-        
-        try:
-            # Ensure ColQwen model is loaded
-            if not ensure_colqwen_model_loaded():
-                logging.error("Failed to load ColQwen model")
-                return None
-                
-            # Process the query and image with ColQwen
-            processed_image = colpali_processor.process_images([image]).to(colpali_model.device)
-            processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
-            
-            logging.info("Processing image and query with ColQwen")
-            
-            # Forward pass to get embeddings
-            with torch.no_grad():
-                image_embedding = colpali_model(**processed_image)
-                query_embedding = colpali_model(**processed_query)
-            
-            # Get the number of image patches
-            n_patches = colpali_processor.get_n_patches(
-                image_size=image.size,
-                patch_size=colpali_model.patch_size,
-                spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
-            )
-            
-            logging.info(f"Image patches: {n_patches}")
-            
-            # Get the image mask
-            image_mask = colpali_processor.get_image_mask(processed_image)
-            
-            # Generate the similarity maps
-            similarity_maps = get_similarity_maps_from_embeddings(
-                image_embeddings=image_embedding,
-                query_embeddings=query_embedding,
-                n_patches=n_patches,
-                image_mask=image_mask
-            )[0]
-            
-            # Get tokens for reference
-            query_content = colpali_processor.decode(processed_query.input_ids[0]).replace(
-                colpali_processor.tokenizer.pad_token, "")
-                
-            # Handle query augmentation token if it exists
-            query_augmentation_token = getattr(colpali_processor, 'query_augmentation_token', None)
-            if query_augmentation_token is not None:
-                query_content = query_content.replace(query_augmentation_token, "").strip()
-                
-            # Tokenize the query
-            query_tokens = colpali_processor.tokenizer.tokenize(query_content)
-            
-            logging.info(f"Generated {len(query_tokens)} tokens: {query_tokens[:10]}")
-            
-            # Filter and save token maps
-            token_maps = []
-            for idx, token in enumerate(query_tokens[:10]):  # Process up to 10 tokens
-                if idx >= similarity_maps.shape[0]:
-                    break
-                    
-                # Get meaningful tokens - skip very short or empty ones
-                token_text = str(token).strip()
-                if len(token_text) <= 1 or token_text in ["", ".", ",", "?", "!"]:
-                    continue
-                    
-                # Generate the visualization
-                try:
-                    fig, ax = plot_similarity_map(
-                        image=image,
-                        similarity_map=similarity_maps[idx],
-                        figsize=(10, 10),
-                        show_colorbar=True
-                    )
-                    
-                    # Add a title with the token
-                    max_sim = similarity_maps[idx].max().item()
-                    ax.set_title(f"Token: '{token}' (MaxSim: {max_sim:.2f})")
-                    
-                    # Save to a temporary file
-                    map_path = os.path.join(TEMP_UPLOAD_DIR, f"{analysis_id}_token_{idx}.png")
-                    fig.savefig(map_path, dpi=120)
-                    plt.close(fig)
-                    
-                    # Only use first several meaningful tokens to avoid cluttering the UI
-                    if len(token_maps) < 5:
-                        token_maps.append({"token": token, "path": map_path, "index": idx})
-                except Exception as plot_error:
-                    logging.error(f"Error plotting similarity map for token {token}: {plot_error}")
-            
-            logging.info(f"Generated {len(token_maps)} token maps for {analysis_id}")
-            return token_maps
-            
-        except Exception as e:
-            logging.error(f"Exception in generate_similarity_maps: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return None    
-    
     # Main route for homepage
     @rt("/")
     def get(session):
@@ -898,6 +1294,12 @@ def serve_fasthtml():
         # Create a temporary path to save the image
         os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
         filename = getattr(image_file, 'filename', f"image_{analysis_id}.jpg")
+        # Make sure we have a clean filename with no spaces or special characters
+        safe_filename = "".join(c for c in filename if c.isalnum() or c in "._-")
+        if safe_filename != filename:
+            logging.info(f"Sanitized filename from '{filename}' to '{safe_filename}'")
+            filename = safe_filename
+        
         image_path = os.path.join(TEMP_UPLOAD_DIR, f"{analysis_id}_{filename}")
         
         # Save the uploaded image
@@ -907,8 +1309,18 @@ def serve_fasthtml():
             content = await image_file.read()
             with open(image_path, "wb") as f:
                 f.write(content)
+            
+            # Verify the file was saved
+            if os.path.exists(image_path):
+                file_size = os.path.getsize(image_path)
+                logging.info(f"Image saved successfully: {image_path} (size: {file_size} bytes)")
+            else:
+                logging.error(f"Failed to save image, file doesn't exist: {image_path}")
+                return Div(f"Error saving image: File doesn't exist after write operation", cls="text-red-500")
         except Exception as e:
             logging.error(f"Error saving image: {e}")
+            import traceback
+            traceback.print_exc()
             return Div(f"Error saving image: {str(e)}", cls="text-red-500")
         
         # Open the image for processing
@@ -917,6 +1329,8 @@ def serve_fasthtml():
             logging.info(f"Image opened: {image.size}, {image.mode}")
         except Exception as e:
             logging.error(f"Error opening image: {e}")
+            import traceback
+            traceback.print_exc()
             return Div(f"Error opening image: {str(e)}", cls="text-red-500")
         
         # Get the appropriate query based on analysis type
@@ -925,69 +1339,249 @@ def serve_fasthtml():
         
         # Save analysis to database
         try:
-            analysis = ImageAnalysis(
-                analysis_id=analysis_id,
-                image_path=image_path,
-                analysis_type=analysis_type,
-                query=query
+            # Use direct SQLite for more reliable database operations
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO image_analyses (analysis_id, image_path, analysis_type, query) VALUES (?, ?, ?, ?)",
+                (analysis_id, image_path, analysis_type, query)
             )
-            sqlalchemy_session.add(analysis)
-            sqlalchemy_session.commit()
+            conn.commit()
+            conn.close()
             logging.info(f"Analysis record created in database: {analysis_id}")
         except Exception as db_error:
             logging.error(f"Database error: {db_error}")
-            sqlalchemy_session.rollback()
+            import traceback
+            traceback.print_exc()
         
-        # Process with Qwen
-        qwen_response = await process_with_qwen(image, query, analysis_id)
+        # Retrieve relevant documents for context
+        retrieved_paragraphs, top_sources = await retrieve_relevant_documents(query)
+        
+        if not top_sources:
+            logging.warning("No relevant documents found for context")
+        else:
+            logging.info(f"Found {len(top_sources)} relevant documents, top score: {top_sources[0].get('score', 0)}")
+        
+        # Generate context text
+        context_text = "\n\n".join(retrieved_paragraphs) if retrieved_paragraphs else ""
+        
+        # Generate similarity maps for top document
+        token_maps = {}
+        if top_sources:
+            top_source = top_sources[0]
+            image_key = top_source.get('image_key')
+            
+            if image_key:
+                logging.info(f"Generating similarity maps for image key: {image_key}")
+                
+                # Update database with context source if column exists
+                try:
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+                    # Check if the column exists first
+                    cursor.execute("PRAGMA table_info(image_analyses)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    if 'context_source' in columns:
+                        cursor.execute(
+                            "UPDATE image_analyses SET context_source = ? WHERE analysis_id = ?",
+                            (f"{top_source['filename']} (page {top_source['page']})", analysis_id)
+                        )
+                        conn.commit()
+                    conn.close()
+                except Exception as db_error:
+                    logging.error(f"Database error updating context source: {db_error}")
+                
+                # Generate token maps
+                image_heatmaps = await generate_similarity_maps(query, image_key)
+                if image_heatmaps:
+                    logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
+                    token_maps[image_key] = image_heatmaps
+                else:
+                    logging.warning(f"No token heatmaps generated for {image_key}")
+            else:
+                logging.warning("Top source missing image_key")
+        
+        # Process with Qwen (including context)
+        qwen_response = await process_with_qwen(image, query, context_text, analysis_id)
         
         # Update database with response
         try:
-            analysis = sqlalchemy_session.query(ImageAnalysis).filter_by(analysis_id=analysis_id).first()
-            if analysis:
-                analysis.response = qwen_response
-                sqlalchemy_session.commit()
-                logging.info(f"Updated analysis record with response: {analysis_id}")
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE image_analyses SET response = ? WHERE analysis_id = ?",
+                (qwen_response, analysis_id)
+            )
+            conn.commit()
+            conn.close()
+            logging.info(f"Updated analysis record with response: {analysis_id}")
         except Exception as db_error:
             logging.error(f"Database error updating response: {db_error}")
-            sqlalchemy_session.rollback()
         
-        # Generate similarity maps with ColQwen
-        token_maps = await generate_similarity_maps(image, query, analysis_id)
+        # Add a log just before returning UI
+        logging.info(f"Rendering UI with: image={os.path.basename(image_path)}, token_maps={len(token_maps)}, top_sources={len(top_sources)}")
         
         # Return the analysis results UI
-        logging.info(f"Returning analysis results UI for {analysis_id}")
-        return analysis_results_ui(image_path, qwen_response, token_maps, analysis_id)
-
-    @rt("/get-token-map/{filename}")
-    async def get_token_map(filename: str):
-        """Return the token map image HTML for display in the UI"""
-        # Get the file path
-        image_path = os.path.join(TEMP_UPLOAD_DIR, filename)
-        
-        if not os.path.exists(image_path):
-            return Div("Token map not found", cls="text-red-500 p-4")
-            
-        # Return the HTML for the token map display
-        return Div(
-            Img(
-                src=f"/temp-image/{filename}",
-                cls="mx-auto max-h-96 w-full object-contain"
-            ),
-            cls="p-2 flex items-center justify-center min-h-[300px]"
+        return analysis_results_ui(
+            image_path=image_path, 
+            qwen_response=qwen_response, 
+            context_paragraphs=retrieved_paragraphs,
+            top_sources=top_sources, 
+            token_maps=token_maps, 
+            analysis_id=analysis_id
         )
 
-    @rt("/temp-image/{filename}")
+    
+
+    @fasthtml_app.get("/temp-image/{filename}")
     async def serve_temp_image(filename: str):
         """Serve temporary images (uploads and similarity maps)"""
         image_path = os.path.join(TEMP_UPLOAD_DIR, filename)
+        logging.info(f"Requested temp image: {filename}, looking at: {image_path}")
         
-        if not os.path.exists(image_path):
-            logging.error(f"Image not found: {image_path}")
-            return Response(content=f"Image not found: {filename}", 
-                        media_type="text/plain", status_code=404)
+        if os.path.exists(image_path):
+            logging.info(f"Found temp image at: {image_path}")
+            return FastAPIFileResponse(image_path, media_type=f"image/{os.path.splitext(filename)[1][1:]}")
+        else:
+            logging.error(f"Temp image not found: {image_path}")
+            # List files in the directory for debugging
+            try:
+                files = os.listdir(TEMP_UPLOAD_DIR)
+                logging.info(f"Files in {TEMP_UPLOAD_DIR}: {files[:10]}")  # First 10 files
+            except Exception as e:
+                logging.error(f"Error listing directory: {e}")
+            
+            return StarletteResponse(
+                content=f"Image not found: {filename}", 
+                media_type="text/plain", 
+                status_code=404
+            )
+
+    @fasthtml_app.get("/pdf-image/{image_key}")
+    async def get_pdf_image(image_key: str):
+        """Serve PDF page images"""
+        logging.info(f"Image request for key: {image_key}")
+        try:
+            if image_key in page_images:
+                image_path = page_images[image_key]
+                logging.info(f"Found image path: {image_path}")
+                if os.path.exists(image_path):
+                    logging.info(f"Image file exists, serving from: {image_path}")
+                    return FastAPIFileResponse(image_path, media_type="image/png")
+                else:
+                    logging.error(f"Image file does not exist at path: {image_path}")
+                    # Try to find the image by reconstructing path patterns
+                    parts = image_key.split('_')
+                    if len(parts) >= 2:
+                        filename = '_'.join(parts[:-1])
+                        page_num = int(parts[-1]) if parts[-1].isdigit() else 0
+                        potential_paths = [
+                            # Check different path patterns
+                            os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                            os.path.join(PDF_IMAGES_DIR, f"{filename}", f"page_{page_num}.png"),
+                            os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
+                        ]
+                        
+                        for path in potential_paths:
+                            logging.info(f"Trying alternative path: {path}")
+                            if os.path.exists(path):
+                                logging.info(f"Found image at alternative path: {path}")
+                                return FastAPIFileResponse(path, media_type="image/png")
+            else:
+                logging.error(f"Image key '{image_key}' not found in page_images dictionary")
+                # List available keys for debugging
+                available_keys = list(page_images.keys())[:10]  # First 10 keys
+                logging.info(f"Available keys (first 10): {available_keys}")
+        except Exception as e:
+            logging.error(f"Error in get_pdf_image: {str(e)}")
+            import traceback
+            traceback.print_exc()
         
-        return FileResponse(image_path, media_type=f"image/{os.path.splitext(filename)[1][1:]}")
+        # Return a placeholder image or error response
+        return StarletteResponse(
+            content=f"Image not found for key: {image_key}", 
+            media_type="text/plain", 
+            status_code=404
+        )
+    #
+    
+    @fasthtml_app.get("/heatmap-image/{filename}")
+    async def get_heatmap_image(filename: str):
+        """Serve heatmap images"""
+        heatmap_path = os.path.join(HEATMAP_DIR, filename)
+        logging.info(f"Looking for heatmap image: {heatmap_path}")
+        
+        if os.path.exists(heatmap_path):
+            logging.info(f"Found heatmap at: {heatmap_path}, size: {os.path.getsize(heatmap_path)} bytes")
+            try:
+                # Open and read the file directly
+                with open(heatmap_path, "rb") as f:
+                    content = f.read()
+                    
+                # Return as binary response
+                return Response(
+                    content=content,
+                    media_type="image/png"
+                )
+            except Exception as e:
+                logging.error(f"Error reading heatmap file: {e}")
+                import traceback
+                traceback.print_exc()
+                return Response(
+                    content=f"Error reading heatmap: {str(e)}",
+                    media_type="text/plain",
+                    status_code=500
+                )
+        else:
+            logging.error(f"Heatmap image not found: {heatmap_path}")
+            # List what files do exist in the directory
+            try:
+                files = os.listdir(HEATMAP_DIR)
+                matching_files = [f for f in files if f.startswith(filename.split('_token_')[0])]
+                logging.info(f"Files in {HEATMAP_DIR} that match prefix: {matching_files}")
+            except Exception as e:
+                logging.error(f"Error listing directory: {e}")
+                
+            return Response(
+                content=f"Heatmap not found: {filename}",
+                media_type="text/plain",
+                status_code=404
+            )
+
+    # Also update the token_map route to use a direct image reference rather than going through heatmap-image
+    @fasthtml_app.get("/token-map/{image_key}/{token_idx}")
+    async def get_token_map(image_key: str, token_idx: int):
+        """Return the token map image HTML for display in the UI"""
+        # Get the file path
+        heatmap_filename = f"{image_key}_token_{token_idx}.png"
+        heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
+        logging.info(f"Looking for token map: {heatmap_path}")
+        
+        if os.path.exists(heatmap_path):
+            logging.info(f"Found token map at: {heatmap_path}")
+            # Encode the image directly to base64 for inline display
+            try:
+                with open(heatmap_path, "rb") as f:
+                    img_data = f.read()
+                    base64_img = base64.b64encode(img_data).decode('utf-8')
+                    
+                # Use an inline data URL instead of a separate request
+                return Div(
+                    Img(
+                        src=f"data:image/png;base64,{base64_img}",
+                        cls="mx-auto max-h-96 w-full object-contain token-map"
+                    ),
+                    cls="p-2 flex items-center justify-center min-h-[300px]"
+                )
+            except Exception as e:
+                logging.error(f"Error reading token map file: {e}")
+                import traceback
+                traceback.print_exc()
+                return Div(f"Error reading token map: {str(e)}", cls="text-red-500 p-4")
+        else:
+            logging.error(f"Token map not found at: {heatmap_path}")
+            return Div(f"Token map not found for {image_key} token {token_idx}", cls="text-red-500 p-4")
+
 
     return fasthtml_app
 
