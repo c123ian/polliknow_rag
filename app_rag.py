@@ -35,12 +35,12 @@ from rerankers import Reranker
 from io import BytesIO
 
 # Constants
-QWEN_MODELS_DIR = "/Qwen"  # existing volume
+MISTRAL_MODELS_DIR = "/Mistral"  # volume for Mistral models
 COLQWEN_MODELS_DIR = "/ColQwen"  # volume for ColQwen2 models
 DATA_DIR = "/bee_pdf"
 TEMP_UPLOAD_DIR = "/bee_pdf/temp_uploads"
 HEATMAP_DIR = "/bee_pdf/heatmaps"  # Directory for storing heatmaps
-DEFAULT_QWEN_NAME = "Qwen/Qwen2.5-7B-Instruct-1M"
+DEFAULT_MISTRAL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
 DEFAULT_COLQWEN_NAME = "vidore/colqwen2-v1.0"
 USERNAME = "c123ian"
 APP_NAME = "polliknow-rag"
@@ -91,9 +91,9 @@ conn.close()
 
 # Set up volumes
 try:
-    qwen_volume = modal.Volume.lookup("Qwen", create_if_missing=False)
+    mistral_volume = modal.Volume.lookup("Mistral", create_if_missing=False)
 except modal.exception.NotFoundError:
-    raise Exception("Download Qwen models first with the appropriate script")
+    raise Exception("Download Mistral models first with the appropriate script")
 
 try:
     colqwen_volume = modal.Volume.lookup("ColQwen", create_if_missing=False)
@@ -113,7 +113,8 @@ except modal.exception.NotFoundError:
 # Setup image with required dependencies
 image = modal.Image.debian_slim(python_version="3.10") \
     .pip_install(
-        "vllm==0.7.2",
+        "vllm==0.8.1",              # Updated to minimum required version
+        "mistral_common>=1.5.4",    # Required for Mistral 3.1
         "python-fasthtml==0.4.3",
         "aiohttp",
         "faiss-cpu",
@@ -121,29 +122,33 @@ image = modal.Image.debian_slim(python_version="3.10") \
         "pandas",
         "numpy",
         "huggingface_hub",
-        "transformers==4.48.3",
+        "transformers>=4.48.3",      # Use latest transformers
         "rerankers",
         "sqlite-minutils",
         "rank-bm25",
         "nltk",
         "sqlalchemy",
         "pdf2image",
-        "colpali-engine[interpretability]>=0.3.2",  # Add interpretability extras
+        "colpali-engine[interpretability]>=0.3.2",
         "torch",
-        "matplotlib"
+        "matplotlib",
+        "accelerate",
+        "einops",
+        "timm",
+        "pillow"
     )
 
 app = modal.App(APP_NAME)
 
-# Create app function for Qwen LLM serving
+# Create app function for Mistral LLM serving
 @app.function(
     image=image,
-    gpu=modal.gpu.A10G(count=1),
+    gpu=modal.gpu.A100(count=1, size="80GB"),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=100,
     volumes={
-        QWEN_MODELS_DIR: qwen_volume,
+        MISTRAL_MODELS_DIR: mistral_volume,
         COLQWEN_MODELS_DIR: colqwen_volume,
         DATA_DIR: bee_volume,
         DATABASE_DIR: db_volume
@@ -157,7 +162,7 @@ def serve_vllm():
     import uuid
     import datetime
     from fastapi.responses import StreamingResponse, JSONResponse
-    from typing import Optional
+    from typing import Optional, Dict, Any, List
 
     from vllm.config import ModelConfig
     from vllm.engine.arg_utils import AsyncEngineArgs
@@ -167,10 +172,10 @@ def serve_vllm():
     from vllm.entrypoints.logger import RequestLogger
     from vllm.sampling_params import SamplingParams
 
-    MODELS_DIR = "/Qwen"
+    MODELS_DIR = MISTRAL_MODELS_DIR
 
     web_app = fastapi.FastAPI(
-        title=f"OpenAI-compatible {DEFAULT_QWEN_NAME} server",
+        title=f"OpenAI-compatible {DEFAULT_MISTRAL_NAME} server",
         description="Run an OpenAI-compatible LLM server with vLLM",
         version="0.0.1",
         docs_url="/docs",
@@ -194,19 +199,66 @@ def serve_vllm():
 
     tokenizer_path = find_tokenizer_path(MODELS_DIR)
     if not tokenizer_path:
-        raise Exception(f"Could not find tokenizer files in {MODELS_DIR}")
+        # For Mistral 3.1, the tokenizer might be in the model directory
+        tokenizer_path = model_path
 
     logging.info(f"Initializing AsyncLLMEngine with model path: {model_path} and tokenizer path: {tokenizer_path}")
 
+    # Following the specific Mistral recommendations from the model card
     engine_args = AsyncEngineArgs(
         model=model_path,
         tokenizer=tokenizer_path,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.95,
-        max_model_len=94192
+        max_model_len=32768,
+        dtype="bfloat16",
+        # Mistral-specific parameters
+        tokenizer_mode="mistral",
+        config_format="mistral",
+        load_format="mistral",
+        # Enable vision model support
+        limit_mm_per_prompt={"image": 10},
     )
 
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    try:
+        engine = AsyncLLMEngine.from_engine_args(engine_args)
+        logging.info("Successfully initialized AsyncLLMEngine")
+    except Exception as e:
+        logging.error(f"Error initializing AsyncLLMEngine: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Fall back to direct vLLM approach if the AsyncLLMEngine fails
+        try:
+            logging.info("Attempting alternative vLLM initialization...")
+            from vllm import LLM
+            
+            # Initialize with simpler parameters
+            llm = LLM(
+                model=model_path,
+                tokenizer=tokenizer_path,
+                tokenizer_mode="mistral",
+                trust_remote_code=True,
+                dtype="bfloat16",
+                tensor_parallel_size=1,
+                gpu_memory_utilization=0.95,
+            )
+            
+            # Create a compatibility wrapper that mimics AsyncLLMEngine
+            class CompatibilityEngine:
+                def __init__(self, llm):
+                    self.llm = llm
+                    
+                async def generate(self, prompt, sampling_params, request_id):
+                    # Convert to synchronous call
+                    outputs = self.llm.generate(prompt, sampling_params)
+                    return outputs
+                    
+            engine = CompatibilityEngine(llm)
+            logging.info("Initialized alternative LLM engine")
+        except Exception as fallback_error:
+            logging.error(f"Failed to initialize alternative engine: {fallback_error}")
+            raise
 
     event_loop: Optional[asyncio.AbstractEventLoop] = None
     try:
@@ -219,7 +271,7 @@ def serve_vllm():
     else:
         model_config = asyncio.run(engine.get_model_config())
 
-    models = OpenAIServingModels(engine_client=engine, model_config=model_config, base_model_paths={DEFAULT_QWEN_NAME: model_path})
+    models = OpenAIServingModels(engine_client=engine, model_config=model_config, base_model_paths={DEFAULT_MISTRAL_NAME: model_path})
     request_logger = RequestLogger(max_log_len=256)
 
     openai_serving_chat = OpenAIServingChat(
@@ -244,7 +296,7 @@ def serve_vllm():
             logging.info(f"Received completion request: max_tokens={max_tokens}, stream={stream}")
 
             sampling_params = SamplingParams(
-                temperature=0.7,
+                temperature=0.15,  # Lower for Mistral
                 max_tokens=max_tokens,
                 stop=["User:", "Assistant:", "\n\n"],
             )
@@ -316,67 +368,183 @@ def serve_vllm():
 
     @web_app.post("/v1/chat/completions")
     async def chat_completions(request: fastapi.Request) -> JSONResponse:
-        """Handle multimodal chat completions"""
+        """Handle multimodal chat completions for Mistral Vision"""
         try:
             body = await request.json()
+            logging.debug(f"Full chat request body: {body}")
+            
             messages = body.get("messages", [])
-            model = body.get("model", DEFAULT_QWEN_NAME)
+            model = body.get("model", DEFAULT_MISTRAL_NAME)
             max_tokens = body.get("max_tokens", 500)
+            temperature = body.get("temperature", 0.15)  # Mistral recommends 0.15
+            top_p = body.get("top_p", 0.95)
             request_id = str(uuid.uuid4())
             
             logging.info(f"Received chat completion request for model {model}")
             
-            # Convert to standard text prompt format for now
-            prompt = ""
+            # Format messages according to Mistral's expected format
+            formatted_messages = []
             for message in messages:
-                role = message.get("role", "user")
-                content = message.get("content", "")
-                
-                # Handle multimodal content
-                if isinstance(content, list):
-                    for item in content:
-                        if item.get("type") == "text":
-                            prompt += f"{role.title()}: {item.get('text', '')}\n"
-                        elif item.get("type") == "image_url":
-                            prompt += f"{role.title()}: [Image content provided]\n"
+                if message.get("role") == "system":
+                    # For Mistral 3.1, add system prompt using special tokens
+                    system_content = message.get("content", "")
+                    if isinstance(system_content, list):
+                        # Handle multimodal system prompt if needed
+                        system_text = " ".join([item.get("text", "") for item in system_content if item.get("type") == "text"])
+                    else:
+                        system_text = system_content
+                    
+                    # Add formatted system prompt
+                    formatted_messages.append({
+                        "role": "system",
+                        "content": system_text
+                    })
                 else:
-                    prompt += f"{role.title()}: {content}\n"
+                    # Pass user and assistant messages as is
+                    formatted_messages.append(message)
             
-            # Add assistant prompt
-            prompt += "Assistant:"
-            
-            # Generate response with vLLM
+            # Build sampling params
             sampling_params = SamplingParams(
-                temperature=0.7,
+                temperature=temperature,
+                top_p=top_p,
                 max_tokens=max_tokens,
-                stop=["User:", "System:", "\n\n"],
+                stop=body.get("stop", None)
             )
             
-            outputs = await engine.generate(prompt, sampling_params, request_id)
-            
-            if len(outputs.outputs) > 0:
-                response_text = outputs.outputs[0].text
-                # Remove any prefix if present
-                response_text = response_text.split("Assistant:")[-1].lstrip()
+            # Try Direct OpenAI API Compatible Format first
+            try:
+                # Use mistral_common if available for proper chat formatting
+                try:
+                    import mistral_common
+                    logging.info(f"Using mistral_common version: {mistral_common.__version__}")
+                except ImportError:
+                    logging.warning("mistral_common not available")
                 
-                return JSONResponse(content={
-                    "id": request_id,
-                    "object": "chat.completion",
-                    "created": int(datetime.datetime.now().timestamp()),
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": response_text
-                            },
-                            "finish_reason": "stop"
+                # For multimodal models, we use the openai_serving_chat instance if available
+                try:
+                    if 'openai_serving_chat' in globals():
+                        response = await openai_serving_chat.create_chat_completion(
+                            request_id=request_id,
+                            model=model,
+                            messages=formatted_messages,
+                            sampling_params=sampling_params,
+                            stream=False
+                        )
+                        return JSONResponse(content=response)
+                    else:
+                        logging.warning("openai_serving_chat not available, using engine directly")
+                        raise AttributeError("openai_serving_chat not available")
+                except Exception as api_error:
+                    logging.error(f"Error in OpenAI chat completion: {api_error}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+            except Exception as e:
+                logging.error(f"Direct API approach failed: {e}")
+                
+                # Fall back to manual prompt construction
+                logging.info("Falling back to manual prompt construction")
+                
+                # Build a prompt in Mistral's expected format
+                # Format: <s>[SYSTEM_PROMPT]<system prompt>[/SYSTEM_PROMPT][INST]<user message>[/INST]<assistant response></s>[INST]<user message>[/INST]
+                
+                system_content = ""
+                for message in messages:
+                    if message.get("role") == "system":
+                        content = message.get("content", "")
+                        if isinstance(content, list):
+                            # Get only text from system prompt
+                            system_content = " ".join([item.get("text", "") for item in content if item.get("type") == "text"])
+                        else:
+                            system_content = content
+                        break
+                
+                # Build the conversation prompt with Mistral's format
+                prompt = f"<s>[SYSTEM_PROMPT]{system_content}[/SYSTEM_PROMPT]"
+                
+                # Add conversation messages
+                user_content = None
+                for message in messages:
+                    role = message.get("role")
+                    content = message.get("content")
+                    
+                    # Skip system messages as they're already handled
+                    if role == "system":
+                        continue
+                        
+                    if role == "user":
+                        # For the last user message, save it for special handling
+                        user_content = content
+                        continue
+                    elif role == "assistant":
+                        if isinstance(content, list):
+                            # Get only text from assistant
+                            text_content = " ".join([item.get("text", "") for item in content if item.get("type") == "text"])
+                            prompt += f"[INST]{user_content if user_content else ''}[/INST]{text_content}</s>"
+                        else:
+                            prompt += f"[INST]{user_content if user_content else ''}[/INST]{content}</s>"
+                        user_content = None
+                
+                # Add the final user message if there is one
+                if user_content is not None:
+                    if isinstance(user_content, list):
+                        # Handle multimodal content specially
+                        text_parts = []
+                        has_images = False
+                        
+                        for item in user_content:
+                            if item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                            elif item.get("type") == "image_url":
+                                has_images = True
+                                # Just note that there's an image - we'll add it to the model inputs directly
+                                text_parts.append("[IMAGE]")
+                        
+                        text_content = " ".join(text_parts)
+                        prompt += f"[INST]{text_content}[/INST]"
+                        
+                        if has_images:
+                            logging.warning("Direct image handling not supported in manual mode - using text-only prompt")
+                    else:
+                        prompt += f"[INST]{user_content}[/INST]"
+                
+                # Generate output
+                logging.info(f"Using manual prompt: {prompt[:100]}...")
+                outputs = await engine.generate(prompt, sampling_params, request_id)
+                
+                if outputs and hasattr(outputs, 'outputs') and len(outputs.outputs) > 0:
+                    response_text = outputs.outputs[0].text.strip()
+                    
+                    # Create OpenAI-compatible response
+                    response_json = {
+                        "id": request_id,
+                        "object": "chat.completion",
+                        "created": int(datetime.datetime.now().timestamp()),
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": response_text
+                                },
+                                "finish_reason": "stop"
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": -1,  # Not available
+                            "completion_tokens": -1,  # Not available
+                            "total_tokens": -1  # Not available
                         }
-                    ]
-                })
-            else:
-                return JSONResponse(content={"error": "No output generated"}, status_code=500)
-                
+                    }
+                    
+                    return JSONResponse(content=response_json)
+                else:
+                    logging.error("No output generated or invalid output structure")
+                    return JSONResponse(
+                        content={"error": "No output generated or invalid output structure"}, 
+                        status_code=500
+                    )
         except Exception as e:
             logging.error(f"Error in chat_completions: {str(e)}")
             import traceback
@@ -962,10 +1130,10 @@ def serve_fasthtml():
             logging.error(f"Error generating image description: {str(e)}")
             return None
 
-    # Process image with Qwen LLM - FIXED VERSION FOR MULTIMODAL
+    # Process image with Mistral Vision
     async def process_with_qwen(image, query, context_text="", analysis_id=""):
-        """Process the image with Qwen LLM including context from retrieved documents"""
-        logging.info(f"Processing image {analysis_id} with Qwen using query: {query}")
+        """Process the image with Mistral Vision including context from retrieved documents"""
+        logging.info(f"Processing image {analysis_id} with Mistral Vision using query: {query}")
         
         try:
             # Convert image to base64 for transmission
@@ -974,67 +1142,62 @@ def serve_fasthtml():
             img_data = img_buffer.getvalue()
             base64_img = base64.b64encode(img_data).decode("utf-8")
             
-            # Build the prompt for Qwen, including context if available
-            system_prompt = "You are an expert biologist analyzing visual specimens."
+            # Build the system prompt for Mistral
+            system_prompt = """You are an expert biologist analyzing visual specimens. 
+            Provide detailed, scientific analysis with proper taxonomic terminology.
+            Always be thorough but concise, keeping responses under 5 sentences."""
             
             # Log image info for debugging
             logging.info(f"Image for analysis: {image.format} {image.size}, {len(base64_img)} bytes base64")
             
-            # Check if we should use direct ColQwen processing instead
+            # Build user content with text and image
+            user_content = []
+            
+            # Add text content
+            text_content = query
             if context_text:
-                # For context-aware analysis
-                prompt = f"""{system_prompt}
-
-Query: {query}
-
-Relevant context from scientific literature:
-{context_text}
-
-Examine the image and provide a detailed, scientifically accurate response using the context where relevant.
-Keep your answer under 5 sentences but be thorough and precise.
-"""
-            else:
-                # For direct image analysis
-                prompt = f"""{system_prompt}
-
-Query: {query}
-
-Provide a detailed, scientifically accurate response with proper taxonomic terminology.
-Keep your answer under 5 sentences but be thorough and precise.
-"""
-
-            # Create a multimodal message format
+                text_content += f"\n\nRelevant context from scientific literature:\n{context_text}\n\nExamine the image and provide a detailed, scientifically accurate response using the context where relevant."
+            
+            user_content.append({"type": "text", "text": text_content})
+            
+            # Add image content - Mistral expects this format
+            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}})
+            
+            # Create the chat completion request in Mistral's format
             multimodal_message = {
-                "model": DEFAULT_QWEN_NAME,
+                "model": DEFAULT_MISTRAL_NAME,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": f"{query}\n\n{context_text if context_text else ''}"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
-                    ]}
+                    {"role": "user", "content": user_content}
                 ],
-                "max_tokens": 500
+                "max_tokens": 500,
+                "temperature": 0.15  # Mistral recommends low temperature
             }
             
-            # First try with multimodal API endpoint (if available)
+            # Call the multimodal endpoint
             multimodal_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/chat/completions"
-            logging.info(f"Trying multimodal endpoint: {multimodal_url}")
+            logging.info(f"Calling Mistral Vision endpoint: {multimodal_url}")
             
             async with aiohttp.ClientSession() as client_session:
                 try:
-                    async with client_session.post(multimodal_url, json=multimodal_message, timeout=60) as response:
+                    async with client_session.post(multimodal_url, json=multimodal_message, timeout=120) as response:
                         if response.status == 200:
                             result = await response.json()
                             if "choices" in result and len(result["choices"]) > 0:
                                 multimodal_response = result["choices"][0]["message"]["content"]
-                                logging.info(f"Received multimodal response: {multimodal_response[:100]}...")
+                                logging.info(f"Received Mistral Vision response: {multimodal_response[:100]}...")
                                 return multimodal_response.strip()
-                        else:
-                            logging.warning(f"Multimodal endpoint failed with status {response.status}")
+                        
+                        # If we get here, there was an error with the response
+                        logging.warning(f"Mistral Vision endpoint failed with status {response.status}")
+                        error_text = await response.text()
+                        logging.error(f"Error response: {error_text}")
                 except Exception as e:
-                    logging.warning(f"Multimodal endpoint error: {str(e)}")
+                    logging.warning(f"Mistral Vision endpoint error: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
             
-            # Fallback to text-only with image description
+            # Fallback to text-only with image description if the vision model fails
             logging.info("Falling back to text-only endpoint with image description")
             
             # Describe the image using ColQwen for context
@@ -1042,58 +1205,51 @@ Keep your answer under 5 sentences but be thorough and precise.
             if image_description:
                 logging.info(f"Generated image description: {image_description[:100]}...")
                 
-                # Use text endpoint with image description
-                # Create the context part separately
-                context_part = f"Relevant context from scientific literature:\n{context_text}" if context_text else ""
-
-                # Use it in the main f-string
-                text_prompt = f"""{system_prompt}
-
-                Query: {query}
-
-                Image description: {image_description}
-
-                {context_part}
-
-                Provide a detailed, scientifically accurate response with proper taxonomic terminology.
-                Keep your answer under 5 sentences but be thorough and precise.
-                """
+                # Format the text prompt with Mistral's expected format
+                system_part = f"[SYSTEM_PROMPT]{system_prompt}[/SYSTEM_PROMPT]"
+                
+                # Include image description and context
+                user_part = f"Query: {query}\n\nImage description: {image_description}\n"
+                if context_text:
+                    user_part += f"\nRelevant context from scientific literature:\n{context_text}\n"
+                
+                # Complete the prompt in Mistral format
+                text_prompt = f"<s>{system_part}[INST]{user_part}[/INST]"
             else:
-                # Plain text fallback
-                text_prompt = prompt
+                # Basic format without image description
+                text_prompt = f"<s>[SYSTEM_PROMPT]{system_prompt}[/SYSTEM_PROMPT][INST]{query}\n\n{context_text if context_text else ''}[/INST]"
             
             # Use text-only API
             vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
             payload = {
                 "prompt": text_prompt,
                 "max_tokens": 500,
-                "stream": True
+                "temperature": 0.15,
+                "stream": False
             }
             
-            logging.info(f"Sending streaming request to text endpoint: {vllm_url}")
+            logging.info(f"Sending text request to endpoint: {vllm_url}")
             
             async with aiohttp.ClientSession() as client_session:
                 async with client_session.post(vllm_url, json=payload) as response:
                     if response.status == 200:
-                        # For streamed responses, collect all chunks
-                        full_response = ""
-                        async for chunk in response.content:
-                            if chunk:
-                                text = chunk.decode('utf-8')
-                                full_response += text
-                        
-                        logging.info(f"Collected full response from streaming: {full_response[:100]}...")
-                        return full_response.strip()
+                        result = await response.json()
+                        if "choices" in result and len(result["choices"]) > 0:
+                            text_response = result["choices"][0]["text"]
+                            logging.info(f"Received text response: {text_response[:100]}...")
+                            return text_response.strip()
+                        else:
+                            logging.error(f"Invalid response format: {result}")
                     else:
                         error_text = await response.text()
-                        logging.error(f"Error from Qwen: {error_text}")
+                        logging.error(f"Error from Mistral text API: {error_text}")
                         return f"Error processing image: {error_text}"
         
         except Exception as e:
             logging.error(f"Exception in process_with_qwen: {str(e)}")
             import traceback
             traceback.print_exc()
-            return f"Error: {str(e)}"
+            return f"Error analyzing image: {str(e)}"
     
     # Define UI components
     def upload_form():
@@ -1462,7 +1618,7 @@ Keep your answer under 5 sentences but be thorough and precise.
                         cls="mb-6"
                     ),
                     
-                    # Display Qwen's response
+                    # Display Mistral's response
                     Div(
                         H3("AI Analysis", cls="text-xl font-semibold text-white mb-2"),
                         Div(
@@ -1720,7 +1876,7 @@ Keep your answer under 5 sentences but be thorough and precise.
             else:
                 logging.warning("Top source missing image_key")
         
-        # Process with Qwen (including context)
+        # Process with Mistral Vision (we keep the function name for compatibility)
         qwen_response = await process_with_qwen(image, query, context_text, analysis_id)
         
         # Update database with response
@@ -1980,6 +2136,7 @@ Keep your answer under 5 sentences but be thorough and precise.
                 status_code=404
             )
 
+    
     @fasthtml_app.get("/debug-info")
     async def debug_info():
         """Return debugging information about the environment"""
