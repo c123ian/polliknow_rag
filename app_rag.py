@@ -169,20 +169,24 @@ def serve_vllm():
     from vllm.entrypoints.openai.serving_models import OpenAIServingModels
     from vllm.entrypoints.logger import RequestLogger
     from vllm.sampling_params import SamplingParams
-    from colpali_engine.models import ColQwen2, ColQwen2Processor
-    from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
+
+
+    # ADD THESE TWO LINES HERE
+    # Initialize ColQwen2 model variables
+    colqwen_model = None
+    colqwen_processor = None
 
     # Models directories
     MODELS_DIR = MISTRAL_MODELS_DIR
     COLQWEN_DIR = COLQWEN_MODELS_DIR
 
     # Log directory contents for debugging
-    logging.info(f"COLQWEN_DIR contents: {os.listdir(COLQWEN_DIR)}")
+    logging.info(f"MODELS_DIR contents: {os.listdir(MODELS_DIR)}")
     
     # Initialize FastAPI app
     web_app = fastapi.FastAPI(
-        title=f"OpenAI-compatible {DEFAULT_MISTRAL_NAME} server with ColQwen2 embedding support",
-        description="Run an OpenAI-compatible LLM server with vLLM and ColQwen2",
+        title=f"OpenAI-compatible {DEFAULT_MISTRAL_NAME} server",
+        description="Run an OpenAI-compatible LLM server with vLLM",
         version="0.0.1",
         docs_url="/docs",
     )
@@ -293,47 +297,6 @@ def serve_vllm():
         chat_template_content_format="string",  
     )
 
-    # Initialize ColQwen2 model
-    colqwen_model = None
-    colqwen_processor = None
-
-    def load_colqwen_model():
-        """Load ColQwen2 model if it's not already loaded"""
-        global colqwen_model, colqwen_processor
-        
-        if colqwen_model is not None:
-            return colqwen_model, colqwen_processor
-            
-        # Log directory contents for debugging
-        try:
-            model_dir = os.path.join(COLQWEN_DIR, os.path.basename(DEFAULT_COLQWEN_NAME))
-            logging.info(f"Looking for ColQwen2 model in: {model_dir}")
-            if os.path.exists(model_dir) and os.path.isdir(model_dir):
-                logging.info(f"Directory exists and contains: {os.listdir(model_dir)}")
-                colqwen_model = ColQwen2.from_pretrained(
-                    model_dir,
-                    torch_dtype=torch.bfloat16,
-                    device_map="cuda" if torch.cuda.is_available() else "cpu"
-                ).eval()
-                colqwen_processor = ColQwen2Processor.from_pretrained(model_dir)
-                logging.info(f"Loaded ColQwen2 model from volume: {model_dir}")
-            else:
-                logging.info(f"Directory not found, downloading from HuggingFace: {DEFAULT_COLQWEN_NAME}")
-                colqwen_model = ColQwen2.from_pretrained(
-                    DEFAULT_COLQWEN_NAME,
-                    torch_dtype=torch.bfloat16,
-                    device_map="cuda" if torch.cuda.is_available() else "cpu"
-                ).eval()
-                colqwen_processor = ColQwen2Processor.from_pretrained(DEFAULT_COLQWEN_NAME)
-                logging.info(f"Loaded ColQwen2 model from HuggingFace")
-        except Exception as e:
-            logging.error(f"Error loading ColQwen2 model: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-            
-        return colqwen_model, colqwen_processor
-    
     # === Mistral Vision/LLM Endpoints ===
     
     @web_app.post("/v1/completions")
@@ -447,8 +410,8 @@ def serve_vllm():
             # Try Direct OpenAI API Compatible Format first
             try:
                 response = await openai_serving_chat.create_chat_completion(
-                    request_id=request_id,
-                    model=model,
+                    # request_id=request_id,
+                    # model=model,
                     messages=formatted_messages,
                     sampling_params=sampling_params,
                     stream=False
@@ -562,8 +525,11 @@ def serve_vllm():
             traceback.print_exc()
             return JSONResponse(status_code=500, content={"error": str(e)})
 
+
+
+
     # === ColQwen2 Endpoints ===
-    
+
     @web_app.post("/v1/embeddings")
     async def generate_embeddings(request: fastapi.Request) -> JSONResponse:
         """Generate embeddings for queries or images"""
@@ -688,143 +654,19 @@ def serve_vllm():
             import traceback
             traceback.print_exc()
             return JSONResponse(status_code=500, content={"error": str(e)})
-
-    @web_app.post("/v1/similarity_maps")
-    async def generate_similarity_maps(request: fastapi.Request) -> JSONResponse:
-        """Generate token similarity heatmaps for images and queries"""
-        try:
-            # Load the model if needed
-            model, processor = load_colqwen_model()
-            
-            body = await request.json()
-            query = body.get("query", "")
-            image_data = body.get("image", "")
-            max_tokens = body.get("max_tokens", 6)  # Limit number of tokens for maps
-            
-            if not query or not image_data:
-                return JSONResponse(status_code=400, content={"error": "Both query and image must be provided"})
-            
-            # Convert base64 to PIL Image
-            try:
-                # Expect format like: data:image/jpeg;base64,/9j/4AAQSkZJR...
-                if "base64," in image_data:
-                    image_data = image_data.split("base64,")[1]
-                
-                img_bytes = base64.b64decode(image_data)
-                image = Image.open(BytesIO(img_bytes))
-            except Exception as e:
-                logging.error(f"Error processing image data: {e}")
-                return JSONResponse(status_code=400, content={"error": f"Invalid image data: {str(e)}"})
-            
-            # Process query and image with ColQwen2
-            processed_query = processor.process_queries([query]).to(model.device)
-            batch_images = processor.process_images([image]).to(model.device)
-            
-            # Forward passes to get embeddings
-            with torch.no_grad():
-                query_embeddings = model(**processed_query)
-                image_embeddings = model(**batch_images)
-            
-            # Get the number of image patches
-            n_patches = processor.get_n_patches(
-                image_size=image.size,
-                patch_size=model.patch_size,
-                spatial_merge_size=getattr(model, 'spatial_merge_size', None)
-            )
-            
-            # Get image mask
-            image_mask = processor.get_image_mask(batch_images)
-            
-            # Generate similarity maps
-            batched_similarity_maps = get_similarity_maps_from_embeddings(
-                image_embeddings=image_embeddings,
-                query_embeddings=query_embeddings,
-                n_patches=n_patches,
-                image_mask=image_mask
-            )
-            
-            # Get the similarity map for this image
-            similarity_maps = batched_similarity_maps[0]  # (query_length, n_patches_x, n_patches_y)
-            
-            # Get tokens for the query
-            query_tokens = processor.tokenizer.tokenize(query)
-            
-            # Filter to meaningful tokens
-            token_sims = []
-            stopwords = set(["<bos>", "<eos>", "<pad>", "a", "an", "the", "in", "on", "at", "of", "for", "with", "by", "to", "from"])
-            
-            for token_idx, token in enumerate(query_tokens):
-                if token_idx >= similarity_maps.shape[0]:
-                    continue
-                    
-                # Skip stopwords and short tokens
-                if token in stopwords or len(token) <= 1:
-                    continue
-                    
-                token_clean = token[1:] if token.startswith("▁") else token
-                if token_clean and len(token_clean) > 1:
-                    max_sim = similarity_maps[token_idx].max().item()
-                    token_sims.append((token_idx, token, max_sim))
-            
-            # Sort by similarity score and take top tokens
-            token_sims.sort(key=lambda x: x[2], reverse=True)
-            top_tokens = token_sims[:max_tokens]  # Limit to max_tokens
-            
-            # Generate and return heatmaps as base64
-            token_maps = []
-            for token_idx, token, score in top_tokens:
-                # Skip if score is very low
-                if score < 0.1:
-                    continue
-                    
-                # Generate heatmap
-                fig, ax = plot_similarity_map(
-                    image=image,
-                    similarity_map=similarity_maps[token_idx],
-                    figsize=(8, 8),
-                    show_colorbar=False,
-                )
-                
-                # Clean token for display
-                token_display = token[1:] if token.startswith("▁") else token
-                ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
-                
-                # Convert figure to base64
-                img_buffer = BytesIO()
-                fig.savefig(img_buffer, format="png", bbox_inches='tight')
-                img_buffer.seek(0)
-                img_data = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
-                plt.close(fig)
-                
-                # Add to response
-                token_maps.append({
-                    "token": token_display,
-                    "token_idx": int(token_idx),
-                    "score": float(score),
-                    "heatmap_base64": img_data
-                })
-            
-            return JSONResponse(content={
-                "query": query,
-                "token_maps": token_maps
-            })
-            
-        except Exception as e:
-            logging.error(f"Error generating similarity maps: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse(status_code=500, content={"error": str(e)})
-
+        
     return web_app
 
-# Create app function for FastHTML UI - No GPU required now
+# Create app function for FastHTML UI
 @app.function(
     image=image,
+    gpu=modal.gpu.A10G(count=1),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     volumes={
         DATA_DIR: bee_volume,
-        DATABASE_DIR: db_volume
+        DATABASE_DIR: db_volume,
+        COLQWEN_MODELS_DIR: colqwen_volume  # Include ColQwen volume
     },
     secrets=[modal.Secret.from_name("my-custom-secret-3")]
 )
@@ -849,20 +691,114 @@ def serve_fasthtml():
     import numpy as np
     from rank_bm25 import BM25Okapi
     from pdf2image import convert_from_path
+    from colpali_engine.models import ColQwen2, ColQwen2Processor
+    from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
+    from rerankers import Reranker
     
-    # Setup NLTK
+    # Setup NLTK for tokenization 
     NLTK_DATA_DIR = "/tmp/nltk_data"
     os.makedirs(NLTK_DATA_DIR, exist_ok=True)
     nltk.data.path.append(NLTK_DATA_DIR)
     nltk.download("punkt", download_dir=NLTK_DATA_DIR)
     
     # Global variables - data only, no models
+    colpali_model = None
+    colpali_processor = None
     df = None
     page_images = {}
     bm25_index = None
     tokenized_docs = None
     colpali_embeddings = None
+
+    def load_colqwen_model():
+        """Load ColQwen2 model if it's not already loaded"""
+        global colqwen_model, colqwen_processor
+        
+        if colqwen_model is not None:
+            return colqwen_model, colqwen_processor
+            
+        # Import necessary modules here to ensure they're available
+        from colpali_engine.models import ColQwen2, ColQwen2Processor
+        from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
+        
+        try:
+            # Log directory contents for debugging
+            model_dir = os.path.join(COLQWEN_DIR, os.path.basename(DEFAULT_COLQWEN_NAME))
+            logging.info(f"Looking for ColQwen2 model in: {model_dir}")
+            if os.path.exists(model_dir) and os.path.isdir(model_dir):
+                logging.info(f"Directory exists and contains: {os.listdir(model_dir)}")
+                colqwen_model = ColQwen2.from_pretrained(
+                    model_dir,
+                    torch_dtype=torch.bfloat16,
+                    device_map="cuda" if torch.cuda.is_available() else "cpu"
+                ).eval()
+                colqwen_processor = ColQwen2Processor.from_pretrained(model_dir)
+                logging.info(f"Loaded ColQwen2 model from volume: {model_dir}")
+            else:
+                logging.info(f"Directory not found, downloading from HuggingFace: {DEFAULT_COLQWEN_NAME}")
+                colqwen_model = ColQwen2.from_pretrained(
+                    DEFAULT_COLQWEN_NAME,
+                    torch_dtype=torch.bfloat16,
+                    device_map="cuda" if torch.cuda.is_available() else "cpu"
+                ).eval()
+                colqwen_processor = ColQwen2Processor.from_pretrained(DEFAULT_COLQWEN_NAME)
+                logging.info(f"Loaded ColQwen2 model from HuggingFace")
+        except Exception as e:
+            logging.error(f"Error loading ColQwen2 model: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+            
+        return colqwen_model, colqwen_processor
     
+    # Function to load ColQwen2 model
+    def ensure_colpali_model_loaded():
+        """Ensure the ColQwen2 model is loaded"""
+        global colpali_model, colpali_processor
+        
+        if colpali_model is None:
+            try:
+                # Check if CUDA is available for GPU acceleration
+                if torch.cuda.is_available():
+                    logging.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
+                else:
+                    logging.warning("CUDA not available - using CPU for ColQwen2")
+                
+                # First try to find model in volume
+                model_path = os.path.join(COLQWEN_MODELS_DIR, os.path.basename(DEFAULT_COLQWEN_NAME))
+                if os.path.exists(model_path) and os.path.isdir(model_path):
+                    logging.info(f"Loading ColQwen2 model from volume path: {model_path}")
+                    # List files in model path for debugging
+                    try:
+                        logging.info(f"Model directory contents: {os.listdir(model_path)}")
+                    except Exception as e:
+                        logging.error(f"Error listing model directory: {e}")
+                    
+                    colpali_model = ColQwen2.from_pretrained(
+                        model_path,
+                        torch_dtype=torch.bfloat16,
+                        device_map="cuda" if torch.cuda.is_available() else "cpu"
+                    ).eval()
+                    colpali_processor = ColQwen2Processor.from_pretrained(model_path)
+                else:
+                    # Fall back to direct download from HuggingFace
+                    logging.info(f"Model not found in volume, downloading from HuggingFace: {DEFAULT_COLQWEN_NAME}")
+                    colpali_model = ColQwen2.from_pretrained(
+                        DEFAULT_COLQWEN_NAME,
+                        torch_dtype=torch.bfloat16,
+                        device_map="cuda" if torch.cuda.is_available() else "cpu"
+                    ).eval()
+                    colpali_processor = ColQwen2Processor.from_pretrained(DEFAULT_COLQWEN_NAME)
+                
+                logging.info(f"ColQwen2 model loaded successfully on device: {colpali_model.device}")
+                return True
+            except Exception as e:
+                logging.error(f"Error loading ColQwen2 model: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+        return True
+
     # Function to load data
     def load_data():
         """Load all data needed for document retrieval"""
@@ -930,7 +866,7 @@ def serve_fasthtml():
 
     # Load data at startup
     load_data()
-
+    
     # Make temporary directories
     os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
     os.makedirs(HEATMAP_DIR, exist_ok=True)
@@ -952,6 +888,8 @@ def serve_fasthtml():
         created_at = Column(DateTime, default=datetime.datetime.utcnow)
         # Only include context_source if we verified it exists
         context_source = Column(String, nullable=True)
+
+
 
     # Initialize the FastHTML app
     fasthtml_app, rt = fast_app(
@@ -1061,252 +999,8 @@ def serve_fasthtml():
         }
         return queries.get(analysis_type, queries["classify_insect"])
 
-    # API calls to serve_vllm for embeddings and similarity maps
-    async def call_colqwen_api(endpoint, payload):
-        """Call ColQwen2 API endpoints in serve_vllm"""
-        api_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/{endpoint}"
-        logging.info(f"Calling ColQwen2 API endpoint: {api_url}")
-        
-        async with aiohttp.ClientSession() as client_session:
-            try:
-                async with client_session.post(api_url, json=payload, timeout=60) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        error_text = await response.text()
-                        logging.error(f"Error from ColQwen2 API: {error_text}")
-                        return {"error": error_text}
-            except Exception as e:
-                logging.error(f"Error calling ColQwen2 API: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                return {"error": str(e)}
-
-    # Retrieve relevant documents
-    async def retrieve_relevant_documents(query, top_k=5):
-        """Retrieve most relevant documents using ColPali embeddings and BM25"""
-        global colpali_embeddings, df, bm25_index, tokenized_docs
-        
-        if colpali_embeddings is None or df is None or len(df) == 0:
-            logging.error("No documents or embeddings available for retrieval")
-            return [], []
-            
-        retrieved_paragraphs = []
-        top_sources_data = []
-        
-        # ColPali retrieval (vector search)
-        try:
-            # Generate query embeddings via API
-            query_results = await call_colqwen_api("v1/embeddings", {
-                "type": "query",
-                "queries": [query]
-            })
-            
-            if "error" in query_results:
-                logging.error(f"Error generating query embeddings: {query_results['error']}")
-                return [], []
-            
-            # Extract the query embedding
-            query_embedding = query_results["embeddings"][0]["embedding"]
-            
-            # Calculate similarities with all pages
-            similarities = []
-            for idx, page_emb in enumerate(colpali_embeddings):
-                # Convert embeddings to proper format
-                payload = {
-                    "query_embeddings": [query_embedding],
-                    "image_embeddings": [page_emb.tolist() if hasattr(page_emb, "tolist") else page_emb]
-                }
-                
-                # Call API to score embeddings
-                score_results = await call_colqwen_api("v1/score_embeddings", payload)
-                
-                if "error" in score_results:
-                    logging.error(f"Error scoring embeddings: {score_results['error']}")
-                    continue
-                
-                # Extract the score
-                score = score_results["scores"][0]["scores"][0]["score"]
-                similarities.append((idx, score))
-            
-            # Sort by similarity score
-            similarities.sort(key=lambda x: x[1], reverse=True)
-            vector_top_indices = [idx for idx, _ in similarities[:top_k]]
-            
-            # Try BM25 keyword search if available
-            keyword_top_indices = []
-            bm25_scores = None
-            if bm25_index is not None and tokenized_docs is not None:
-                try:
-                    # Tokenize query and get BM25 scores
-                    tokenized_query = word_tokenize(query.lower())
-                    bm25_scores = bm25_index.get_scores(tokenized_query)
-                    keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
-                except Exception as e:
-                    logging.error(f"Error in BM25 scoring: {e}")
-            
-            # Combine results (hybrid retrieval)
-            all_indices = list(set(vector_top_indices + keyword_top_indices))
-            
-            # Get data for reranking
-            docs_for_reranking = []
-            doc_indices = []
-            
-            for idx in all_indices:
-                if idx < len(df):
-                    # Get document info
-                    filename = df.iloc[idx]['filename']
-                    page_num = df.iloc[idx]['page']
-                    image_key = df.iloc[idx]['image_key']
-                    text = df.iloc[idx]['text']
-                    
-                    # Get vector score
-                    vector_score = 0.0
-                    for v_idx, score in similarities:
-                        if v_idx == idx:
-                            vector_score = score
-                            break
-                    
-                    # Get keyword score (if available)
-                    keyword_score = 0.0
-                    if bm25_scores is not None and len(bm25_scores) > idx:
-                        keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
-                    
-                    # Combine scores (weighted)
-                    alpha = 0.7  # Weight for vector search
-                    combined_score = alpha * vector_score + (1 - alpha) * keyword_score
-                    
-                    # Store for reranking
-                    docs_for_reranking.append(text)
-                    doc_indices.append(idx)
-                    
-                    # Add to results
-                    retrieved_paragraphs.append(text)
-                    top_sources_data.append({
-                        'filename': filename,
-                        'page': page_num,
-                        'score': combined_score,
-                        'vector_score': vector_score,
-                        'keyword_score': keyword_score,
-                        'image_key': image_key,
-                        'idx': idx
-                    })
-            
-            # Rerank results if we have documents
-            if docs_for_reranking:
-                try:
-                    # Use a cross-encoder reranker
-                    from rerankers import Reranker
-                    ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
-                    ranked_results = ranker.rank(query=query, docs=docs_for_reranking)
-                    top_ranked = ranked_results.top_k(min(3, len(docs_for_reranking)))
-                    
-                    # Get the final top documents after reranking
-                    final_retrieved_paragraphs = []
-                    final_top_sources = []
-                    
-                    for ranked_doc in top_ranked:
-                        ranked_idx = docs_for_reranking.index(ranked_doc.text)
-                        doc_idx = doc_indices[ranked_idx]
-                        source_info = next((s for s in top_sources_data if s['idx'] == doc_idx), None)
-                        if source_info:
-                            source_info['reranker_score'] = ranked_doc.score
-                            final_top_sources.append(source_info)
-                            final_retrieved_paragraphs.append(ranked_doc.text)
-                    
-                    return final_retrieved_paragraphs, final_top_sources
-                    
-                except Exception as e:
-                    logging.error(f"Error in reranking: {e}")
-            
-            # If reranking fails, sort by combined score
-            sorted_indices = sorted(range(len(top_sources_data)), 
-                                   key=lambda i: top_sources_data[i]['score'], 
-                                   reverse=True)
-            sorted_paragraphs = [retrieved_paragraphs[i] for i in sorted_indices[:3]]
-            sorted_sources = [top_sources_data[i] for i in sorted_indices[:3]]
-            
-            return sorted_paragraphs, sorted_sources
-            
-        except Exception as e:
-            logging.error(f"Error in document retrieval: {e}")
-            import traceback
-            traceback.print_exc()
-            return [], []
-
-    # Generate similarity maps for context document
-    async def generate_similarity_maps(query, image_key):
-        """Generate token similarity maps for a retrieved document"""
-        global page_images
-        
-        if not image_key or image_key not in page_images:
-            logging.error(f"Invalid image key: {image_key}")
-            return []
-            
-        try:
-            # Get image path and load image
-            image_path = page_images[image_key]
-            if not os.path.exists(image_path):
-                logging.error(f"Image file not found: {image_path}")
-                return []
-                
-            # Load the image
-            image = Image.open(image_path)
-            
-            # Convert image to base64
-            img_buffer = BytesIO()
-            image.save(img_buffer, format="PNG")
-            img_buffer.seek(0)
-            base64_img = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
-            
-            # Call API to generate similarity maps
-            result = await call_colqwen_api("v1/similarity_maps", {
-                "query": query,
-                "image": f"data:image/png;base64,{base64_img}",
-                "max_tokens": 6
-            })
-            
-            if "error" in result:
-                logging.error(f"Error generating similarity maps: {result['error']}")
-                return []
-            
-            # Process and save the maps locally
-            token_maps = result.get("token_maps", [])
-            image_heatmaps = []
-            
-            for token_map in token_maps:
-                token = token_map["token"]
-                token_idx = token_map["token_idx"]
-                score = token_map["score"]
-                
-                # Save base64 image to file
-                heatmap_filename = f"{image_key}_token_{token_idx}.png"
-                heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
-                
-                # Decode and save
-                heatmap_data = base64.b64decode(token_map["heatmap_base64"])
-                with open(heatmap_path, "wb") as f:
-                    f.write(heatmap_data)
-                
-                # Add to list
-                image_heatmaps.append({
-                    "token": token,
-                    "score": score,
-                    "path": heatmap_filename,
-                    "token_idx": token_idx
-                })
-            
-            logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
-            return image_heatmaps
-            
-        except Exception as e:
-            logging.error(f"Error generating similarity maps: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
-
-    # Process image with Mistral Vision - New implementation without ColQwen image descriptions
-    async def process_with_mistral_vision(image, query, context_text="", analysis_id=""):
+    # API calls to serve_vllm for LLM operations
+    async def call_mistral_vision_api(image, query, context_text="", analysis_id=""):
         """Process the image with Mistral Vision including context from retrieved documents"""
         logging.info(f"Processing image {analysis_id} with Mistral Vision using query: {query}")
         
@@ -1414,11 +1108,403 @@ def serve_fasthtml():
                         return f"Error processing image: {error_text}"
         
         except Exception as e:
-            logging.error(f"Exception in process_with_mistral_vision: {str(e)}")
+            logging.error(f"Exception in call to Mistral Vision API: {str(e)}")
             import traceback
             traceback.print_exc()
             return f"Error analyzing image: {str(e)}"
-    
+        
+    # API calls to serve_vllm for embeddings and similarity maps
+    async def call_colqwen_api(endpoint, payload, max_retries=2, timeout=120):
+        """Call ColQwen2 API endpoints in serve_vllm with retry logic"""
+        api_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/{endpoint}"
+        logging.info(f"Calling ColQwen2 API endpoint: {api_url}")
+        
+        for retry in range(max_retries + 1):
+            try:
+                async with aiohttp.ClientSession() as client_session:
+                    async with client_session.post(api_url, json=payload, timeout=timeout) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        else:
+                            error_text = await response.text()
+                            logging.error(f"Error from ColQwen2 API: {error_text}")
+                            if retry < max_retries:
+                                logging.info(f"Retrying request ({retry+1}/{max_retries})...")
+                                await asyncio.sleep(1)  # Add delay between retries
+                            else:
+                                return {"error": error_text}
+            except asyncio.TimeoutError:
+                logging.error(f"Timeout error calling ColQwen2 API (attempt {retry+1}/{max_retries+1})")
+                if retry < max_retries:
+                    logging.info(f"Retrying with increased timeout...")
+                    timeout = min(timeout * 1.5, 300)  # Increase timeout for next retry, max 5 minutes
+                    await asyncio.sleep(1)
+                else:
+                    return {"error": "Request timed out after multiple attempts"}
+            except Exception as e:
+                logging.error(f"Error calling ColQwen2 API: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                if retry < max_retries:
+                    logging.info(f"Retrying request ({retry+1}/{max_retries})...")
+                    await asyncio.sleep(1)
+                else:
+                    return {"error": str(e)}
+        
+        return {"error": "Failed after multiple retry attempts"}
+    # Retrieve relevant documents
+    async def retrieve_relevant_documents(query, top_k=5):
+        """Retrieve most relevant documents using ColPali embeddings and BM25"""
+        global colpali_embeddings, df, bm25_index, tokenized_docs
+        
+        # Always initialize return values
+        retrieved_paragraphs = []
+        top_sources_data = []
+        
+        if colpali_embeddings is None or df is None or len(df) == 0:
+            logging.error("No documents or embeddings available for retrieval")
+            return [], []
+            
+        # Initialize vector search variables
+        vector_top_indices = []
+        keyword_top_indices = []
+        similarities = []
+        bm25_scores = None
+        
+        # Try ColPali retrieval (vector search)
+        try:
+            # Generate query embeddings via API
+            query_results = await call_colqwen_api("v1/embeddings", {
+                "type": "query",
+                "queries": [query]
+            })
+            
+            if "error" in query_results:
+                logging.error(f"Error generating query embeddings: {query_results.get('error')}")
+            else:
+                # Extract the query embedding
+                query_embedding = query_results["embeddings"][0]["embedding"]
+                
+                # Calculate similarities with all pages
+                for idx, page_emb in enumerate(colpali_embeddings):
+                    try:
+                        # Convert embeddings to proper format
+                        payload = {
+                            "query_embeddings": [query_embedding],
+                            "image_embeddings": [page_emb.tolist() if hasattr(page_emb, "tolist") else page_emb]
+                        }
+                        
+                        # Call API to score embeddings
+                        score_results = await call_colqwen_api("v1/score_embeddings", payload)
+                        
+                        if "error" in score_results:
+                            logging.error(f"Error scoring embeddings: {score_results.get('error')}")
+                            continue
+                        
+                        # Extract the score
+                        score = score_results["scores"][0]["scores"][0]["score"]
+                        similarities.append((idx, score))
+                    except Exception as e:
+                        logging.error(f"Error processing embedding {idx}: {e}")
+                        continue
+                
+                # Sort by similarity score
+                if similarities:
+                    similarities.sort(key=lambda x: x[1], reverse=True)
+                    vector_top_indices = [idx for idx, _ in similarities[:top_k]]
+                    logging.info(f"Vector search found {len(vector_top_indices)} relevant documents")
+        except Exception as e:
+            logging.error(f"Vector search failed: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Try BM25 keyword search if available
+        try:
+            if bm25_index is not None and tokenized_docs is not None:
+                # Tokenize query and get BM25 scores
+                tokenized_query = word_tokenize(query.lower())
+                bm25_scores = bm25_index.get_scores(tokenized_query)
+                keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
+                logging.info(f"Keyword search found {len(keyword_top_indices)} relevant documents")
+        except Exception as e:
+            logging.error(f"Keyword search failed: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Combine results (hybrid retrieval)
+        all_indices = list(set(vector_top_indices + keyword_top_indices))
+        
+        if not all_indices:
+            logging.warning("No relevant documents found with either method")
+            return [], []
+        
+        # Get data for reranking
+        docs_for_reranking = []
+        doc_indices = []
+        
+        for idx in all_indices:
+            if idx < len(df):
+                try:
+                    # Get document info
+                    filename = df.iloc[idx]['filename']
+                    page_num = df.iloc[idx]['page']
+                    image_key = df.iloc[idx]['image_key']
+                    text = df.iloc[idx]['text']
+                    
+                    # Get vector score
+                    vector_score = 0.0
+                    for v_idx, score in similarities:
+                        if v_idx == idx:
+                            vector_score = score
+                            break
+                    
+                    # Get keyword score (if available)
+                    keyword_score = 0.0
+                    if bm25_scores is not None and len(bm25_scores) > idx:
+                        keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
+                    
+                    # Combine scores (weighted)
+                    alpha = 0.7  # Weight for vector search
+                    combined_score = alpha * vector_score + (1 - alpha) * keyword_score
+                    
+                    # Store for reranking
+                    docs_for_reranking.append(text)
+                    doc_indices.append(idx)
+                    
+                    # Add to results
+                    retrieved_paragraphs.append(text)
+                    top_sources_data.append({
+                        'filename': filename,
+                        'page': page_num,
+                        'score': combined_score,
+                        'vector_score': vector_score,
+                        'keyword_score': keyword_score,
+                        'image_key': image_key,
+                        'idx': idx
+                    })
+                except Exception as e:
+                    logging.error(f"Error processing document at index {idx}: {e}")
+                    continue
+        
+        # Rerank results if we have documents
+        if docs_for_reranking:
+            try:
+                # Use a cross-encoder reranker
+                from rerankers import Reranker
+                ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
+                ranked_results = ranker.rank(query=query, docs=docs_for_reranking)
+                top_ranked = ranked_results.top_k(min(3, len(docs_for_reranking)))
+                
+                # Get the final top documents after reranking
+                final_retrieved_paragraphs = []
+                final_top_sources = []
+                
+                for ranked_doc in top_ranked:
+                    try:
+                        ranked_idx = docs_for_reranking.index(ranked_doc.text)
+                        doc_idx = doc_indices[ranked_idx]
+                        source_info = next((s for s in top_sources_data if s['idx'] == doc_idx), None)
+                        if source_info:
+                            source_info['reranker_score'] = ranked_doc.score
+                            final_top_sources.append(source_info)
+                            final_retrieved_paragraphs.append(ranked_doc.text)
+                    except Exception as e:
+                        logging.error(f"Error in reranking document: {e}")
+                        continue
+                
+                if final_retrieved_paragraphs and final_top_sources:
+                    return final_retrieved_paragraphs, final_top_sources
+            except Exception as e:
+                logging.error(f"Error in reranking: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # If reranking fails or no documents, sort by combined score
+        if retrieved_paragraphs and top_sources_data:
+            try:
+                sorted_indices = sorted(range(len(top_sources_data)), 
+                                    key=lambda i: top_sources_data[i]['score'], 
+                                    reverse=True)
+                sorted_paragraphs = [retrieved_paragraphs[i] for i in sorted_indices[:3]]
+                sorted_sources = [top_sources_data[i] for i in sorted_indices[:3]]
+                
+                return sorted_paragraphs, sorted_sources
+            except Exception as e:
+                logging.error(f"Error sorting by score: {e}")
+        
+        # Fall back to returning raw results if available
+        if retrieved_paragraphs and top_sources_data:
+            # Limit to top 3 if more are available
+            return retrieved_paragraphs[:3], top_sources_data[:3]
+        
+        # Return empty lists as last resort
+        return [], []
+
+    # Generate similarity maps for context document
+    async def generate_similarity_maps(query, image_key):
+        """Generate token similarity maps for a retrieved document"""
+        global colpali_model, colpali_processor, page_images
+
+        # Load ColQwen2 model if not already loaded
+        if not ensure_colpali_model_loaded():
+            logging.error("Failed to load ColQwen2 model for similarity maps")
+            return []
+        
+        if not image_key or image_key not in page_images:
+            logging.error(f"Invalid image key: {image_key}")
+            return []
+            
+        try:
+            # Get image path and load image
+            image_path = page_images[image_key]
+            if not os.path.exists(image_path):
+                logging.error(f"Image file not found: {image_path}")
+                return []
+                
+            # Load the image
+            image = Image.open(image_path)
+            
+            # Process query and image with ColPali
+            processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
+            batch_images = colpali_processor.process_images([image]).to(colpali_model.device)
+            
+            # Forward passes to get embeddings
+            with torch.no_grad():
+                query_embeddings = colpali_model(**processed_query)
+                image_embeddings = colpali_model(**batch_images)
+            
+            # Get the number of image patches
+            n_patches = colpali_processor.get_n_patches(
+                image_size=image.size,
+                patch_size=colpali_model.patch_size,
+                spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
+            )
+            
+            # Get image mask
+            image_mask = colpali_processor.get_image_mask(batch_images)
+            
+            # Generate similarity maps
+            batched_similarity_maps = get_similarity_maps_from_embeddings(
+                image_embeddings=image_embeddings,
+                query_embeddings=query_embeddings,
+                n_patches=n_patches,
+                image_mask=image_mask
+            )
+            
+            # Get the similarity map for this image
+            similarity_maps = batched_similarity_maps[0]  # (query_length, n_patches_x, n_patches_y)
+            
+            # Get tokens for the query
+            query_tokens = colpali_processor.tokenizer.tokenize(query)
+            
+            # Filter to meaningful tokens
+            token_sims = []
+            stopwords = set(["<bos>", "<eos>", "<pad>", "a", "an", "the", "in", "on", "at", "of", "for", "with", "by", "to", "from"])
+            
+            for token_idx, token in enumerate(query_tokens):
+                if token_idx >= similarity_maps.shape[0]:
+                    continue
+                    
+                # Skip stopwords and short tokens
+                if token in stopwords or len(token) <= 1:
+                    continue
+                    
+                token_clean = token[1:] if token.startswith("▁") else token
+                if token_clean and len(token_clean) > 1:
+                    max_sim = similarity_maps[token_idx].max().item()
+                    token_sims.append((token_idx, token, max_sim))
+            
+            # Sort by similarity score and take top tokens
+            token_sims.sort(key=lambda x: x[2], reverse=True)
+            top_tokens = token_sims[:6]  # Limit to 6 tokens
+            
+            # Generate and return heatmaps as base64
+            image_heatmaps = []
+            for token_idx, token, score in top_tokens:
+                # Skip if score is very low
+                if score < 0.1:
+                    continue
+                    
+                # Generate heatmap
+                fig, ax = plot_similarity_map(
+                    image=image,
+                    similarity_map=similarity_maps[token_idx],
+                    figsize=(8, 8),
+                    show_colorbar=False,
+                )
+                
+                # Clean token for display
+                token_display = token[1:] if token.startswith("▁") else token
+                ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
+                
+                # Save heatmap
+                heatmap_filename = f"{image_key}_token_{token_idx}.png"
+                heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
+                fig.savefig(heatmap_path, bbox_inches='tight')
+                plt.close(fig)
+                
+                # Add to list
+                image_heatmaps.append({
+                    "token": token_display,
+                    "score": score,
+                    "path": heatmap_filename,
+                    "token_idx": token_idx
+                })
+            
+            logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
+            return image_heatmaps
+            
+        except Exception as e:
+            logging.error(f"Error generating similarity maps: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    # Generate image description to improve context for LLM
+    async def generate_image_description(image):
+        """Generate a description of the image using ColQwen"""
+        global colpali_model, colpali_processor
+        
+        # Load model if needed
+        if not ensure_colpali_model_loaded():
+            logging.error("Failed to load ColQwen2 model for image description")
+            return None
+        
+        try:
+            # Process the image with ColQwen
+            processed_image = colpali_processor.process_images([image]).to(colpali_model.device)
+            
+            # For image description, use a standard query
+            description_query = "Describe this image in detail, focusing on visual features and any text content visible."
+            processed_query = colpali_processor.process_queries([description_query]).to(colpali_model.device)
+            
+            # Get embeddings for both
+            with torch.no_grad():
+                image_embeddings = colpali_model(**processed_image)
+                query_embeddings = colpali_model(**processed_query)
+            
+            # Get similarity score as a rough measure of key information
+            similarity_score = float(colpali_processor.score_multi_vector(
+                query_embeddings, 
+                image_embeddings
+            )[0])
+            
+            # Use generic description based on score
+            confidence = min(similarity_score * 10, 1.0)  # Scale to 0-1
+            
+            if confidence > 0.7:
+                return "The image appears to show a biological specimen, possibly an insect or other organism with taxonomic features visible. The specimen has distinctive visual features that can likely be classified according to taxonomic hierarchy."
+            elif confidence > 0.5:
+                return "The image shows what appears to be a biological specimen or organism. Some distinctive features may be visible for classification purposes."
+            elif confidence > 0.3:
+                return "The image contains visual content that may be related to biological specimens or organisms."
+            else:
+                return "The image contains visual content that may be relevant to the query."
+                
+        except Exception as e:
+            logging.error(f"Error generating image description: {str(e)}")
+            return None
+
     # Define UI components
     def upload_form():
         """Render upload form for images with proper interactive elements"""
@@ -1944,7 +2030,7 @@ def serve_fasthtml():
                         const imageKey = tab.getAttribute('data-image-key');
                         
                         // Update tab styling
-                        document.querySelectorAll('[id^="token-tab-"]').forEach(t => {
+                        document.querySelectorAll('[id^="token-tab-"]').forEach(function(t) {
                             t.classList.remove('btn-primary', 'active');
                             t.classList.add('btn-outline');
                         });
@@ -2109,8 +2195,8 @@ def serve_fasthtml():
             else:
                 logging.warning("Top source missing image_key")
         
-        # Process with Mistral Vision (renamed the function)
-        mistral_response = await process_with_mistral_vision(image, query, context_text, analysis_id)
+        # Call Mistral Vision API for analysis
+        mistral_response = await call_mistral_vision_api(image, query, context_text, analysis_id)
         
         # Update database with response
         try:
