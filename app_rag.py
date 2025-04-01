@@ -16,12 +16,14 @@ from fastlite import Database
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import FileResponse, Response as StarletteResponse
+from starlette.responses import FileResponse, Response
 from fastapi import FastAPI, Request, Response as FastAPIResponse
 from fastapi.responses import FileResponse as FastAPIFileResponse
-from starlette.responses import Response
+from starlette.responses import Response as StarletteResponse
 from PIL import Image
-from io import BytesIO
+from colpali_engine.models import ColQwen2, ColQwen2Processor
+from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import matplotlib.pyplot as plt
 import json
 import pickle
@@ -29,11 +31,12 @@ import pandas as pd
 import numpy as np
 from nltk.tokenize import word_tokenize
 import nltk
+from rerankers import Reranker
 from io import BytesIO
 
 # Constants
-MISTRAL_MODELS_DIR = "/Mistral"  # volume for Mistral models
-COLQWEN_MODELS_DIR = "/Qwen"  # Changed volume name to match what's created in download_qwen.py
+MISTRAL_MODELS_DIR = "/Mistral"  
+COLQWEN_MODELS_DIR = "/ColQwen"  # volume for ColQwen2 models
 DATA_DIR = "/bee_pdf"
 TEMP_UPLOAD_DIR = "/bee_pdf/temp_uploads"
 HEATMAP_DIR = "/bee_pdf/heatmaps"  # Directory for storing heatmaps
@@ -86,17 +89,16 @@ if 'context_source' not in columns:
         logging.error(f"Error adding context_source column: {e}")
 conn.close()
 
-# Set up volumes - ensure correct volume names
+# Set up volumes
 try:
     mistral_volume = modal.Volume.lookup("Mistral", create_if_missing=False)
 except modal.exception.NotFoundError:
     raise Exception("Download Mistral models first with the appropriate script")
 
 try:
-    # Changed to match what's created in download_qwen.py
-    colqwen_volume = modal.Volume.lookup("Qwen", create_if_missing=False)
+    colqwen_volume = modal.Volume.lookup("ColQwen", create_if_missing=False)
 except modal.exception.NotFoundError:
-    raise Exception("Download Qwen models first with download_qwen.py")
+    raise Exception("Download ColQwen models first with the appropriate script")
 
 try:
     bee_volume = modal.Volume.from_name("bee_pdf", create_if_missing=True)
@@ -120,28 +122,24 @@ image = modal.Image.debian_slim(python_version="3.10") \
         "pandas",
         "numpy",
         "huggingface_hub",
-        "transformers>=4.48.3",      # Use latest transformers
+        "transformers>=4.48.3",
         "rerankers",
         "sqlite-minutils",
         "rank-bm25",
         "nltk",
         "sqlalchemy",
         "pdf2image",
-        "colpali-engine[interpretability]>=0.3.2",
+        "colpali-engine[interpretability]>=0.3.2",  # Add interpretability extras
         "torch",
-        "matplotlib",
-        "accelerate",
-        "einops",
-        "timm",
-        "pillow"
+        "matplotlib"
     )
 
 app = modal.App(APP_NAME)
 
-# Create app function for Mistral LLM serving & ColQwen2 operations
+# Create app function for Qwen LLM serving
 @app.function(
     image=image,
-    gpu=modal.gpu.A100(count=1, size="80GB"),
+    gpu=modal.gpu.A10G(count=1),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=100,
@@ -160,7 +158,7 @@ def serve_vllm():
     import uuid
     import datetime
     from fastapi.responses import StreamingResponse, JSONResponse
-    from typing import Optional, Dict, Any, List
+    from typing import Optional
 
     from vllm.config import ModelConfig
     from vllm.engine.arg_utils import AsyncEngineArgs
@@ -170,20 +168,8 @@ def serve_vllm():
     from vllm.entrypoints.logger import RequestLogger
     from vllm.sampling_params import SamplingParams
 
+    MODELS_DIR = "/Mistral"
 
-    # ADD THESE TWO LINES HERE
-    # Initialize ColQwen2 model variables
-    colqwen_model = None
-    colqwen_processor = None
-
-    # Models directories
-    MODELS_DIR = MISTRAL_MODELS_DIR
-    COLQWEN_DIR = COLQWEN_MODELS_DIR
-
-    # Log directory contents for debugging
-    logging.info(f"MODELS_DIR contents: {os.listdir(MODELS_DIR)}")
-    
-    # Initialize FastAPI app
     web_app = fastapi.FastAPI(
         title=f"OpenAI-compatible {DEFAULT_MISTRAL_NAME} server",
         description="Run an OpenAI-compatible LLM server with vLLM",
@@ -191,7 +177,6 @@ def serve_vllm():
         docs_url="/docs",
     )
 
-    # Helper functions for model loading
     def find_model_path(base_dir):
         for root, _, files in os.walk(base_dir):
             if "config.json" in files:
@@ -210,69 +195,24 @@ def serve_vllm():
 
     tokenizer_path = find_tokenizer_path(MODELS_DIR)
     if not tokenizer_path:
-        # For Mistral 3.1, the tokenizer might be in the model directory
-        tokenizer_path = model_path
+        raise Exception(f"Could not find tokenizer files in {MODELS_DIR}")
 
     logging.info(f"Initializing AsyncLLMEngine with model path: {model_path} and tokenizer path: {tokenizer_path}")
 
-    # Following the specific Mistral recommendations from the model card
     engine_args = AsyncEngineArgs(
         model=model_path,
         tokenizer=tokenizer_path,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.95,
-        max_model_len=32768,
-        dtype="bfloat16",
-        # Mistral-specific parameters
+        max_model_len=94192,
         tokenizer_mode="mistral",
         config_format="mistral",
         load_format="mistral",
-        # Enable vision model support
-        limit_mm_per_prompt={"image": 10},
+        dtype="float16"
     )
 
-    # Initialize Mistral engine
-    try:
-        engine = AsyncLLMEngine.from_engine_args(engine_args)
-        logging.info("Successfully initialized AsyncLLMEngine")
-    except Exception as e:
-        logging.error(f"Error initializing AsyncLLMEngine: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Fall back to direct vLLM approach if the AsyncLLMEngine fails
-        try:
-            logging.info("Attempting alternative vLLM initialization...")
-            from vllm import LLM
-            
-            # Initialize with simpler parameters
-            llm = LLM(
-                model=model_path,
-                tokenizer=tokenizer_path,
-                tokenizer_mode="mistral",
-                trust_remote_code=True,
-                dtype="bfloat16",
-                tensor_parallel_size=1,
-                gpu_memory_utilization=0.95,
-            )
-            
-            # Create a compatibility wrapper that mimics AsyncLLMEngine
-            class CompatibilityEngine:
-                def __init__(self, llm):
-                    self.llm = llm
-                    
-                async def generate(self, prompt, sampling_params, request_id):
-                    # Convert to synchronous call
-                    outputs = self.llm.generate(prompt, sampling_params)
-                    return outputs
-                    
-            engine = CompatibilityEngine(llm)
-            logging.info("Initialized alternative LLM engine")
-        except Exception as fallback_error:
-            logging.error(f"Failed to initialize alternative engine: {fallback_error}")
-            raise
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
 
-    # Set up model configuration
     event_loop: Optional[asyncio.AbstractEventLoop] = None
     try:
         event_loop = asyncio.get_running_loop()
@@ -297,8 +237,6 @@ def serve_vllm():
         chat_template_content_format="string",  
     )
 
-    # === Mistral Vision/LLM Endpoints ===
-    
     @web_app.post("/v1/completions")
     async def completion_generator(request: fastapi.Request) -> StreamingResponse:
         try:
@@ -311,52 +249,69 @@ def serve_vllm():
             logging.info(f"Received completion request: max_tokens={max_tokens}, stream={stream}")
 
             sampling_params = SamplingParams(
-                temperature=0.15,  # Lower for Mistral
+                temperature=0.7,
                 max_tokens=max_tokens,
                 stop=["User:", "Assistant:", "\n\n"],
             )
 
             if stream:
                 async def generate_text():
-                    # Simplified streaming implementation that properly uses async iteration
-                    response_text = ""
-                    
-                    # Use proper async iteration over the generator
-                    async for output in engine.generate(prompt, sampling_params, request_id):
-                        if len(output.outputs) > 0:
-                            new_text = output.outputs[0].text
-                            
-                            # Remove Assistant: prefix if present
-                            if "Assistant:" in new_text and not response_text:
+                    full_response = ""
+                    last_yielded_position = 0
+                    assistant_prefix_removed = False
+                    buffer = ""
+
+                    async for result in engine.generate(prompt, sampling_params, request_id):
+                        if len(result.outputs) > 0:
+                            new_text = result.outputs[0].text
+
+                            if not assistant_prefix_removed:
                                 new_text = new_text.split("Assistant:")[-1].lstrip()
-                                
-                            # Calculate the difference to send
-                            delta = new_text[len(response_text):]
-                            if delta:
-                                yield delta
-                                response_text = new_text
+                                assistant_prefix_removed = True
+
+                            if len(new_text) > last_yielded_position:
+                                new_part = new_text[last_yielded_position:]
+                                buffer += new_part
+
+                                words = buffer.split()
+                                if len(words) > 1:
+                                    to_yield = ' '.join(words[:-1]) + ' '
+                                    for punct in ['.', '!', '?']:
+                                        to_yield = to_yield.replace(f"{punct}", f"{punct} ")
+                                    to_yield = ' '.join(to_yield.split())
+                                    buffer = words[-1]
+                                    yield to_yield + ' '
+
+                                last_yielded_position = len(new_text)
+
+                            full_response = new_text
+
+                    if buffer:
+                        for punct in ['.', '!', '?']:
+                            buffer = buffer.replace(f"{punct}", f"{punct} ")
+                        buffer = ' '.join(buffer.split())
+                        yield buffer
 
                 return StreamingResponse(generate_text(), media_type="text/plain")
             else:
-                # Non-streaming response using proper async handling
-                response_text = ""
-                async for output in engine.generate(prompt, sampling_params, request_id):
-                    if len(output.outputs) > 0:
-                        response_text = output.outputs[0].text
-                
-                # Remove Assistant: prefix if present
-                if "Assistant:" in response_text:
+                # Non-streaming response
+                outputs = await engine.generate(prompt, sampling_params, request_id)
+                if len(outputs.outputs) > 0:
+                    response_text = outputs.outputs[0].text
+                    # Remove Assistant: prefix if present
                     response_text = response_text.split("Assistant:")[-1].lstrip()
-                
-                return JSONResponse(content={
-                    "id": request_id,
-                    "choices": [
-                        {
-                            "text": response_text,
-                            "finish_reason": "stop"
-                        }
-                    ]
-                })
+                    
+                    return JSONResponse(content={
+                        "id": request_id,
+                        "choices": [
+                            {
+                                "text": response_text,
+                                "finish_reason": "stop"
+                            }
+                        ]
+                    })
+                else:
+                    return JSONResponse(content={"error": "No output generated"}, status_code=500)
                 
         except Exception as e:
             logging.error(f"Error in completion_generator: {str(e)}")
@@ -366,140 +321,53 @@ def serve_vllm():
 
     @web_app.post("/v1/chat/completions")
     async def chat_completions(request: fastapi.Request) -> JSONResponse:
-        """Handle multimodal chat completions for Mistral Vision"""
+        """Handle multimodal chat completions"""
         try:
             body = await request.json()
             messages = body.get("messages", [])
             model = body.get("model", DEFAULT_MISTRAL_NAME)
             max_tokens = body.get("max_tokens", 500)
-            temperature = body.get("temperature", 0.15)  # Mistral recommends 0.15
-            top_p = body.get("top_p", 0.95)
             request_id = str(uuid.uuid4())
             
             logging.info(f"Received chat completion request for model {model}")
             
-            # Format messages according to Mistral's expected format
-            formatted_messages = []
+            # Convert to standard text prompt format for now
+            prompt = ""
             for message in messages:
-                if message.get("role") == "system":
-                    # For Mistral 3.1, add system prompt using special tokens
-                    system_content = message.get("content", "")
-                    if isinstance(system_content, list):
-                        # Handle multimodal system prompt if needed
-                        system_text = " ".join([item.get("text", "") for item in system_content if item.get("type") == "text"])
-                    else:
-                        system_text = system_content
-                    
-                    # Add formatted system prompt
-                    formatted_messages.append({
-                        "role": "system",
-                        "content": system_text
-                    })
+                role = message.get("role", "user")
+                content = message.get("content", "")
+                
+                # Handle multimodal content
+                if isinstance(content, list):
+                    for item in content:
+                        if item.get("type") == "text":
+                            prompt += f"{role.title()}: {item.get('text', '')}\n"
+                        elif item.get("type") == "image_url":
+                            prompt += f"{role.title()}: [Image content provided]\n"
                 else:
-                    # Pass user and assistant messages as is
-                    formatted_messages.append(message)
+                    prompt += f"{role.title()}: {content}\n"
             
-            # Build sampling params
+            # Add assistant prompt
+            prompt += "Assistant:"
+            
+            # Generate response with vLLM
             sampling_params = SamplingParams(
-                temperature=temperature,
-                top_p=top_p,
+                temperature=0.7,
                 max_tokens=max_tokens,
-                stop=body.get("stop", None)
+                stop=["User:", "System:", "\n\n"],
             )
             
-            # Try Direct OpenAI API Compatible Format first
-            try:
-                response = await openai_serving_chat.create_chat_completion(
-                    # request_id=request_id,
-                    # model=model,
-                    messages=formatted_messages,
-                    sampling_params=sampling_params,
-                    stream=False
-                )
-                return JSONResponse(content=response)
-            except Exception as api_error:
-                logging.error(f"Error in OpenAI chat completion: {api_error}")
-                import traceback
-                traceback.print_exc()
+            outputs = await engine.generate(prompt, sampling_params, request_id)
+            
+            if len(outputs.outputs) > 0:
+                response_text = outputs.outputs[0].text
+                # Remove any prefix if present
+                response_text = response_text.split("Assistant:")[-1].lstrip()
                 
-                # Fall back to manual prompt construction
-                logging.info("Falling back to manual prompt construction")
-                
-                # Build a prompt in Mistral's expected format
-                # Format: <s>[SYSTEM_PROMPT]<system prompt>[/SYSTEM_PROMPT][INST]<user message>[/INST]<assistant response></s>[INST]<user message>[/INST]
-                
-                system_content = ""
-                for message in messages:
-                    if message.get("role") == "system":
-                        content = message.get("content", "")
-                        if isinstance(content, list):
-                            # Get only text from system prompt
-                            system_content = " ".join([item.get("text", "") for item in content if item.get("type") == "text"])
-                        else:
-                            system_content = content
-                        break
-                
-                # Build the conversation prompt with Mistral's format
-                prompt = f"<s>[SYSTEM_PROMPT]{system_content}[/SYSTEM_PROMPT]"
-                
-                # Add conversation messages
-                user_content = None
-                for message in messages:
-                    role = message.get("role")
-                    content = message.get("content")
-                    
-                    # Skip system messages as they're already handled
-                    if role == "system":
-                        continue
-                        
-                    if role == "user":
-                        # For the last user message, save it for special handling
-                        user_content = content
-                        continue
-                    elif role == "assistant":
-                        if isinstance(content, list):
-                            # Get only text from assistant
-                            text_content = " ".join([item.get("text", "") for item in content if item.get("type") == "text"])
-                            prompt += f"[INST]{user_content if user_content else ''}[/INST]{text_content}</s>"
-                        else:
-                            prompt += f"[INST]{user_content if user_content else ''}[/INST]{content}</s>"
-                        user_content = None
-                
-                # Add the final user message if there is one
-                if user_content is not None:
-                    if isinstance(user_content, list):
-                        # Handle multimodal content specially
-                        text_parts = []
-                        has_images = False
-                        
-                        for item in user_content:
-                            if item.get("type") == "text":
-                                text_parts.append(item.get("text", ""))
-                            elif item.get("type") == "image_url":
-                                has_images = True
-                                # Just note that there's an image - we'll add it to the model inputs directly
-                                text_parts.append("[IMAGE]")
-                        
-                        text_content = " ".join(text_parts)
-                        prompt += f"[INST]{text_content}[/INST]"
-                        
-                        if has_images:
-                            logging.warning("Direct image handling not supported in manual mode - using text-only prompt")
-                    else:
-                        prompt += f"[INST]{user_content}[/INST]"
-                
-                # Use proper async handling with the generator
-                response_text = ""
-                async for output in engine.generate(prompt, sampling_params, request_id):
-                    if output and hasattr(output, 'outputs') and len(output.outputs) > 0:
-                        response_text = output.outputs[0].text.strip()
-                
-                # Create OpenAI-compatible response
-                response_json = {
+                return JSONResponse(content={
                     "id": request_id,
                     "object": "chat.completion",
                     "created": int(datetime.datetime.now().timestamp()),
-                    "model": model,
                     "choices": [
                         {
                             "index": 0,
@@ -509,15 +377,10 @@ def serve_vllm():
                             },
                             "finish_reason": "stop"
                         }
-                    ],
-                    "usage": {
-                        "prompt_tokens": -1,  # Not available
-                        "completion_tokens": -1,  # Not available
-                        "total_tokens": -1  # Not available
-                    }
-                }
-                
-                return JSONResponse(content=response_json)
+                    ]
+                })
+            else:
+                return JSONResponse(content={"error": "No output generated"}, status_code=500)
                 
         except Exception as e:
             logging.error(f"Error in chat_completions: {str(e)}")
@@ -525,148 +388,18 @@ def serve_vllm():
             traceback.print_exc()
             return JSONResponse(status_code=500, content={"error": str(e)})
 
-
-
-
-    # === ColQwen2 Endpoints ===
-
-    @web_app.post("/v1/embeddings")
-    async def generate_embeddings(request: fastapi.Request) -> JSONResponse:
-        """Generate embeddings for queries or images"""
-        try:
-            # Load the model if needed
-            model, processor = load_colqwen_model()
-            
-            body = await request.json()
-            embedding_type = body.get("type", "query")  # 'query' or 'image'
-            
-            if embedding_type == "query":
-                # Process queries
-                queries = body.get("queries", [])
-                if not queries:
-                    return JSONResponse(status_code=400, content={"error": "No queries provided"})
-                
-                processed_queries = processor.process_queries(queries).to(model.device)
-                with torch.no_grad():
-                    query_embeddings = model(**processed_queries)
-                
-                # Convert embeddings to list for JSON serialization
-                result = []
-                for i, emb in enumerate(query_embeddings):
-                    # Convert to CPU and standard float for serialization
-                    numpy_emb = emb.cpu().to(torch.float32).numpy().tolist()
-                    result.append({
-                        "index": i,
-                        "embedding": numpy_emb,
-                        "query": queries[i]
-                    })
-                
-                return JSONResponse(content={"embeddings": result})
-                
-            elif embedding_type == "image":
-                # Process images from base64
-                images_data = body.get("images", [])
-                if not images_data:
-                    return JSONResponse(status_code=400, content={"error": "No images provided"})
-                
-                # Convert base64 to PIL Images
-                images = []
-                for img_data in images_data:
-                    try:
-                        # Expect format like: data:image/jpeg;base64,/9j/4AAQSkZJR...
-                        if "base64," in img_data:
-                            img_data = img_data.split("base64,")[1]
-                        
-                        img_bytes = base64.b64decode(img_data)
-                        img = Image.open(BytesIO(img_bytes))
-                        images.append(img)
-                    except Exception as e:
-                        logging.error(f"Error processing image: {e}")
-                        return JSONResponse(status_code=400, content={"error": f"Invalid image data: {str(e)}"})
-                
-                # Process images with ColQwen2
-                processed_images = processor.process_images(images).to(model.device)
-                with torch.no_grad():
-                    image_embeddings = model(**processed_images)
-                
-                # Convert embeddings to list for JSON serialization
-                result = []
-                for i, emb in enumerate(image_embeddings):
-                    # Convert to CPU and standard float for serialization
-                    numpy_emb = emb.cpu().to(torch.float32).numpy().tolist()
-                    result.append({
-                        "index": i,
-                        "embedding": numpy_emb
-                    })
-                
-                return JSONResponse(content={"embeddings": result})
-                
-            else:
-                return JSONResponse(status_code=400, content={"error": f"Invalid embedding type: {embedding_type}"})
-                
-        except Exception as e:
-            logging.error(f"Error generating embeddings: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse(status_code=500, content={"error": str(e)})
-
-    @web_app.post("/v1/score_embeddings")
-    async def score_embeddings(request: fastapi.Request) -> JSONResponse:
-        """Score similarity between query and document embeddings"""
-        try:
-            # Load the model if needed
-            _, processor = load_colqwen_model()
-            
-            body = await request.json()
-            query_embeddings_data = body.get("query_embeddings", [])
-            image_embeddings_data = body.get("image_embeddings", [])
-            
-            if not query_embeddings_data or not image_embeddings_data:
-                return JSONResponse(status_code=400, content={"error": "Both query and image embeddings must be provided"})
-            
-            # Convert lists back to tensors
-            query_embeddings = [torch.tensor(emb, dtype=torch.float32) for emb in query_embeddings_data]
-            image_embeddings = [torch.tensor(emb, dtype=torch.float32) for emb in image_embeddings_data]
-            
-            # Calculate scores
-            scores = []
-            for q_idx, query_emb in enumerate(query_embeddings):
-                query_scores = []
-                for img_idx, img_emb in enumerate(image_embeddings):
-                    # Use processor's scoring method
-                    score = float(processor.score_multi_vector(
-                        query_emb.unsqueeze(0),
-                        img_emb.unsqueeze(0)
-                    )[0])
-                    query_scores.append({
-                        "image_index": img_idx,
-                        "score": score
-                    })
-                scores.append({
-                    "query_index": q_idx,
-                    "scores": query_scores
-                })
-            
-            return JSONResponse(content={"scores": scores})
-            
-        except Exception as e:
-            logging.error(f"Error scoring embeddings: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse(status_code=500, content={"error": str(e)})
-        
     return web_app
 
-# Create app function for FastHTML UI
+# Create app function for FastHTML UI and ColQwen processing
 @app.function(
     image=image,
-    gpu=modal.gpu.A10G(count=1),
+    gpu=modal.gpu.A100(count=1, size="80GB"),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     volumes={
         DATA_DIR: bee_volume,
         DATABASE_DIR: db_volume,
-        COLQWEN_MODELS_DIR: colqwen_volume  # Include ColQwen volume
+        COLQWEN_MODELS_DIR: colqwen_volume
     },
     secrets=[modal.Secret.from_name("my-custom-secret-3")]
 )
@@ -686,94 +419,48 @@ def serve_fasthtml():
     from fastapi.responses import FileResponse, Response, HTMLResponse
     from io import BytesIO
     from PIL import Image
+    from colpali_engine.models import ColQwen2, ColQwen2Processor
+    from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
     import nltk
     from nltk.tokenize import word_tokenize
     import numpy as np
     from rank_bm25 import BM25Okapi
     from pdf2image import convert_from_path
-    from colpali_engine.models import ColQwen2, ColQwen2Processor
-    from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
-    from rerankers import Reranker
     
-    # Setup NLTK for tokenization 
+    # Setup NLTK
     NLTK_DATA_DIR = "/tmp/nltk_data"
     os.makedirs(NLTK_DATA_DIR, exist_ok=True)
     nltk.data.path.append(NLTK_DATA_DIR)
     nltk.download("punkt", download_dir=NLTK_DATA_DIR)
     
-    # Global variables - data only, no models
+    # Global variables
     colpali_model = None
     colpali_processor = None
+    colpali_embeddings = None
     df = None
     page_images = {}
     bm25_index = None
     tokenized_docs = None
-    colpali_embeddings = None
-
-    def load_colqwen_model():
-        """Load ColQwen2 model if it's not already loaded"""
-        global colqwen_model, colqwen_processor
-        
-        if colqwen_model is not None:
-            return colqwen_model, colqwen_processor
-            
-        # Import necessary modules here to ensure they're available
-        from colpali_engine.models import ColQwen2, ColQwen2Processor
-        from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
-        
-        try:
-            # Log directory contents for debugging
-            model_dir = os.path.join(COLQWEN_DIR, os.path.basename(DEFAULT_COLQWEN_NAME))
-            logging.info(f"Looking for ColQwen2 model in: {model_dir}")
-            if os.path.exists(model_dir) and os.path.isdir(model_dir):
-                logging.info(f"Directory exists and contains: {os.listdir(model_dir)}")
-                colqwen_model = ColQwen2.from_pretrained(
-                    model_dir,
-                    torch_dtype=torch.bfloat16,
-                    device_map="cuda" if torch.cuda.is_available() else "cpu"
-                ).eval()
-                colqwen_processor = ColQwen2Processor.from_pretrained(model_dir)
-                logging.info(f"Loaded ColQwen2 model from volume: {model_dir}")
-            else:
-                logging.info(f"Directory not found, downloading from HuggingFace: {DEFAULT_COLQWEN_NAME}")
-                colqwen_model = ColQwen2.from_pretrained(
-                    DEFAULT_COLQWEN_NAME,
-                    torch_dtype=torch.bfloat16,
-                    device_map="cuda" if torch.cuda.is_available() else "cpu"
-                ).eval()
-                colqwen_processor = ColQwen2Processor.from_pretrained(DEFAULT_COLQWEN_NAME)
-                logging.info(f"Loaded ColQwen2 model from HuggingFace")
-        except Exception as e:
-            logging.error(f"Error loading ColQwen2 model: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-            
-        return colqwen_model, colqwen_processor
     
-    # Function to load ColQwen2 model
+    # Load ColPali model and data functions
     def ensure_colpali_model_loaded():
-        """Ensure the ColQwen2 model is loaded"""
+        """Ensure the ColQwen2 model is properly loaded from volume if possible"""
         global colpali_model, colpali_processor
         
-        if colpali_model is None:
+        # Verify CUDA is available
+        if torch.cuda.is_available():
+            logging.info(f"CUDA is available: {torch.cuda.get_device_name(0)}")
+        else:
+            logging.warning("WARNING: CUDA is NOT available, ColQwen will run on CPU which is slower")
+        
+        # Check if we need to load the model
+        if 'colpali_model' not in globals() or colpali_model is None:
+            logging.info(f"Loading ColQwen2 model...")
             try:
-                # Check if CUDA is available for GPU acceleration
-                if torch.cuda.is_available():
-                    logging.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
-                else:
-                    logging.warning("CUDA not available - using CPU for ColQwen2")
-                
                 # First try to find model in volume
                 model_path = os.path.join(COLQWEN_MODELS_DIR, os.path.basename(DEFAULT_COLQWEN_NAME))
                 if os.path.exists(model_path) and os.path.isdir(model_path):
-                    logging.info(f"Loading ColQwen2 model from volume path: {model_path}")
-                    # List files in model path for debugging
-                    try:
-                        logging.info(f"Model directory contents: {os.listdir(model_path)}")
-                    except Exception as e:
-                        logging.error(f"Error listing model directory: {e}")
-                    
+                    logging.info(f"Using local model from volume: {model_path}")
                     colpali_model = ColQwen2.from_pretrained(
                         model_path,
                         torch_dtype=torch.bfloat16,
@@ -781,7 +468,7 @@ def serve_fasthtml():
                     ).eval()
                     colpali_processor = ColQwen2Processor.from_pretrained(model_path)
                 else:
-                    # Fall back to direct download from HuggingFace
+                    # Fall back to HuggingFace download
                     logging.info(f"Model not found in volume, downloading from HuggingFace: {DEFAULT_COLQWEN_NAME}")
                     colpali_model = ColQwen2.from_pretrained(
                         DEFAULT_COLQWEN_NAME,
@@ -799,7 +486,6 @@ def serve_fasthtml():
                 return False
         return True
 
-    # Function to load data
     def load_data():
         """Load all data needed for document retrieval"""
         global colpali_embeddings, df, page_images, bm25_index, tokenized_docs
@@ -864,9 +550,10 @@ def serve_fasthtml():
             bm25_index = None
             tokenized_docs = None
 
-    # Load data at startup
+    # Load models and data at startup
+    ensure_colpali_model_loaded()
     load_data()
-    
+
     # Make temporary directories
     os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
     os.makedirs(HEATMAP_DIR, exist_ok=True)
@@ -888,8 +575,6 @@ def serve_fasthtml():
         created_at = Column(DateTime, default=datetime.datetime.utcnow)
         # Only include context_source if we verified it exists
         context_source = Column(String, nullable=True)
-
-
 
     # Initialize the FastHTML app
     fasthtml_app, rt = fast_app(
@@ -958,23 +643,6 @@ def serve_fasthtml():
                     font-size: 14px;
                     margin-bottom: 8px;
                 }
-                
-                /* Prevent token map UI flicker */
-                .token-tab {
-                    min-width: 60px;
-                    text-align: center;
-                }
-                
-                #token-map-display {
-                    min-height: 300px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                }
-                
-                #token-map-display img {
-                    transition: opacity 0.2s;
-                }
             """),
         ),
         middleware=[
@@ -999,252 +667,67 @@ def serve_fasthtml():
         }
         return queries.get(analysis_type, queries["classify_insect"])
 
-    # API calls to serve_vllm for LLM operations
-    async def call_mistral_vision_api(image, query, context_text="", analysis_id=""):
-        """Process the image with Mistral Vision including context from retrieved documents"""
-        logging.info(f"Processing image {analysis_id} with Mistral Vision using query: {query}")
-        
-        try:
-            # Convert image to base64 for transmission
-            img_buffer = BytesIO()
-            image.save(img_buffer, format=image.format or "JPEG")
-            img_data = img_buffer.getvalue()
-            base64_img = base64.b64encode(img_data).decode("utf-8")
-            
-            # Build the system prompt for Mistral
-            system_prompt = """You are an expert biologist analyzing visual specimens. 
-            Provide detailed, scientific analysis with proper taxonomic terminology.
-            Always be thorough but concise, keeping responses under 5 sentences."""
-            
-            # Log image info for debugging
-            logging.info(f"Image for analysis: {image.format} {image.size}, {len(base64_img)} bytes base64")
-            
-            # Build user content with text and image
-            user_content = []
-            
-            # Add text content
-            text_content = query
-            if context_text:
-                text_content += f"\n\nRelevant context from scientific literature:\n{context_text}\n\nExamine the image and provide a detailed, scientifically accurate response using the context where relevant."
-            
-            user_content.append({"type": "text", "text": text_content})
-            
-            # Add image content - Mistral expects this format
-            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}})
-            
-            # Create the chat completion request in Mistral's format
-            multimodal_message = {
-                "model": DEFAULT_MISTRAL_NAME,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                "max_tokens": 500,
-                "temperature": 0.15  # Mistral recommends low temperature
-            }
-            
-            # Call the multimodal endpoint
-            multimodal_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/chat/completions"
-            logging.info(f"Calling Mistral Vision endpoint: {multimodal_url}")
-            
-            async with aiohttp.ClientSession() as client_session:
-                try:
-                    async with client_session.post(multimodal_url, json=multimodal_message, timeout=120) as response:
-                        if response.status == 200:
-                            result = await response.json()
-                            if "choices" in result and len(result["choices"]) > 0:
-                                multimodal_response = result["choices"][0]["message"]["content"]
-                                logging.info(f"Received Mistral Vision response: {multimodal_response[:100]}...")
-                                return multimodal_response.strip()
-                        
-                        # If we get here, there was an error with the response
-                        logging.warning(f"Mistral Vision endpoint failed with status {response.status}")
-                        error_text = await response.text()
-                        logging.error(f"Error response: {error_text}")
-                except Exception as e:
-                    logging.warning(f"Mistral Vision endpoint error: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Fallback to text-only endpoint with clear messaging
-            logging.info("Falling back to text-only endpoint")
-            
-            # Format the text prompt with Mistral's expected format
-            system_part = f"[SYSTEM_PROMPT]{system_prompt}[/SYSTEM_PROMPT]"
-            
-            # Build prompt without image description - just explain the limitation
-            user_part = f"Query: {query}\n\n"
-            if context_text:
-                user_part += f"Relevant context from scientific literature:\n{context_text}\n\n"
-            user_part += "Note: I couldn't analyze the image directly, but I can provide information based on the query and context."
-            
-            # Complete the prompt in Mistral format
-            text_prompt = f"<s>{system_part}[INST]{user_part}[/INST]"
-            
-            # Use text-only API
-            vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
-            payload = {
-                "prompt": text_prompt,
-                "max_tokens": 500,
-                "temperature": 0.15,
-                "stream": False
-            }
-            
-            logging.info(f"Sending text request to endpoint: {vllm_url}")
-            
-            async with aiohttp.ClientSession() as client_session:
-                async with client_session.post(vllm_url, json=payload) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        if "choices" in result and len(result["choices"]) > 0:
-                            text_response = result["choices"][0]["text"]
-                            logging.info(f"Received text response: {text_response[:100]}...")
-                            return text_response.strip()
-                        else:
-                            logging.error(f"Invalid response format: {result}")
-                    else:
-                        error_text = await response.text()
-                        logging.error(f"Error from Mistral text API: {error_text}")
-                        return f"Error processing image: {error_text}"
-        
-        except Exception as e:
-            logging.error(f"Exception in call to Mistral Vision API: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return f"Error analyzing image: {str(e)}"
-        
-    # API calls to serve_vllm for embeddings and similarity maps
-    async def call_colqwen_api(endpoint, payload, max_retries=2, timeout=120):
-        """Call ColQwen2 API endpoints in serve_vllm with retry logic"""
-        api_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/{endpoint}"
-        logging.info(f"Calling ColQwen2 API endpoint: {api_url}")
-        
-        for retry in range(max_retries + 1):
-            try:
-                async with aiohttp.ClientSession() as client_session:
-                    async with client_session.post(api_url, json=payload, timeout=timeout) as response:
-                        if response.status == 200:
-                            return await response.json()
-                        else:
-                            error_text = await response.text()
-                            logging.error(f"Error from ColQwen2 API: {error_text}")
-                            if retry < max_retries:
-                                logging.info(f"Retrying request ({retry+1}/{max_retries})...")
-                                await asyncio.sleep(1)  # Add delay between retries
-                            else:
-                                return {"error": error_text}
-            except asyncio.TimeoutError:
-                logging.error(f"Timeout error calling ColQwen2 API (attempt {retry+1}/{max_retries+1})")
-                if retry < max_retries:
-                    logging.info(f"Retrying with increased timeout...")
-                    timeout = min(timeout * 1.5, 300)  # Increase timeout for next retry, max 5 minutes
-                    await asyncio.sleep(1)
-                else:
-                    return {"error": "Request timed out after multiple attempts"}
-            except Exception as e:
-                logging.error(f"Error calling ColQwen2 API: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                if retry < max_retries:
-                    logging.info(f"Retrying request ({retry+1}/{max_retries})...")
-                    await asyncio.sleep(1)
-                else:
-                    return {"error": str(e)}
-        
-        return {"error": "Failed after multiple retry attempts"}
     # Retrieve relevant documents
     async def retrieve_relevant_documents(query, top_k=5):
         """Retrieve most relevant documents using ColPali embeddings and BM25"""
-        global colpali_embeddings, df, bm25_index, tokenized_docs
+        global colpali_model, colpali_processor, colpali_embeddings, df, bm25_index, tokenized_docs
         
-        # Always initialize return values
-        retrieved_paragraphs = []
-        top_sources_data = []
+        # Ensure models and data are loaded
+        ensure_colpali_model_loaded()
         
         if colpali_embeddings is None or df is None or len(df) == 0:
             logging.error("No documents or embeddings available for retrieval")
             return [], []
             
-        # Initialize vector search variables
-        vector_top_indices = []
-        keyword_top_indices = []
-        similarities = []
-        bm25_scores = None
+        retrieved_paragraphs = []
+        top_sources_data = []
         
-        # Try ColPali retrieval (vector search)
+        # ColPali retrieval (vector search)
         try:
-            # Generate query embeddings via API
-            query_results = await call_colqwen_api("v1/embeddings", {
-                "type": "query",
-                "queries": [query]
-            })
+            # Process query with ColPali
+            processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
+            with torch.no_grad():
+                query_embeddings = colpali_model(**processed_query)
             
-            if "error" in query_results:
-                logging.error(f"Error generating query embeddings: {query_results.get('error')}")
-            else:
-                # Extract the query embedding
-                query_embedding = query_results["embeddings"][0]["embedding"]
+            # Calculate similarities with all pages
+            similarities = []
+            for idx, page_emb in enumerate(colpali_embeddings):
+                # Convert page embedding to tensor with matching dtype
+                page_tensor = torch.tensor(page_emb, device=colpali_model.device, dtype=query_embeddings.dtype)
                 
-                # Calculate similarities with all pages
-                for idx, page_emb in enumerate(colpali_embeddings):
-                    try:
-                        # Convert embeddings to proper format
-                        payload = {
-                            "query_embeddings": [query_embedding],
-                            "image_embeddings": [page_emb.tolist() if hasattr(page_emb, "tolist") else page_emb]
-                        }
-                        
-                        # Call API to score embeddings
-                        score_results = await call_colqwen_api("v1/score_embeddings", payload)
-                        
-                        if "error" in score_results:
-                            logging.error(f"Error scoring embeddings: {score_results.get('error')}")
-                            continue
-                        
-                        # Extract the score
-                        score = score_results["scores"][0]["scores"][0]["score"]
-                        similarities.append((idx, score))
-                    except Exception as e:
-                        logging.error(f"Error processing embedding {idx}: {e}")
-                        continue
+                # Score using ColPali's scoring method
+                score = float(colpali_processor.score_multi_vector(
+                    query_embeddings,
+                    page_tensor.unsqueeze(0)  # Add batch dimension
+                )[0])
                 
-                # Sort by similarity score
-                if similarities:
-                    similarities.sort(key=lambda x: x[1], reverse=True)
-                    vector_top_indices = [idx for idx, _ in similarities[:top_k]]
-                    logging.info(f"Vector search found {len(vector_top_indices)} relevant documents")
-        except Exception as e:
-            logging.error(f"Vector search failed: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # Try BM25 keyword search if available
-        try:
+                similarities.append((idx, score))
+            
+            # Sort by similarity score
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            vector_top_indices = [idx for idx, _ in similarities[:top_k]]
+            
+            # Try BM25 keyword search if available
+            keyword_top_indices = []
+            bm25_scores = None
             if bm25_index is not None and tokenized_docs is not None:
-                # Tokenize query and get BM25 scores
-                tokenized_query = word_tokenize(query.lower())
-                bm25_scores = bm25_index.get_scores(tokenized_query)
-                keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
-                logging.info(f"Keyword search found {len(keyword_top_indices)} relevant documents")
-        except Exception as e:
-            logging.error(f"Keyword search failed: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # Combine results (hybrid retrieval)
-        all_indices = list(set(vector_top_indices + keyword_top_indices))
-        
-        if not all_indices:
-            logging.warning("No relevant documents found with either method")
-            return [], []
-        
-        # Get data for reranking
-        docs_for_reranking = []
-        doc_indices = []
-        
-        for idx in all_indices:
-            if idx < len(df):
                 try:
+                    # Tokenize query and get BM25 scores
+                    tokenized_query = word_tokenize(query.lower())
+                    bm25_scores = bm25_index.get_scores(tokenized_query)
+                    keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
+                except Exception as e:
+                    logging.error(f"Error in BM25 scoring: {e}")
+            
+            # Combine results (hybrid retrieval)
+            all_indices = list(set(vector_top_indices + keyword_top_indices))
+            
+            # Get data for reranking
+            docs_for_reranking = []
+            doc_indices = []
+            
+            for idx in all_indices:
+                if idx < len(df):
                     # Get document info
                     filename = df.iloc[idx]['filename']
                     page_num = df.iloc[idx]['page']
@@ -1282,25 +765,21 @@ def serve_fasthtml():
                         'image_key': image_key,
                         'idx': idx
                     })
-                except Exception as e:
-                    logging.error(f"Error processing document at index {idx}: {e}")
-                    continue
-        
-        # Rerank results if we have documents
-        if docs_for_reranking:
-            try:
-                # Use a cross-encoder reranker
-                from rerankers import Reranker
-                ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
-                ranked_results = ranker.rank(query=query, docs=docs_for_reranking)
-                top_ranked = ranked_results.top_k(min(3, len(docs_for_reranking)))
-                
-                # Get the final top documents after reranking
-                final_retrieved_paragraphs = []
-                final_top_sources = []
-                
-                for ranked_doc in top_ranked:
-                    try:
+            
+            # Rerank results if we have documents
+            if docs_for_reranking:
+                try:
+                    # Use a cross-encoder reranker
+                    from rerankers import Reranker
+                    ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
+                    ranked_results = ranker.rank(query=query, docs=docs_for_reranking)
+                    top_ranked = ranked_results.top_k(min(3, len(docs_for_reranking)))
+                    
+                    # Get the final top documents after reranking
+                    final_retrieved_paragraphs = []
+                    final_top_sources = []
+                    
+                    for ranked_doc in top_ranked:
                         ranked_idx = docs_for_reranking.index(ranked_doc.text)
                         doc_idx = doc_indices[ranked_idx]
                         source_info = next((s for s in top_sources_data if s['idx'] == doc_idx), None)
@@ -1308,47 +787,31 @@ def serve_fasthtml():
                             source_info['reranker_score'] = ranked_doc.score
                             final_top_sources.append(source_info)
                             final_retrieved_paragraphs.append(ranked_doc.text)
-                    except Exception as e:
-                        logging.error(f"Error in reranking document: {e}")
-                        continue
-                
-                if final_retrieved_paragraphs and final_top_sources:
+                    
                     return final_retrieved_paragraphs, final_top_sources
-            except Exception as e:
-                logging.error(f"Error in reranking: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # If reranking fails or no documents, sort by combined score
-        if retrieved_paragraphs and top_sources_data:
-            try:
-                sorted_indices = sorted(range(len(top_sources_data)), 
-                                    key=lambda i: top_sources_data[i]['score'], 
-                                    reverse=True)
-                sorted_paragraphs = [retrieved_paragraphs[i] for i in sorted_indices[:3]]
-                sorted_sources = [top_sources_data[i] for i in sorted_indices[:3]]
-                
-                return sorted_paragraphs, sorted_sources
-            except Exception as e:
-                logging.error(f"Error sorting by score: {e}")
-        
-        # Fall back to returning raw results if available
-        if retrieved_paragraphs and top_sources_data:
-            # Limit to top 3 if more are available
-            return retrieved_paragraphs[:3], top_sources_data[:3]
-        
-        # Return empty lists as last resort
-        return [], []
+                    
+                except Exception as e:
+                    logging.error(f"Error in reranking: {e}")
+            
+            # If reranking fails, sort by combined score
+            sorted_indices = sorted(range(len(top_sources_data)), 
+                                   key=lambda i: top_sources_data[i]['score'], 
+                                   reverse=True)
+            sorted_paragraphs = [retrieved_paragraphs[i] for i in sorted_indices[:3]]
+            sorted_sources = [top_sources_data[i] for i in sorted_indices[:3]]
+            
+            return sorted_paragraphs, sorted_sources
+            
+        except Exception as e:
+            logging.error(f"Error in document retrieval: {e}")
+            import traceback
+            traceback.print_exc()
+            return [], []
 
     # Generate similarity maps for context document
     async def generate_similarity_maps(query, image_key):
         """Generate token similarity maps for a retrieved document"""
         global colpali_model, colpali_processor, page_images
-
-        # Load ColQwen2 model if not already loaded
-        if not ensure_colpali_model_loaded():
-            logging.error("Failed to load ColQwen2 model for similarity maps")
-            return []
         
         if not image_key or image_key not in page_images:
             logging.error(f"Invalid image key: {image_key}")
@@ -1416,9 +879,9 @@ def serve_fasthtml():
             
             # Sort by similarity score and take top tokens
             token_sims.sort(key=lambda x: x[2], reverse=True)
-            top_tokens = token_sims[:6]  # Limit to 6 tokens
+            top_tokens = token_sims[:6]  # Get top 6 tokens
             
-            # Generate and return heatmaps as base64
+            # Generate and save heatmaps
             image_heatmaps = []
             for token_idx, token, score in top_tokens:
                 # Skip if score is very low
@@ -1460,14 +923,13 @@ def serve_fasthtml():
             traceback.print_exc()
             return []
 
-    # Generate image description to improve context for LLM
+    # Generate image description for LLM context
     async def generate_image_description(image):
         """Generate a description of the image using ColQwen"""
         global colpali_model, colpali_processor
         
-        # Load model if needed
-        if not ensure_colpali_model_loaded():
-            logging.error("Failed to load ColQwen2 model for image description")
+        if not colpali_model or not colpali_processor:
+            logging.warning("ColQwen model not available for image description")
             return None
         
         try:
@@ -1505,6 +967,139 @@ def serve_fasthtml():
             logging.error(f"Error generating image description: {str(e)}")
             return None
 
+    # Process image with Qwen LLM - FIXED VERSION FOR MULTIMODAL
+    async def process_with_qwen(image, query, context_text="", analysis_id=""):
+        """Process the image with Qwen LLM including context from retrieved documents"""
+        logging.info(f"Processing image {analysis_id} with Qwen using query: {query}")
+        
+        try:
+            # Convert image to base64 for transmission
+            img_buffer = BytesIO()
+            image.save(img_buffer, format=image.format or "JPEG")
+            img_data = img_buffer.getvalue()
+            base64_img = base64.b64encode(img_data).decode("utf-8")
+            
+            # Build the prompt for Qwen, including context if available
+            system_prompt = "You are an expert biologist analyzing visual specimens."
+            
+            # Log image info for debugging
+            logging.info(f"Image for analysis: {image.format} {image.size}, {len(base64_img)} bytes base64")
+            
+            # Check if we should use direct ColQwen processing instead
+            if context_text:
+                # For context-aware analysis
+                prompt = f"""{system_prompt}
+
+Query: {query}
+
+Relevant context from scientific literature:
+{context_text}
+
+Examine the image and provide a detailed, scientifically accurate response using the context where relevant.
+Keep your answer under 5 sentences but be thorough and precise.
+"""
+            else:
+                # For direct image analysis
+                prompt = f"""{system_prompt}
+
+Query: {query}
+
+Provide a detailed, scientifically accurate response with proper taxonomic terminology.
+Keep your answer under 5 sentences but be thorough and precise.
+"""
+
+            # Create a multimodal message format
+            multimodal_message = {
+                "model": DEFAULT_MISTRAL_NAME,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": f"{query}\n\n{context_text if context_text else ''}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
+                    ]}
+                ],
+                "max_tokens": 500
+            }
+            
+            # First try with multimodal API endpoint (if available)
+            multimodal_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/chat/completions"
+            logging.info(f"Trying multimodal endpoint: {multimodal_url}")
+            
+            async with aiohttp.ClientSession() as client_session:
+                try:
+                    async with client_session.post(multimodal_url, json=multimodal_message, timeout=60) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            if "choices" in result and len(result["choices"]) > 0:
+                                multimodal_response = result["choices"][0]["message"]["content"]
+                                logging.info(f"Received multimodal response: {multimodal_response[:100]}...")
+                                return multimodal_response.strip()
+                        else:
+                            logging.warning(f"Multimodal endpoint failed with status {response.status}")
+                except Exception as e:
+                    logging.warning(f"Multimodal endpoint error: {str(e)}")
+            
+            # Fallback to text-only with image description
+            logging.info("Falling back to text-only endpoint with image description")
+            
+            # Describe the image using ColQwen for context
+            image_description = await generate_image_description(image)
+            if image_description:
+                logging.info(f"Generated image description: {image_description[:100]}...")
+                
+                # Use text endpoint with image description
+                # Create the context part separately
+                context_part = f"Relevant context from scientific literature:\n{context_text}" if context_text else ""
+
+                # Use it in the main f-string
+                text_prompt = f"""{system_prompt}
+
+                Query: {query}
+
+                Image description: {image_description}
+
+                {context_part}
+
+                Provide a detailed, scientifically accurate response with proper taxonomic terminology.
+                Keep your answer under 5 sentences but be thorough and precise.
+                """
+            else:
+                # Plain text fallback
+                text_prompt = prompt
+            
+            # Use text-only API
+            vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
+            payload = {
+                "prompt": text_prompt,
+                "max_tokens": 500,
+                "stream": True
+            }
+            
+            logging.info(f"Sending streaming request to text endpoint: {vllm_url}")
+            
+            async with aiohttp.ClientSession() as client_session:
+                async with client_session.post(vllm_url, json=payload) as response:
+                    if response.status == 200:
+                        # For streamed responses, collect all chunks
+                        full_response = ""
+                        async for chunk in response.content:
+                            if chunk:
+                                text = chunk.decode('utf-8')
+                                full_response += text
+                        
+                        logging.info(f"Collected full response from streaming: {full_response[:100]}...")
+                        return full_response.strip()
+                    else:
+                        error_text = await response.text()
+                        logging.error(f"Error from Qwen: {error_text}")
+                        return f"Error processing image: {error_text}"
+        
+        except Exception as e:
+            logging.error(f"Exception in process_with_qwen: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return f"Error: {str(e)}"
+    
     # Define UI components
     def upload_form():
         """Render upload form for images with proper interactive elements"""
@@ -1650,7 +1245,7 @@ def serve_fasthtml():
             )
 
     def token_maps_ui(image_key, heatmaps):
-        """Create token map UI with tabs and display area - improved to avoid flicker"""
+        """Create token map UI with tabs and display area"""
         if not heatmaps:
             return Div("No token maps available", cls="text-zinc-400 text-center")
             
@@ -1663,9 +1258,9 @@ def serve_fasthtml():
             token_tab = Button(
                 heatmap['token'],
                 cls=token_class,
-                # Use data attributes for client-side tab switching to reduce HTTP requests
-                data_token_idx=f"{heatmap['token_idx']}",
-                data_image_key=f"{image_key}",
+                hx_get=f"/token-map/{image_key}/{heatmap['token_idx']}",
+                hx_target="#token-map-display",
+                hx_swap="innerHTML",
                 id=f"token-tab-{i}"
             )
             # Add the button to our list
@@ -1673,32 +1268,6 @@ def serve_fasthtml():
         
         # Create token tabs Div with all buttons at once
         token_tabs = Div(*tab_buttons, cls="flex flex-wrap gap-2 mb-4")
-        
-        # Pre-load all token maps as hidden images
-        token_maps_container = Div(id="token-maps-container", cls="hidden")
-        for heatmap in heatmaps:
-            heatmap_path = f"/heatmap-image/{image_key}_token_{heatmap['token_idx']}.png"
-            token_maps_container.children.append(
-                Img(
-                    src=heatmap_path,
-                    cls="hidden",
-                    id=f"token-map-{heatmap['token_idx']}",
-                    data_token_idx=f"{heatmap['token_idx']}"
-                )
-            )
-        
-        # Initial token map display - show the first one
-        initial_token_map = None
-        if heatmaps:
-            initial_token_idx = heatmaps[0]['token_idx']
-            initial_heatmap_path = f"/heatmap-image/{image_key}_token_{initial_token_idx}.png"
-            initial_token_map = Img(
-                src=initial_heatmap_path,
-                cls="mx-auto max-h-96 w-full object-contain token-map",
-                id="active-token-map"
-            )
-        else:
-            initial_token_map = Div("Select a token above to see its heatmap", cls="text-zinc-400 text-center py-8")
         
         # Create the full token maps container
         return Div(
@@ -1709,51 +1278,37 @@ def serve_fasthtml():
             # Token tabs navigation - using our complete Div with all buttons
             token_tabs,
             
-            # Hidden container with all maps
-            token_maps_container,
-            
-            # Token map display area - just shows the active map
+            # Token map display area
             Div(
-                initial_token_map,
+                Div("Select a token above to see its heatmap", cls="text-zinc-400 text-center py-8"),
                 id="token-map-display",
                 cls="w-full bg-zinc-700 rounded-md overflow-hidden"
             ),
             
-            # JavaScript to handle tab interaction client-side
+            # JavaScript to handle tab interaction
             Script('''
-            document.addEventListener('DOMContentLoaded', function() {
-                // Add click handlers to all token tabs
-                document.querySelectorAll('[id^="token-tab-"]').forEach(function(tab) {
-                    tab.addEventListener('click', function(e) {
-                        // Get the token index and image key from data attributes
-                        const tokenIdx = this.getAttribute('data-token-idx');
-                        const imageKey = this.getAttribute('data-image-key');
-                        
-                        // Remove active class from all tabs
-                        document.querySelectorAll('[id^="token-tab-"]').forEach(function(t) {
-                            t.classList.remove('btn-primary', 'active');
-                            t.classList.add('btn-outline');
-                        });
-                        
-                        // Add active class to clicked tab
-                        this.classList.remove('btn-outline');
-                        this.classList.add('btn-primary', 'active');
-                        
-                        // Update the displayed token map
-                        const mapPath = `/heatmap-image/${imageKey}_token_${tokenIdx}.png`;
-                        const activeMap = document.getElementById('active-token-map');
-                        if (activeMap) {
-                            // Just update the src attribute to avoid reflow
-                            activeMap.src = mapPath;
-                        }
+            document.addEventListener('htmx:afterSwap', function() {
+                if (document.getElementById('token-tab-0')) {
+                    setTimeout(function() {
+                        document.getElementById('token-tab-0').click();
+                    }, 300);
+                }
+            });
+            
+            document.addEventListener('htmx:afterRequest', function(evt) {
+                if (evt.detail.target && evt.detail.target.id === 'token-map-display') {
+                    // Remove active class from all tabs
+                    document.querySelectorAll('[id^="token-tab-"]').forEach(function(tab) {
+                        tab.classList.remove('btn-primary', 'active');
+                        tab.classList.add('btn-outline');
                     });
-                });
-                
-                // Auto-select first tab on load
-                setTimeout(function() {
-                    const firstTab = document.getElementById('token-tab-0');
-                    if (firstTab) firstTab.click();
-                }, 100);
+                    
+                    // Add active class to clicked tab
+                    if (evt.detail.requestConfig.triggeringElement) {
+                        evt.detail.requestConfig.triggeringElement.classList.remove('btn-outline');
+                        evt.detail.requestConfig.triggeringElement.classList.add('btn-primary', 'active');
+                    }
+                }
             });
             '''),
             
@@ -1840,7 +1395,7 @@ def serve_fasthtml():
                 cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
             )
 
-    def analysis_results_ui(image_path, mistral_response, context_paragraphs, top_sources, token_maps, analysis_id):
+    def analysis_results_ui(image_path, qwen_response, context_paragraphs, top_sources, token_maps, analysis_id):
         """Create UI to display analysis results with context and token maps"""
         
         # Get the image filename for the UI
@@ -1912,11 +1467,11 @@ def serve_fasthtml():
                         cls="mb-6"
                     ),
                     
-                    # Display Mistral's response
+                    # Display Qwen's response
                     Div(
                         H3("AI Analysis", cls="text-xl font-semibold text-white mb-2"),
                         Div(
-                            mistral_response,
+                            qwen_response,
                             cls="bg-zinc-700 rounded-md p-4 text-white"
                         ),
                         cls="mb-6"
@@ -1993,7 +1548,12 @@ def serve_fasthtml():
                 
                 # Global script to initialize UI behaviors
                 Script("""
-                // Set up form behaviors
+                // Set up click tracking for debugging
+                document.addEventListener('click', function(e) {
+                    console.log('Click detected on:', e.target);
+                });
+                
+                // Make sure form submits properly
                 document.addEventListener('DOMContentLoaded', function() {
                     const form = document.getElementById('upload-form');
                     if (form) {
@@ -2022,44 +1582,14 @@ def serve_fasthtml():
                     }
                 });
                 
-                // Handle token map interactions
-                document.addEventListener('click', function(e) {
-                    if (e.target.closest('[id^="token-tab-"]')) {
-                        const tab = e.target.closest('[id^="token-tab-"]');
-                        const tokenIdx = tab.getAttribute('data-token-idx');
-                        const imageKey = tab.getAttribute('data-image-key');
-                        
-                        // Update tab styling
-                        document.querySelectorAll('[id^="token-tab-"]').forEach(function(t) {
-                            t.classList.remove('btn-primary', 'active');
-                            t.classList.add('btn-outline');
-                        });
-                        
-                        tab.classList.remove('btn-outline');
-                        tab.classList.add('btn-primary', 'active');
-                        
-                        // Find the right image and show it
-                        const mapPath = `/heatmap-image/${imageKey}_token_${tokenIdx}.png`;
-                        const display = document.getElementById('token-map-display');
-                        
-                        if (display) {
-                            // Look for an existing active map
-                            let activeMap = document.getElementById('active-token-map');
-                            
-                            if (activeMap) {
-                                activeMap.src = mapPath;
-                            } else {
-                                // Create a new map if needed
-                                activeMap = document.createElement('img');
-                                activeMap.id = 'active-token-map';
-                                activeMap.src = mapPath;
-                                activeMap.className = 'mx-auto max-h-96 w-full object-contain token-map';
-                                
-                                // Clear the display and add the new map
-                                display.innerHTML = '';
-                                display.appendChild(activeMap);
-                            }
-                        }
+                // Handle tabs for token maps
+                document.addEventListener('htmx:afterSwap', function(evt) {
+                    if (evt.detail.target.id === 'analysis-results') {
+                        // Auto-select first token tab if available
+                        setTimeout(function() {
+                            const firstTab = document.getElementById('token-tab-0');
+                            if (firstTab) firstTab.click();
+                        }, 300);
                     }
                 });
                 """),
@@ -2195,8 +1725,8 @@ def serve_fasthtml():
             else:
                 logging.warning("Top source missing image_key")
         
-        # Call Mistral Vision API for analysis
-        mistral_response = await call_mistral_vision_api(image, query, context_text, analysis_id)
+        # Process with Qwen (including context)
+        qwen_response = await process_with_qwen(image, query, context_text, analysis_id)
         
         # Update database with response
         try:
@@ -2204,7 +1734,7 @@ def serve_fasthtml():
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE image_analyses SET response = ? WHERE analysis_id = ?",
-                (mistral_response, analysis_id)
+                (qwen_response, analysis_id)
             )
             conn.commit()
             conn.close()
@@ -2218,11 +1748,198 @@ def serve_fasthtml():
         # Return the analysis results UI
         return analysis_results_ui(
             image_path=image_path, 
-            mistral_response=mistral_response, 
+            qwen_response=qwen_response, 
             context_paragraphs=retrieved_paragraphs,
             top_sources=top_sources, 
             token_maps=token_maps, 
             analysis_id=analysis_id
+        )
+
+    @fasthtml_app.get("/token-map/{image_key}/{token_idx}")
+    async def get_token_map(image_key: str, token_idx: int):
+        """Return the token map image HTML for display in the UI"""
+        # Get the file path
+        heatmap_filename = f"{image_key}_token_{token_idx}.png"
+        heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
+        logging.info(f"Looking for token map: {heatmap_path}")
+        
+        if os.path.exists(heatmap_path):
+            logging.info(f"Found token map at: {heatmap_path}")
+            # Encode the image directly to base64 for inline display
+            try:
+                with open(heatmap_path, "rb") as f:
+                    img_data = f.read()
+                    base64_img = base64.b64encode(img_data).decode('utf-8')
+                    
+                # Use an inline data URL instead of a separate request
+                return Div(
+                    Img(
+                        src=f"data:image/png;base64,{base64_img}",
+                        cls="mx-auto max-h-96 w-full object-contain token-map"
+                    ),
+                    cls="p-2 flex items-center justify-center min-h-[300px]"
+                )
+            except Exception as e:
+                logging.error(f"Error reading token map file: {e}")
+                import traceback
+                traceback.print_exc()
+                return Div(f"Error reading token map: {str(e)}", cls="text-red-500 p-4")
+        else:
+            logging.error(f"Token map not found at: {heatmap_path}")
+            return Div(f"Token map not found for {image_key} token {token_idx}", cls="text-red-500 p-4")
+
+    @fasthtml_app.get("/temp-image/{filename}")
+    async def serve_temp_image(filename: str):
+        """Serve temporary images (uploads and similarity maps)"""
+        image_path = os.path.join(TEMP_UPLOAD_DIR, filename)
+        logging.info(f"Requested temp image: {filename}, looking at: {image_path}")
+        
+        if os.path.exists(image_path):
+            logging.info(f"Found temp image at: {image_path}, size: {os.path.getsize(image_path)} bytes")
+            try:
+                # Open and read the file directly
+                with open(image_path, "rb") as f:
+                    content = f.read()
+                
+                # Determine media type based on file extension
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in ['.jpg', '.jpeg']:
+                    media_type = "image/jpeg"
+                elif ext == '.png':
+                    media_type = "image/png"
+                elif ext == '.gif':
+                    media_type = "image/gif"
+                else:
+                    media_type = "application/octet-stream"
+                
+                # Return as binary response
+                return Response(
+                    content=content,
+                    media_type=media_type
+                )
+            except Exception as e:
+                logging.error(f"Error reading temp image file: {e}")
+                import traceback
+                traceback.print_exc()
+                return Response(
+                    content=f"Error reading image: {str(e)}",
+                    media_type="text/plain",
+                    status_code=500
+                )
+        else:
+            logging.error(f"Temp image not found: {image_path}")
+            
+            # Check for files with similar name patterns
+            try:
+                files = os.listdir(TEMP_UPLOAD_DIR)
+                
+                # Look for files with the analysis_id prefix
+                analysis_id = filename.split('_')[0]
+                matching_files = [f for f in files if f.startswith(analysis_id)]
+                
+                if matching_files:
+                    logging.info(f"Found similar files: {matching_files}")
+                    
+                    # Try to use the first matching file instead
+                    if len(matching_files) > 0:
+                        alt_path = os.path.join(TEMP_UPLOAD_DIR, matching_files[0])
+                        logging.info(f"Trying alternative file: {alt_path}")
+                        
+                        if os.path.exists(alt_path):
+                            logging.info(f"Using alternative file: {alt_path}")
+                            with open(alt_path, "rb") as f:
+                                content = f.read()
+                            
+                            # Determine media type based on file extension
+                            alt_ext = os.path.splitext(matching_files[0])[1].lower()
+                            if alt_ext in ['.jpg', '.jpeg']:
+                                media_type = "image/jpeg"
+                            elif alt_ext == '.png':
+                                media_type = "image/png"
+                            elif alt_ext == '.gif':
+                                media_type = "image/gif"
+                            else:
+                                media_type = "application/octet-stream"
+                            
+                            return Response(
+                                content=content,
+                                media_type=media_type
+                            )
+                
+                # If we get here, no good alternative was found
+                logging.info(f"All files in {TEMP_UPLOAD_DIR}: {files[:20]}")
+            except Exception as e:
+                logging.error(f"Error listing directory: {e}")
+            
+            return Response(
+                content=f"Image not found: {filename}",
+                media_type="text/plain",
+                status_code=404
+            )
+
+    @fasthtml_app.get("/pdf-image/{image_key}")
+    async def get_pdf_image(image_key: str):
+        """Serve PDF page images"""
+        logging.info(f"Image request for key: {image_key}")
+        try:
+            if image_key in page_images:
+                image_path = page_images[image_key]
+                logging.info(f"Found image path: {image_path}")
+                if os.path.exists(image_path):
+                    logging.info(f"Image file exists, serving from: {image_path}")
+                    try:
+                        # Open and read the file directly
+                        with open(image_path, "rb") as f:
+                            content = f.read()
+                        
+                        # Return as binary response
+                        return Response(
+                            content=content,
+                            media_type="image/png"
+                        )
+                    except Exception as e:
+                        logging.error(f"Error reading PDF image file: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    logging.error(f"Image file does not exist at path: {image_path}")
+                    # Try to find the image by reconstructing path patterns
+                    parts = image_key.split('_')
+                    if len(parts) >= 2:
+                        filename = '_'.join(parts[:-1])
+                        page_num = int(parts[-1]) if parts[-1].isdigit() else 0
+                        potential_paths = [
+                            # Check different path patterns
+                            os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                            os.path.join(PDF_IMAGES_DIR, f"{filename}", f"page_{page_num}.png"),
+                            os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
+                        ]
+                        
+                        for path in potential_paths:
+                            logging.info(f"Trying alternative path: {path}")
+                            if os.path.exists(path):
+                                logging.info(f"Found image at alternative path: {path}")
+                                with open(path, "rb") as f:
+                                    content = f.read()
+                                return Response(
+                                    content=content,
+                                    media_type="image/png"
+                                )
+            else:
+                logging.error(f"Image key '{image_key}' not found in page_images dictionary")
+                # List available keys for debugging
+                available_keys = list(page_images.keys())[:10]  # First 10 keys
+                logging.info(f"Available keys (first 10): {available_keys}")
+        except Exception as e:
+            logging.error(f"Error in get_pdf_image: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        
+        # Return a placeholder image or error response
+        return Response(
+            content=f"Image not found for key: {image_key}", 
+            media_type="text/plain", 
+            status_code=404
         )
 
     @fasthtml_app.get("/heatmap-image/{filename}")
@@ -2279,11 +1996,7 @@ def serve_fasthtml():
             "pdf_images_dir_exists": os.path.exists(PDF_IMAGES_DIR),
             "pdf_images_subfolders": os.listdir(PDF_IMAGES_DIR)[:20] if os.path.exists(PDF_IMAGES_DIR) else [],
             "page_images_count": len(page_images),
-            "page_images_sample": list(page_images.keys())[:10],
-            "volumes_mounted": {
-                "data_dir": os.path.exists(DATA_DIR),
-                "db_dir": os.path.exists(DATABASE_DIR)
-            }
+            "page_images_sample": list(page_images.keys())[:10]
         }
         
         return Div(
@@ -2292,7 +2005,6 @@ def serve_fasthtml():
             cls="w-full max-w-2xl mx-auto bg-zinc-900 rounded-md p-6"
         )
 
-    
     return fasthtml_app
 
 if __name__ == "__main__":
