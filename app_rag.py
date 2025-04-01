@@ -139,7 +139,7 @@ app = modal.App(APP_NAME)
 # Create app function for Qwen LLM serving
 @app.function(
     image=image,
-    gpu=modal.gpu.A10G(count=1),
+    gpu=modal.gpu.A100(count=1, size="80GB"),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=100,
@@ -393,7 +393,7 @@ def serve_vllm():
 # Create app function for FastHTML UI and ColQwen processing
 @app.function(
     image=image,
-    gpu=modal.gpu.A100(count=1, size="80GB"),
+    gpu=modal.gpu.A10G(count=1),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     volumes={
