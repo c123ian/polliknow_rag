@@ -135,6 +135,8 @@ image = modal.Image.debian_slim(python_version="3.10") \
     )
 
 app = modal.App(APP_NAME)
+# Define global engine variable
+engine = None
 
 @app.function(
     image=image,
@@ -149,6 +151,7 @@ app = modal.App(APP_NAME)
         DATABASE_DIR: db_volume
     },
 )
+
 @modal.asgi_app()
 def serve_vllm():
     import os
@@ -167,6 +170,7 @@ def serve_vllm():
     from vllm.entrypoints.logger import RequestLogger
     from vllm.sampling_params import SamplingParams
 
+    global engine
     MODELS_DIR = "/Mistral"
 
     web_app = fastapi.FastAPI(
@@ -204,7 +208,7 @@ def serve_vllm():
         tokenizer=tokenizer_path,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.95,
-        max_model_len=94192,
+        max_model_len=4096,
         tokenizer_mode="mistral",
         config_format="mistral",
         load_format="mistral",
@@ -215,7 +219,7 @@ def serve_vllm():
     )
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
-
+    
     event_loop: Optional[asyncio.AbstractEventLoop] = None
     try:
         event_loop = asyncio.get_running_loop()
@@ -236,10 +240,9 @@ def serve_vllm():
         models=models,
         response_role="assistant",
         request_logger=request_logger,
-        chat_template=None,  
+        chat_template="mistral",  # Use Mistral's template instead of None
         chat_template_content_format="string",  
     )
-
     @web_app.post("/v1/completions")
     async def completion_generator(request: fastapi.Request) -> StreamingResponse:
         try:
@@ -251,11 +254,7 @@ def serve_vllm():
 
             logging.info(f"Received completion request: max_tokens={max_tokens}, stream={stream}")
 
-            sampling_params = SamplingParams(
-                temperature=0.15,  # Lower temperature for more deterministic outputs
-                max_tokens=max_tokens,
-                stop=["User:", "Assistant:", "\n\n"],
-            )
+            sampling_params = SamplingParams(max_tokens=8192, temperature=0.7)
 
             if stream:
                 async def generate_text():
@@ -341,22 +340,46 @@ def serve_vllm():
             messages = body.get("messages", [])
             model = body.get("model", DEFAULT_MISTRAL_NAME)
             max_tokens = body.get("max_tokens", 500)
+            temperature = body.get("temperature", 0.7)
             request_id = str(uuid.uuid4())
             
-            # IMPORTANT: Pass the messages directly to vLLM without modifying them
+            # Format messages into a prompt manually for Mistral
+            formatted_messages = []
+            for msg in messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                
+                # Handle different message formats
+                if isinstance(content, list):
+                    # Multimodal message
+                    text_parts = []
+                    for part in content:
+                        if part.get("type") == "text":
+                            text_parts.append(part.get("text", ""))
+                        # Image URLs are handled automatically by the model
+                    formatted_text = " ".join(text_parts)
+                    formatted_messages.append(f"{role.capitalize()}: {formatted_text}")
+                else:
+                    # Text-only message
+                    formatted_messages.append(f"{role.capitalize()}: {content}")
+            
+            # Join messages with newlines
+            prompt = "\n".join(formatted_messages) + "\nAssistant:"
+            
+            # Create sampling params
             sampling_params = SamplingParams(
-                temperature=0.7,
+                temperature=temperature,
                 max_tokens=max_tokens,
                 stop=["User:", "System:", "\n\n"],
             )
             
-            # This is the key change - use llm.chat instead of engine.generate
-            # to properly handle multimodal inputs
-            outputs = await engine.chat(messages=messages, sampling_params=sampling_params)
+            # Generate response
+            outputs = await engine.generate(prompt, sampling_params, request_id)
             
-            if len(outputs) > 0:
-                response_text = outputs[0].outputs[0].text
+            if len(outputs.outputs) > 0:
+                response_text = outputs.outputs[0].text
                 
+                # Create a properly formatted response
                 return JSONResponse(content={
                     "id": request_id,
                     "object": "chat.completion",
@@ -372,17 +395,14 @@ def serve_vllm():
                         }
                     ]
                 })
+            else:
+                return JSONResponse(status_code=500, content={"error": "No output generated"})
         except Exception as e:
             logging.error(f"Error in chat_completions: {str(e)}")
             import traceback
             traceback.print_exc()
             return JSONResponse(status_code=500, content={"error": str(e)})
                 
-        except Exception as e:
-            logging.error(f"Error in chat_completions: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse(status_code=500, content={"error": str(e)})
 
     # Add a simple health check endpoint
     @web_app.get("/health")
@@ -432,6 +452,7 @@ def serve_fasthtml():
     import numpy as np
     from rank_bm25 import BM25Okapi
     from pdf2image import convert_from_path
+    from vllm.sampling_params import SamplingParams
     
     # Setup NLTK
     NLTK_DATA_DIR = "/tmp/nltk_data"
@@ -929,7 +950,6 @@ def serve_fasthtml():
             traceback.print_exc()
             return []
 
-    # Process image with Mistral Vision LLM - IMPROVED VERSION
     async def process_with_mistral(image, query, context_text="", analysis_id=""):
         """Process the image with Mistral LLM including context from retrieved documents"""
         logging.info(f"Processing image {analysis_id} with Mistral using query: {query}")
@@ -941,41 +961,34 @@ def serve_fasthtml():
             img_data = img_buffer.getvalue()
             base64_img = base64.b64encode(img_data).decode("utf-8")
             
-            # System message
-            system_prompt = "You are an expert biologist analyzing visual specimens."
-            
-            # Create multimodal message format
-            multimodal_message = {
+            # Create multimodal message format - simplified for clarity
+            payload = {
                 "model": DEFAULT_MISTRAL_NAME,
                 "messages": [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": "You are an expert biologist analyzing visual specimens."},
                     {"role": "user", "content": [
                         {"type": "text", "text": f"{query}\n\n{context_text if context_text else ''}"},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
                     ]}
                 ],
-                "max_tokens": 500
+                "max_tokens": 500,
+                "temperature": 0.7
             }
             
             # Send to vLLM endpoint
             multimodal_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/chat/completions"
-            logging.info(f"Sending request to multimodal endpoint: {multimodal_url}")
             
             async with aiohttp.ClientSession() as client_session:
-                async with client_session.post(multimodal_url, json=multimodal_message, timeout=320) as response:
+                async with client_session.post(multimodal_url, json=payload, timeout=320) as response:
                     if response.status == 200:
                         result = await response.json()
                         if "choices" in result and len(result["choices"]) > 0:
                             model_response = result["choices"][0]["message"]["content"]
-                            logging.info(f"Received multimodal response: {model_response[:100]}...")
                             return model_response.strip()
                         else:
-                            error_msg = "No response choices returned from model"
-                            logging.error(error_msg)
-                            return f"Error: {error_msg}"
+                            return "Error: No response choices returned from model"
                     else:
                         error_text = await response.text()
-                        logging.error(f"Error from Mistral endpoint: {error_text}")
                         return f"Error processing image: {error_text}"
         
         except Exception as e:
