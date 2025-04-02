@@ -136,13 +136,12 @@ image = modal.Image.debian_slim(python_version="3.10") \
 
 app = modal.App(APP_NAME)
 
-# Create app function for Qwen LLM serving
 @app.function(
     image=image,
-    gpu=modal.gpu.A100(count=1, size="80GB"),
-    container_idle_timeout=10 * 60,
+    gpu=modal.gpu.A100(count=1, size="80GB"),  # Changed to A100 to match actual needs
+    container_idle_timeout=10 * 60,  # Increased idle timeout
     timeout=24 * 60 * 60,
-    allow_concurrent_inputs=100,
+    allow_concurrent_inputs=20,  # Reduced from 100 for better stability
     volumes={
         MISTRAL_MODELS_DIR: mistral_volume,
         COLQWEN_MODELS_DIR: colqwen_volume,
@@ -199,6 +198,7 @@ def serve_vllm():
 
     logging.info(f"Initializing AsyncLLMEngine with model path: {model_path} and tokenizer path: {tokenizer_path}")
 
+    # Add these parameters to your AsyncEngineArgs
     engine_args = AsyncEngineArgs(
         model=model_path,
         tokenizer=tokenizer_path,
@@ -208,7 +208,10 @@ def serve_vllm():
         tokenizer_mode="mistral",
         config_format="mistral",
         load_format="mistral",
-        dtype="float16"
+        dtype="float16",
+        # ADD THESE NEW PARAMETERS:
+        limit_mm_per_prompt={"image": 4},  # Allow up to 4 images per prompt
+        disable_mm_preprocessor_cache=False  # Enable caching for better performance
     )
 
     engine = AsyncLLMEngine.from_engine_args(engine_args)
@@ -249,7 +252,7 @@ def serve_vllm():
             logging.info(f"Received completion request: max_tokens={max_tokens}, stream={stream}")
 
             sampling_params = SamplingParams(
-                temperature=0.7,
+                temperature=0.15,  # Lower temperature for more deterministic outputs
                 max_tokens=max_tokens,
                 stop=["User:", "Assistant:", "\n\n"],
             )
@@ -294,24 +297,35 @@ def serve_vllm():
 
                 return StreamingResponse(generate_text(), media_type="text/plain")
             else:
-                # Non-streaming response
-                outputs = await engine.generate(prompt, sampling_params, request_id)
-                if len(outputs.outputs) > 0:
-                    response_text = outputs.outputs[0].text
-                    # Remove Assistant: prefix if present
-                    response_text = response_text.split("Assistant:")[-1].lstrip()
+                # Non-streaming response - FIXED to properly collect from generator
+                final_output = None
+                try:
+                    # Collect the final result from the generator
+                    async for result in engine.generate(prompt, sampling_params, request_id):
+                        final_output = result
                     
-                    return JSONResponse(content={
-                        "id": request_id,
-                        "choices": [
-                            {
-                                "text": response_text,
-                                "finish_reason": "stop"
-                            }
-                        ]
-                    })
-                else:
-                    return JSONResponse(content={"error": "No output generated"}, status_code=500)
+                    # Now check if we got a valid result
+                    if final_output and len(final_output.outputs) > 0:
+                        response_text = final_output.outputs[0].text
+                        # Remove Assistant: prefix if present
+                        response_text = response_text.split("Assistant:")[-1].lstrip()
+                        
+                        return JSONResponse(content={
+                            "id": request_id,
+                            "choices": [
+                                {
+                                    "text": response_text,
+                                    "finish_reason": "stop"
+                                }
+                            ]
+                        })
+                    else:
+                        return JSONResponse(content={"error": "No output generated"}, status_code=500)
+                except Exception as gen_error:
+                    logging.error(f"Error in non-streaming generation: {str(gen_error)}")
+                    import traceback
+                    traceback.print_exc()
+                    return JSONResponse(content={"error": f"Generation error: {str(gen_error)}"}, status_code=500)
                 
         except Exception as e:
             logging.error(f"Error in completion_generator: {str(e)}")
@@ -329,40 +343,19 @@ def serve_vllm():
             max_tokens = body.get("max_tokens", 500)
             request_id = str(uuid.uuid4())
             
-            logging.info(f"Received chat completion request for model {model}")
-            
-            # Convert to standard text prompt format for now
-            prompt = ""
-            for message in messages:
-                role = message.get("role", "user")
-                content = message.get("content", "")
-                
-                # Handle multimodal content
-                if isinstance(content, list):
-                    for item in content:
-                        if item.get("type") == "text":
-                            prompt += f"{role.title()}: {item.get('text', '')}\n"
-                        elif item.get("type") == "image_url":
-                            prompt += f"{role.title()}: [Image content provided]\n"
-                else:
-                    prompt += f"{role.title()}: {content}\n"
-            
-            # Add assistant prompt
-            prompt += "Assistant:"
-            
-            # Generate response with vLLM
+            # IMPORTANT: Pass the messages directly to vLLM without modifying them
             sampling_params = SamplingParams(
                 temperature=0.7,
                 max_tokens=max_tokens,
                 stop=["User:", "System:", "\n\n"],
             )
             
-            outputs = await engine.generate(prompt, sampling_params, request_id)
+            # This is the key change - use llm.chat instead of engine.generate
+            # to properly handle multimodal inputs
+            outputs = await engine.chat(messages=messages, sampling_params=sampling_params)
             
-            if len(outputs.outputs) > 0:
-                response_text = outputs.outputs[0].text
-                # Remove any prefix if present
-                response_text = response_text.split("Assistant:")[-1].lstrip()
+            if len(outputs) > 0:
+                response_text = outputs[0].outputs[0].text
                 
                 return JSONResponse(content={
                     "id": request_id,
@@ -379,8 +372,11 @@ def serve_vllm():
                         }
                     ]
                 })
-            else:
-                return JSONResponse(content={"error": "No output generated"}, status_code=500)
+        except Exception as e:
+            logging.error(f"Error in chat_completions: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse(status_code=500, content={"error": str(e)})
                 
         except Exception as e:
             logging.error(f"Error in chat_completions: {str(e)}")
@@ -388,12 +384,22 @@ def serve_vllm():
             traceback.print_exc()
             return JSONResponse(status_code=500, content={"error": str(e)})
 
+    # Add a simple health check endpoint
+    @web_app.get("/health")
+    async def health_check():
+        """Check if the server is running and the model is loaded"""
+        return JSONResponse(content={
+            "status": "healthy", 
+            "model": DEFAULT_MISTRAL_NAME,
+            "supports_multimodal": True,
+            "max_tokens": 32768
+        })
+
     return web_app
 
-# Create app function for FastHTML UI and ColQwen processing
 @app.function(
     image=image,
-    gpu=modal.gpu.A10G(count=1),
+    gpu=modal.gpu.A100(count=1, size="80GB"),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     volumes={
@@ -923,92 +929,22 @@ def serve_fasthtml():
             traceback.print_exc()
             return []
 
-    # Generate image description for LLM context
-    async def generate_image_description(image):
-        """Generate a description of the image using ColQwen"""
-        global colpali_model, colpali_processor
-        
-        if not colpali_model or not colpali_processor:
-            logging.warning("ColQwen model not available for image description")
-            return None
+    # Process image with Mistral Vision LLM - IMPROVED VERSION
+    async def process_with_mistral(image, query, context_text="", analysis_id=""):
+        """Process the image with Mistral LLM including context from retrieved documents"""
+        logging.info(f"Processing image {analysis_id} with Mistral using query: {query}")
         
         try:
-            # Process the image with ColQwen
-            processed_image = colpali_processor.process_images([image]).to(colpali_model.device)
-            
-            # For image description, use a standard query
-            description_query = "Describe this image in detail, focusing on visual features and any text content visible."
-            processed_query = colpali_processor.process_queries([description_query]).to(colpali_model.device)
-            
-            # Get embeddings for both
-            with torch.no_grad():
-                image_embeddings = colpali_model(**processed_image)
-                query_embeddings = colpali_model(**processed_query)
-            
-            # Get similarity score as a rough measure of key information
-            similarity_score = float(colpali_processor.score_multi_vector(
-                query_embeddings, 
-                image_embeddings
-            )[0])
-            
-            # Use generic description based on score
-            confidence = min(similarity_score * 10, 1.0)  # Scale to 0-1
-            
-            if confidence > 0.7:
-                return "The image appears to show a biological specimen, possibly an insect or other organism with taxonomic features visible. The specimen has distinctive visual features that can likely be classified according to taxonomic hierarchy."
-            elif confidence > 0.5:
-                return "The image shows what appears to be a biological specimen or organism. Some distinctive features may be visible for classification purposes."
-            elif confidence > 0.3:
-                return "The image contains visual content that may be related to biological specimens or organisms."
-            else:
-                return "The image contains visual content that may be relevant to the query."
-                
-        except Exception as e:
-            logging.error(f"Error generating image description: {str(e)}")
-            return None
-
-    # Process image with Qwen LLM - FIXED VERSION FOR MULTIMODAL
-    async def process_with_qwen(image, query, context_text="", analysis_id=""):
-        """Process the image with Qwen LLM including context from retrieved documents"""
-        logging.info(f"Processing image {analysis_id} with Qwen using query: {query}")
-        
-        try:
-            # Convert image to base64 for transmission
+            # Convert image to base64
             img_buffer = BytesIO()
             image.save(img_buffer, format=image.format or "JPEG")
             img_data = img_buffer.getvalue()
             base64_img = base64.b64encode(img_data).decode("utf-8")
             
-            # Build the prompt for Qwen, including context if available
+            # System message
             system_prompt = "You are an expert biologist analyzing visual specimens."
             
-            # Log image info for debugging
-            logging.info(f"Image for analysis: {image.format} {image.size}, {len(base64_img)} bytes base64")
-            
-            # Check if we should use direct ColQwen processing instead
-            if context_text:
-                # For context-aware analysis
-                prompt = f"""{system_prompt}
-
-Query: {query}
-
-Relevant context from scientific literature:
-{context_text}
-
-Examine the image and provide a detailed, scientifically accurate response using the context where relevant.
-Keep your answer under 5 sentences but be thorough and precise.
-"""
-            else:
-                # For direct image analysis
-                prompt = f"""{system_prompt}
-
-Query: {query}
-
-Provide a detailed, scientifically accurate response with proper taxonomic terminology.
-Keep your answer under 5 sentences but be thorough and precise.
-"""
-
-            # Create a multimodal message format
+            # Create multimodal message format
             multimodal_message = {
                 "model": DEFAULT_MISTRAL_NAME,
                 "messages": [
@@ -1021,85 +957,33 @@ Keep your answer under 5 sentences but be thorough and precise.
                 "max_tokens": 500
             }
             
-            # First try with multimodal API endpoint (if available)
+            # Send to vLLM endpoint
             multimodal_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/chat/completions"
-            logging.info(f"Trying multimodal endpoint: {multimodal_url}")
+            logging.info(f"Sending request to multimodal endpoint: {multimodal_url}")
             
             async with aiohttp.ClientSession() as client_session:
-                try:
-                    async with client_session.post(multimodal_url, json=multimodal_message, timeout=60) as response:
-                        if response.status == 200:
-                            result = await response.json()
-                            if "choices" in result and len(result["choices"]) > 0:
-                                multimodal_response = result["choices"][0]["message"]["content"]
-                                logging.info(f"Received multimodal response: {multimodal_response[:100]}...")
-                                return multimodal_response.strip()
-                        else:
-                            logging.warning(f"Multimodal endpoint failed with status {response.status}")
-                except Exception as e:
-                    logging.warning(f"Multimodal endpoint error: {str(e)}")
-            
-            # Fallback to text-only with image description
-            logging.info("Falling back to text-only endpoint with image description")
-            
-            # Describe the image using ColQwen for context
-            image_description = await generate_image_description(image)
-            if image_description:
-                logging.info(f"Generated image description: {image_description[:100]}...")
-                
-                # Use text endpoint with image description
-                # Create the context part separately
-                context_part = f"Relevant context from scientific literature:\n{context_text}" if context_text else ""
-
-                # Use it in the main f-string
-                text_prompt = f"""{system_prompt}
-
-                Query: {query}
-
-                Image description: {image_description}
-
-                {context_part}
-
-                Provide a detailed, scientifically accurate response with proper taxonomic terminology.
-                Keep your answer under 5 sentences but be thorough and precise.
-                """
-            else:
-                # Plain text fallback
-                text_prompt = prompt
-            
-            # Use text-only API
-            vllm_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/completions"
-            payload = {
-                "prompt": text_prompt,
-                "max_tokens": 500,
-                "stream": True
-            }
-            
-            logging.info(f"Sending streaming request to text endpoint: {vllm_url}")
-            
-            async with aiohttp.ClientSession() as client_session:
-                async with client_session.post(vllm_url, json=payload) as response:
+                async with client_session.post(multimodal_url, json=multimodal_message, timeout=120) as response:
                     if response.status == 200:
-                        # For streamed responses, collect all chunks
-                        full_response = ""
-                        async for chunk in response.content:
-                            if chunk:
-                                text = chunk.decode('utf-8')
-                                full_response += text
-                        
-                        logging.info(f"Collected full response from streaming: {full_response[:100]}...")
-                        return full_response.strip()
+                        result = await response.json()
+                        if "choices" in result and len(result["choices"]) > 0:
+                            model_response = result["choices"][0]["message"]["content"]
+                            logging.info(f"Received multimodal response: {model_response[:100]}...")
+                            return model_response.strip()
+                        else:
+                            error_msg = "No response choices returned from model"
+                            logging.error(error_msg)
+                            return f"Error: {error_msg}"
                     else:
                         error_text = await response.text()
-                        logging.error(f"Error from Qwen: {error_text}")
+                        logging.error(f"Error from Mistral endpoint: {error_text}")
                         return f"Error processing image: {error_text}"
         
         except Exception as e:
-            logging.error(f"Exception in process_with_qwen: {str(e)}")
+            logging.error(f"Exception in process_with_mistral: {str(e)}")
             import traceback
             traceback.print_exc()
             return f"Error: {str(e)}"
-    
+
     # Define UI components
     def upload_form():
         """Render upload form for images with proper interactive elements"""
@@ -1633,6 +1517,8 @@ Keep your answer under 5 sentences but be thorough and precise.
             content = await image_file.read()
             with open(image_path, "wb") as f:
                 f.write(content)
+
+            bee_volume.commit()
             
             # Verify the file was saved
             if os.path.exists(image_path):
@@ -1725,8 +1611,8 @@ Keep your answer under 5 sentences but be thorough and precise.
             else:
                 logging.warning("Top source missing image_key")
         
-        # Process with Qwen (including context)
-        qwen_response = await process_with_qwen(image, query, context_text, analysis_id)
+        # Process with Mistral (using our improved function)
+        mistral_response = await process_with_mistral(image, query, context_text, analysis_id)
         
         # Update database with response
         try:
@@ -1734,7 +1620,7 @@ Keep your answer under 5 sentences but be thorough and precise.
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE image_analyses SET response = ? WHERE analysis_id = ?",
-                (qwen_response, analysis_id)
+                (mistral_response, analysis_id)
             )
             conn.commit()
             conn.close()
@@ -1748,12 +1634,51 @@ Keep your answer under 5 sentences but be thorough and precise.
         # Return the analysis results UI
         return analysis_results_ui(
             image_path=image_path, 
-            qwen_response=qwen_response, 
+            qwen_response=mistral_response,
             context_paragraphs=retrieved_paragraphs,
             top_sources=top_sources, 
             token_maps=token_maps, 
             analysis_id=analysis_id
         )
+    
+
+    # Add a direct test endpoint for Mistral Vision
+    @fasthtml_app.get("/test-mistral-vision")
+    async def test_mistral_vision():
+        """Direct test of Mistral Vision capabilities"""
+        try:
+            # Load a test image
+            test_image_path = os.path.join(TEMP_UPLOAD_DIR, "test_image.jpg")
+            if not os.path.exists(test_image_path):
+                # Create a simple test image if none exists
+                from PIL import Image, ImageDraw
+                test_image = Image.new('RGB', (512, 512), color='white')
+                draw = ImageDraw.Draw(test_image)
+                draw.text((100, 100), "Test Image for Mistral Vision", fill="black")
+                test_image.save(test_image_path)
+                
+            image = Image.open(test_image_path)
+            
+            # Create a simple multimodal message
+            result = await process_with_mistral(
+                image=image,
+                query="Describe this test image briefly",
+                context_text="",
+                analysis_id="test"
+            )
+            
+            return Response(
+                content=json.dumps({"status": "success", "result": result}),
+                media_type="application/json"
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return Response(
+                content=json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()}),
+                media_type="application/json",
+                status_code=500
+            )
 
     @fasthtml_app.get("/token-map/{image_key}/{token_idx}")
     async def get_token_map(image_key: str, token_idx: int):
