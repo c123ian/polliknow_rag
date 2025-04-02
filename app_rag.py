@@ -240,7 +240,8 @@ def serve_vllm():
         models=models,
         response_role="assistant",
         request_logger=request_logger,
-        chat_template="mistral",  # Use Mistral's template instead of None
+        chat_template=None,  
+        #chat_template="mistral",  # Use Mistral's template instead of None
         chat_template_content_format="string",  
     )
     @web_app.post("/v1/completions")
@@ -356,11 +357,11 @@ def serve_vllm():
                     for part in content:
                         if part.get("type") == "text":
                             text_parts.append(part.get("text", ""))
-                formatted_text = " ".join(text_parts)
-                formatted_messages.append(f"{role.capitalize()}: {formatted_text}")
-            else:
-                # Text-only message
-                formatted_messages.append(f"{role.capitalize()}: {content}")
+                    formatted_text = " ".join(text_parts)
+                    formatted_messages.append(f"{role.capitalize()}: {formatted_text}")
+                else:
+                    # Text-only message - FIXED INDENTATION HERE
+                    formatted_messages.append(f"{role.capitalize()}: {content}")
             
             # Join messages with newlines
             prompt = "\n".join(formatted_messages) + "\nAssistant:"
