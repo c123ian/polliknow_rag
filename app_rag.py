@@ -962,7 +962,7 @@ def serve_fasthtml():
             logging.info(f"Sending request to multimodal endpoint: {multimodal_url}")
             
             async with aiohttp.ClientSession() as client_session:
-                async with client_session.post(multimodal_url, json=multimodal_message, timeout=120) as response:
+                async with client_session.post(multimodal_url, json=multimodal_message, timeout=320) as response:
                     if response.status == 200:
                         result = await response.json()
                         if "choices" in result and len(result["choices"]) > 0:
