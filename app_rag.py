@@ -356,12 +356,11 @@ def serve_vllm():
                     for part in content:
                         if part.get("type") == "text":
                             text_parts.append(part.get("text", ""))
-                        # Image URLs are handled automatically by the model
-                    formatted_text = " ".join(text_parts)
-                    formatted_messages.append(f"{role.capitalize()}: {formatted_text}")
-                else:
-                    # Text-only message
-                    formatted_messages.append(f"{role.capitalize()}: {content}")
+                formatted_text = " ".join(text_parts)
+                formatted_messages.append(f"{role.capitalize()}: {formatted_text}")
+            else:
+                # Text-only message
+                formatted_messages.append(f"{role.capitalize()}: {content}")
             
             # Join messages with newlines
             prompt = "\n".join(formatted_messages) + "\nAssistant:"
@@ -373,11 +372,13 @@ def serve_vllm():
                 stop=["User:", "System:", "\n\n"],
             )
             
-            # Generate response
-            outputs = await engine.generate(prompt, sampling_params, request_id)
+            # Generate response - collect all outputs from the generator
+            final_output = None
+            async for output in engine.generate(prompt, sampling_params, request_id):
+                final_output = output
             
-            if len(outputs.outputs) > 0:
-                response_text = outputs.outputs[0].text
+            if final_output and len(final_output.outputs) > 0:
+                response_text = final_output.outputs[0].text
                 
                 # Create a properly formatted response
                 return JSONResponse(content={
