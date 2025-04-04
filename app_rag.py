@@ -370,7 +370,7 @@ def serve_vllm():
             sampling_params = SamplingParams(
                 temperature=temperature,
                 max_tokens=max_tokens,
-                stop=["User:", "System:", "\n\n"],
+                #stop=["User:", "System:", "\n\n"],
             )
             
             # Generate response - collect all outputs from the generator
@@ -973,8 +973,9 @@ def serve_fasthtml():
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
                     ]}
                 ],
-                "max_tokens": 500,
-                "temperature": 0.7
+                "max_tokens": 2000,  # Increased from 500
+                "temperature": 0.7,
+                "stream": False  # Explicitly disable streaming
             }
             
             # Send to vLLM endpoint
@@ -984,8 +985,16 @@ def serve_fasthtml():
                 async with client_session.post(multimodal_url, json=payload, timeout=320) as response:
                     if response.status == 200:
                         result = await response.json()
+                        
+                        # Add this line to log the full JSON response
+                        logging.info(f"Raw API response for analysis {analysis_id}:\n{json.dumps(result, indent=2)}")
+                        
                         if "choices" in result and len(result["choices"]) > 0:
                             model_response = result["choices"][0]["message"]["content"]
+                            
+                            # Original logging for the full response content
+                            logging.info(f"Full LLM response for analysis {analysis_id}:\n{'='*50}\n{model_response}\n{'='*50}")
+                            
                             return model_response.strip()
                         else:
                             return "Error: No response choices returned from model"
