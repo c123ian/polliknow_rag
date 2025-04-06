@@ -672,6 +672,16 @@ def serve_fasthtml():
                     font-size: 14px;
                     margin-bottom: 8px;
                 }
+                
+                /* Carousel styles */
+                .carousel-item {
+                    scroll-snap-align: start;
+                }
+                
+                .carousel {
+                    scroll-behavior: smooth;
+                    scroll-snap-type: x mandatory;
+                }
             """),
         ),
         middleware=[
@@ -695,6 +705,43 @@ def serve_fasthtml():
             "analyze_features": "Analyze the visible features of this organism. Describe its morphology, coloration, and any distinctive anatomical structures."
         }
         return queries.get(analysis_type, queries["classify_insect"])
+        
+    # Helper functions for saving to database
+    async def save_to_database(analysis_id, image_path, analysis_type, query, response, top_sources):
+        """Save analysis results to the database"""
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Insert basic info
+            cursor.execute(
+                "INSERT INTO image_analyses (analysis_id, image_path, analysis_type, query, response) VALUES (?, ?, ?, ?, ?)",
+                (analysis_id, image_path, analysis_type, query, response)
+            )
+            
+            # Add context source if available
+            if top_sources:
+                top_source = top_sources[0]
+                context_source = f"{top_source['filename']} (page {top_source['page']})"
+                
+                # Check if the column exists
+                cursor.execute("PRAGMA table_info(image_analyses)")
+                columns = [column[1] for column in cursor.fetchall()]
+                if 'context_source' in columns:
+                    cursor.execute(
+                        "UPDATE image_analyses SET context_source = ? WHERE analysis_id = ?",
+                        (context_source, analysis_id)
+                    )
+            
+            conn.commit()
+            conn.close()
+            logging.info(f"Saved analysis {analysis_id} to database")
+            return True
+        except Exception as db_error:
+            logging.error(f"Database error: {db_error}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     # Retrieve relevant documents
     async def retrieve_relevant_documents(query, top_k=5):
@@ -1081,6 +1128,295 @@ def serve_fasthtml():
             hx_indicator="#loading-indicator",
         )
 
+    # BATCH PROCESSING COMPONENTS
+    def batch_upload_form():
+        """Render form for uploading multiple images for batch processing"""
+        
+        return Form(
+            Div(
+                H2("Batch Image Analysis", cls="text-xl font-semibold text-white mb-4"),
+                
+                P("Upload multiple images (up to 10) for batch processing.", 
+                  cls="text-zinc-300 text-center mb-6"),
+                
+                # Image upload card
+                Div(
+                    Div(
+                        Label("Upload Images:", cls="text-white font-medium mb-2"),
+                        Input(
+                            type="file",
+                            name="image_files",
+                            accept=".jpg,.jpeg,.png",
+                            required=True,
+                            multiple=True,
+                            cls="file-input file-input-bordered file-input-primary w-full",
+                            onchange="handleMultipleFiles(this)"
+                        ),
+                        P(id="file-count", cls="text-sm text-zinc-400 mt-2"),
+                        # Hidden container for individual file inputs
+                        Div(id="file-inputs-container", cls="hidden"),
+                        cls="grid place-items-center p-4"
+                    ),
+                    cls="card bg-zinc-800 border border-zinc-700 rounded-box w-full mb-4"
+                ),
+                
+                # Analysis type selection
+                Div(
+                    Label("Select Analysis Type:", cls="text-white text-sm font-medium mb-2"),
+                    Select(
+                        Option("Classify Insect", value="classify_insect", selected=True),
+                        Option("Identify Species", value="identify_species"),
+                        Option("Analyze Features", value="analyze_features"),
+                        name="analysis_type",
+                        cls="select select-bordered w-full mb-2"
+                    ),
+                    cls="mb-4"
+                ),
+                
+                # Context sharing option
+                Div(
+                    Label(
+                        Input(type="checkbox", name="share_context", value="true", cls="checkbox checkbox-primary mr-2"),
+                        "Share context across all images (faster)",
+                        cls="flex items-center cursor-pointer text-white"
+                    ),
+                    P("Uses the same retrieved document for all images instead of finding unique matches.",
+                      cls="text-zinc-400 text-sm mt-1 ml-6"),
+                    cls="mb-6"
+                ),
+                
+                # Process button
+                Button(
+                    Div(
+                        "Process Batch",
+                        cls="flex items-center justify-center"
+                    ),
+                    id="batch-button",
+                    type="submit",
+                    cls="btn btn-primary w-full"
+                ),
+                
+                # JavaScript for handling multiple files
+                Script("""
+                function handleMultipleFiles(input) {
+                    const maxFiles = 10;
+                    if (input.files.length > maxFiles) {
+                        alert(`Please select a maximum of ${maxFiles} files.`);
+                        input.value = '';
+                        document.getElementById('file-count').textContent = '';
+                        return;
+                    }
+                    
+                    // Clear previous file inputs
+                    const container = document.getElementById('file-inputs-container');
+                    container.innerHTML = '';
+                    
+                    // Create hidden inputs for each file
+                    for (let i = 0; i < input.files.length; i++) {
+                        const fileInput = document.createElement('input');
+                        fileInput.type = 'file';
+                        fileInput.name = `image_${i}`;
+                        fileInput.style.display = 'none';
+                        container.appendChild(fileInput);
+                        
+                        // Use FileList API to set the file
+                        const dataTransfer = new DataTransfer();
+                        dataTransfer.items.add(input.files[i]);
+                        fileInput.files = dataTransfer.files;
+                    }
+                    
+                    // Update count display
+                    document.getElementById('file-count').textContent = 
+                        `${input.files.length} file${input.files.length !== 1 ? 's' : ''} selected`;
+                }
+                """),
+                
+                cls="bg-zinc-900 rounded-md p-6 w-full max-w-lg border border-zinc-700"
+            ),
+            action="/process-batch",
+            method="post",
+            enctype="multipart/form-data",
+            id="batch-upload-form",
+            hx_post="/process-batch",
+            hx_target="#main-content",
+            hx_indicator="#loading-indicator",
+        )
+        
+    def carousel_ui(batch_results):
+        """Create a carousel UI to display multiple image analysis results"""
+        
+        # Create carousel items
+        carousel_items = []
+        
+        for i, result in enumerate(batch_results):
+            # Extract data
+            analysis_id = result.get("analysis_id", f"result_{i}")
+            image_path = result.get("image_path", "")
+            response = result.get("response", "No response generated")
+            context_paragraphs = result.get("context_paragraphs", [])
+            top_sources = result.get("top_sources", [])
+            token_maps = result.get("token_maps", {})
+            has_error = result.get("error", False)
+            error_message = result.get("message", "Unknown error")
+            
+            # Create result card
+            if has_error:
+                # Error card
+                result_card = Div(
+                    Div(
+                        H3(f"Error in Result {i+1}", cls="text-xl font-semibold text-red-500 mb-2"),
+                        P(error_message, cls="text-red-400 mb-4"),
+                        cls="bg-zinc-800 rounded-md p-6 w-full"
+                    ),
+                    id=f"slide-{i}",
+                    cls="carousel-item relative w-full flex justify-center"
+                )
+            else:
+                # Success card - FIX: Store children as a list of components
+                card_content = [
+                    # Result header
+                    Div(
+                        H3(f"Result {i+1} of {len(batch_results)}", 
+                           cls="text-xl font-semibold text-white text-center mb-4"),
+                        
+                        # Main content - image/analysis layout
+                        Div(
+                            # Left column - image 
+                            Div(
+                                H4("Uploaded Image", cls="text-lg font-semibold text-white mb-2"),
+                                try_read_image(image_path),
+                                cls="lg:w-1/2 lg:pr-4 mb-6 lg:mb-0"
+                            ),
+                            
+                            # Right column - analysis
+                            Div(
+                                H4("AI Analysis", cls="text-lg font-semibold text-white mb-2"),
+                                Div(
+                                    response,
+                                    cls="bg-zinc-700 rounded-md p-4 text-white overflow-y-auto max-h-[300px]"
+                                ),
+                                cls="lg:w-1/2 lg:pl-4"
+                            ),
+                            
+                            cls="flex flex-col lg:flex-row w-full mb-6"
+                        ),
+                        
+                        # Context section
+                        (Div(
+                            H4("Context Document", cls="text-lg font-semibold text-white mb-2"),
+                            
+                            # Context document display
+                            (context_document_ui(top_sources[0]) if top_sources else 
+                                Div("No context retrieved", cls="text-zinc-400 p-4")),
+                            
+                            # Token maps for visual explanation (if available)
+                            (token_maps_ui(top_sources[0].get('image_key'), 
+                                            token_maps.get(top_sources[0].get('image_key', ''), [])) 
+                             if top_sources and top_sources[0].get('image_key') in token_maps else 
+                                Div("No token maps available", cls="text-zinc-400 mt-4 p-4")),
+                            
+                            cls="mt-4"
+                        ) if top_sources else ""),
+                        
+                        cls="bg-zinc-800 rounded-md p-6 w-full"
+                    )
+                ]
+                
+                # Success card with list of children elements that can be appended to
+                result_card = Div(
+                    *card_content,  # Unpack the list of components
+                    id=f"slide-{i}",
+                    cls="carousel-item relative w-full flex justify-center"
+                )
+            
+            carousel_items.append(result_card)
+        
+        # Create the carousel navigation controls separately
+        if len(batch_results) > 1:
+            for i in range(len(carousel_items)):
+                prev_idx = (i - 1) % len(batch_results)
+                next_idx = (i + 1) % len(batch_results)
+                
+                # Add navigation buttons - FIX: Add as an additional component to Div's children
+                nav_controls = Div(
+                    A("❮", href=f"#slide-{prev_idx}", 
+                      cls="btn btn-circle btn-outline"),
+                    A("❯", href=f"#slide-{next_idx}", 
+                      cls="btn btn-circle btn-outline"),
+                    cls="absolute flex justify-between transform -translate-y-1/2 left-5 right-5 top-1/2"
+                )
+                
+                # Recreate the carousel item with navigation controls included
+                item = carousel_items[i]
+                new_item = Div(
+                    *item.children,  # Existing children
+                    nav_controls,    # Add navigation controls
+                    id=item.id,
+                    cls=item.cls
+                )
+                carousel_items[i] = new_item
+        
+        # Create the complete carousel component
+        return Div(
+            H2("Batch Analysis Results", cls="text-2xl font-bold text-white mb-4 text-center"),
+            
+            # Carousel container
+            Div(
+                *carousel_items,
+                cls="carousel w-full max-w-5xl rounded-lg overflow-hidden"
+            ),
+            
+            # Pagination dots for larger batches
+            (Div(
+                *[A(str(i+1), href=f"#slide-{i}", 
+                   cls="btn btn-xs rounded-full mr-1 " + 
+                       ("btn-primary" if i == 0 else "btn-outline")) 
+                  for i in range(len(batch_results))],
+                cls="flex justify-center w-full py-4 gap-1"
+            ) if len(batch_results) > 3 else ""),
+            
+            # Process another batch button
+            Div(
+                Button(
+                    "Process Another Batch",
+                    hx_get="/batch-upload",
+                    hx_target="#main-content",
+                    cls="btn btn-secondary w-full max-w-xs"
+                ),
+                cls="mt-8 text-center w-full"
+            ),
+            
+            # Script to handle carousel navigation
+            Script("""
+            document.addEventListener('DOMContentLoaded', function() {
+                // Highlight current slide in pagination
+                const updateActiveDot = function() {
+                    const id = window.location.hash.substring(1);
+                    if (!id) return;
+                    
+                    document.querySelectorAll('[href^="#slide-"]').forEach(dot => {
+                        if (dot.getAttribute('href') === '#' + id) {
+                            dot.classList.add('btn-primary');
+                            dot.classList.remove('btn-outline');
+                        } else {
+                            dot.classList.remove('btn-primary');
+                            dot.classList.add('btn-outline');
+                        }
+                    });
+                };
+                
+                // Listen for hash changes
+                window.addEventListener('hashchange', updateActiveDot);
+                
+                // Initial update
+                updateActiveDot();
+            });
+            """),
+            
+            id="batch-results",
+            cls="w-full flex flex-col items-center bg-zinc-900 rounded-md p-6 fade-in"
+        )
+
     # Add this helper function to directly embed images in the UI
     def try_read_image(image_path):
         """Attempt to read an image and return it as an embedded element"""
@@ -1151,6 +1487,26 @@ def serve_fasthtml():
                 P(f"Error displaying image: {str(e)}", cls="text-red-500 text-center"),
                 cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
             )
+
+    def chat_message(msg_idx, messages):
+        msg = messages[msg_idx]
+        # Improved content class to better handle long messages
+        content_cls = f"px-2.5 py-1.5 rounded-lg max-w-lg {'rounded-br-none border-green-700 border' if msg['role'] == 'user' else 'rounded-bl-none border-zinc-400 border'}"
+        
+        # Log the message content for debugging
+        logging.info(f"Rendering message {msg_idx} from {msg['role']}: {msg['content'][:100]}...")
+        
+        return Div(
+            Div(msg["role"], cls="text-xs text-zinc-500 mb-1"),
+            Div(
+                msg["content"],
+                # Updated styling to handle long text better
+                cls=f"bg-{'green-600 text-white' if msg['role'] == 'user' else 'zinc-200 text-black'} {content_cls} whitespace-pre-wrap break-words",
+                id=f"msg-content-{msg_idx}",
+            ),
+            id=f"msg-{msg_idx}",
+            cls=f"self-{'end' if msg['role'] == 'user' else 'start'} max-w-[85%]",
+        )
 
     def token_maps_ui(image_key, heatmaps):
         """Create token map UI with tabs and display area"""
@@ -1415,98 +1771,61 @@ def serve_fasthtml():
             cls="w-full max-w-2xl bg-zinc-800 rounded-md p-6 fade-in"
         )
 
-    # Main route for homepage
+    # BATCH PROCESSING ROUTES
+    # Make this the default route
     @rt("/")
     def get(session):
         if 'session_id' not in session:
             session['session_id'] = str(uuid.uuid4())
         
-        logging.info(f"New session started: {session['session_id']}")
+        logging.info(f"New session: {session['session_id']} - showing batch upload form")
         
         return (
-            Title("Image Analysis with AI"),
+            Title("Batch Image Analysis"),
             Main(
                 # Loading indicator with better visibility
                 Div(
                     Div(cls="loading loading-spinner loading-lg text-primary"),
-                    Div("Processing your image...", cls="text-white mt-4 text-lg"),
+                    Div("Processing your images...", cls="text-white mt-4 text-lg"),
                     id="loading-indicator",
                     cls="htmx-indicator fixed top-0 left-0 w-full h-full bg-black bg-opacity-80 flex flex-col items-center justify-center z-50"
                 ),
                 
                 # Page header 
-                H1("Image Analysis with AI", cls="text-3xl font-bold mb-4 text-white"),
+                H1("Batch Image Analysis", cls="text-3xl font-bold mb-4 text-white"),
                 
                 # Header info
                 Div(
-                    P("Upload an insect or species image to analyze it with AI", 
-                      cls="text-white text-center mb-8"),
+                    P("Upload multiple insect or species images for batch analysis", 
+                      cls="text-white text-center mb-6"),
                     cls="w-full max-w-2xl"
                 ),
                 
-                # Main content area 
+                # Main content area - DIRECTLY SHOW BATCH FORM
                 Div(
-                    upload_form(),
+                    batch_upload_form(),
                     id="main-content",
                     cls="w-full max-w-2xl"
                 ),
                 
-                # Results area - will be populated by process-image
-                Div(id="analysis-results", cls="w-full max-w-2xl mt-8"),
-                
-                # Global script to initialize UI behaviors
-                Script("""
-                // Set up click tracking for debugging
-                document.addEventListener('click', function(e) {
-                    console.log('Click detected on:', e.target);
-                });
-                
-                // Make sure form submits properly
-                document.addEventListener('DOMContentLoaded', function() {
-                    const form = document.getElementById('upload-form');
-                    if (form) {
-                        // Add visual feedback when button is clicked
-                        const button = document.getElementById('analyze-button');
-                        if (button) {
-                            button.addEventListener('click', function() {
-                                this.classList.add('opacity-70');
-                                setTimeout(() => {
-                                    this.classList.remove('opacity-70');
-                                }, 100);
-                            });
-                        }
-                        
-                        // Show loading state when form is submitted
-                        form.addEventListener('submit', function() {
-                            const btn = document.getElementById('analyze-button');
-                            if (btn) {
-                                btn.innerHTML = '<span class="loading loading-spinner loading-sm"></span> Processing...';
-                                btn.disabled = true;
-                            }
-                            
-                            // Show loading indicator
-                            document.getElementById('loading-indicator').style.display = 'flex';
-                        });
-                    }
-                });
-                
-                // Handle tabs for token maps
-                document.addEventListener('htmx:afterSwap', function(evt) {
-                    if (evt.detail.target.id === 'analysis-results') {
-                        // Auto-select first token tab if available
-                        setTimeout(function() {
-                            const firstTab = document.getElementById('token-tab-0');
-                            if (firstTab) firstTab.click();
-                        }, 300);
-                    }
-                });
-                """),
+                # Results area - will be populated by process-batch
+                Div(id="analysis-results", cls="w-full max-w-5xl mt-8"),
                 
                 cls="flex flex-col items-center min-h-screen bg-black p-4",
             )
         )
 
-    # Process uploaded image
+    # Add this explicit route for batch upload
+    @rt("/batch-upload", methods=["GET"])
+    def get_batch_upload(session):
+        """Show the batch upload form"""
+        if 'session_id' not in session:
+            session['session_id'] = str(uuid.uuid4())
+            
+        logging.info(f"Showing batch upload form for session: {session['session_id']}")
+        return batch_upload_form()
+
+    # Process uploaded image (for single image analysis)
     @rt("/process-image", methods=["POST"])
     async def process_image(request: Request):
         form = await request.form()
@@ -1664,47 +1983,178 @@ def serve_fasthtml():
             token_maps=token_maps, 
             analysis_id=analysis_id
         )
-    
 
-    # Add a direct test endpoint for Mistral Vision
-    @fasthtml_app.get("/test-mistral-vision")
-    async def test_mistral_vision():
-        """Direct test of Mistral Vision capabilities"""
-        try:
-            # Load a test image
-            test_image_path = os.path.join(TEMP_UPLOAD_DIR, "test_image.jpg")
-            if not os.path.exists(test_image_path):
-                # Create a simple test image if none exists
-                from PIL import Image, ImageDraw
-                test_image = Image.new('RGB', (512, 512), color='white')
-                draw = ImageDraw.Draw(test_image)
-                draw.text((100, 100), "Test Image for Mistral Vision", fill="black")
-                test_image.save(test_image_path)
+    # Process batch of images
+    @rt("/process-batch", methods=["POST"])
+    async def process_batch(request: Request):
+        """Process a batch of uploaded images"""
+        form = await request.form()
+        
+        # Extract all uploaded images
+        image_files = []
+        for key in form.keys():
+            if key.startswith('image_'):
+                image_files.append(form.get(key))
+        
+        # If no image_X fields, try the multiple file field
+        if not image_files and form.get("image_files"):
+            image_files = form.getlist("image_files")
+        
+        # Limit to 10 images
+        image_files = image_files[:10]
+        
+        if not image_files:
+            return Div("No images uploaded", cls="text-red-500 text-center p-4")
+        
+        logging.info(f"Processing batch of {len(image_files)} images")
+        
+        analysis_type = form.get("analysis_type", "classify_insect")
+        share_context = form.get("share_context", "false") == "true"
+        
+        # Get the appropriate query based on analysis type
+        query = get_query_for_analysis(analysis_type)
+        logging.info(f"Using query: {query}, Share context: {share_context}")
+        
+        # For shared context, retrieve documents once
+        shared_context = None
+        shared_top_sources = None
+        
+        if share_context:
+            logging.info(f"Retrieving shared context for query: {query}")
+            shared_context, shared_top_sources = await retrieve_relevant_documents(query)
+            logging.info(f"Retrieved {len(shared_context) if shared_context else 0} shared context paragraphs")
+        
+        # Create directory for temporary uploads if it doesn't exist
+        os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+        
+        # Process each image
+        batch_results = []
+        token_maps_by_image = {}
+        
+        for i, image_file in enumerate(image_files):
+            if not image_file:
+                continue
                 
-            image = Image.open(test_image_path)
-            
-            # Create a simple multimodal message
-            result = await process_with_mistral(
-                image=image,
-                query="Describe this test image briefly",
-                context_text="",
-                analysis_id="test"
-            )
-            
-            return Response(
-                content=json.dumps({"status": "success", "result": result}),
-                media_type="application/json"
-            )
+            try:
+                # Generate a unique ID for this analysis
+                analysis_id = str(uuid.uuid4())
+                
+                # Get filename or create default
+                filename = getattr(image_file, 'filename', f"image_{i}.jpg")
+                # Sanitize filename
+                safe_filename = "".join(c for c in filename if c.isalnum() or c in "._-")
+                image_path = os.path.join(TEMP_UPLOAD_DIR, f"{analysis_id}_{safe_filename}")
+                
+                logging.info(f"Processing image {i+1}/{len(image_files)}: {filename} → {image_path}")
+                
+                # Save the uploaded image
+                content = await image_file.read()
+                with open(image_path, "wb") as f:
+                    f.write(content)
+                
+                # Verify the file was saved
+                if not os.path.exists(image_path):
+                    raise FileNotFoundError(f"Failed to save image to {image_path}")
+                    
+                # Open the image for processing
+                image = Image.open(image_path)
+                
+                # Get context - either shared or unique per image
+                if not share_context:
+                    logging.info(f"Retrieving unique context for image {i+1}")
+                    retrieved_paragraphs, top_sources = await retrieve_relevant_documents(query)
+                else:
+                    logging.info(f"Using shared context for image {i+1}")
+                    retrieved_paragraphs, top_sources = shared_context, shared_top_sources
+                
+                # Generate context text
+                context_text = "\n\n".join(retrieved_paragraphs) if retrieved_paragraphs else ""
+                
+                # Generate token maps for top document
+                image_token_maps = {}
+                if top_sources:
+                    top_source = top_sources[0]
+                    image_key = top_source.get('image_key')
+                    
+                    # Only generate token maps if we haven't already for this context
+                    if image_key and image_key not in token_maps_by_image:
+                        logging.info(f"Generating token maps for context document: {image_key}")
+                        image_heatmaps = await generate_similarity_maps(query, image_key)
+                        if image_heatmaps:
+                            token_maps_by_image[image_key] = image_heatmaps
+                            image_token_maps[image_key] = image_heatmaps
+                    elif image_key:
+                        # Reuse existing token maps
+                        image_token_maps[image_key] = token_maps_by_image[image_key]
+                
+                # Process with Mistral - FIX: Store the response in a variable
+                logging.info(f"Processing image {i+1} with Mistral")
+                response_text = await process_with_mistral(image, query, context_text, analysis_id)
+                
+                # Save to database - FIX: Use the correct variable name
+                try:
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+                    
+                    # Insert basic info - FIX: Use response_text instead of mistral_response
+                    cursor.execute(
+                        "INSERT INTO image_analyses (analysis_id, image_path, analysis_type, query, response) VALUES (?, ?, ?, ?, ?)",
+                        (analysis_id, image_path, analysis_type, query, response_text)
+                    )
+                    
+                    # Add context source if available
+                    if top_sources:
+                        top_source = top_sources[0]
+                        context_source = f"{top_source['filename']} (page {top_source['page']})"
+                        
+                        # Check if the column exists
+                        cursor.execute("PRAGMA table_info(image_analyses)")
+                        columns = [column[1] for column in cursor.fetchall()]
+                        if 'context_source' in columns:
+                            cursor.execute(
+                                "UPDATE image_analyses SET context_source = ? WHERE analysis_id = ?",
+                                (context_source, analysis_id)
+                            )
+                    
+                    conn.commit()
+                    conn.close()
+                    logging.info(f"Saved analysis {analysis_id} to database")
+                except Exception as db_error:
+                    logging.error(f"Database error for image {i+1}: {db_error}")
+                
+                # Add to batch results - FIX: Use response_text instead of mistral_response
+                batch_results.append({
+                    "analysis_id": analysis_id,
+                    "image_path": image_path,
+                    "response": response_text,
+                    "context_paragraphs": retrieved_paragraphs,
+                    "top_sources": top_sources,
+                    "token_maps": image_token_maps
+                })
+                
+            except Exception as e:
+                logging.error(f"Error processing image {i+1}: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Add error result
+                batch_results.append({
+                    "error": True,
+                    "message": f"Error: {str(e)}",
+                    "analysis_id": f"error_{i}",
+                    "image_path": ""
+                })
+        
+        # Ensure volume is committed
+        try:
+            bee_volume.commit()
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return Response(
-                content=json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()}),
-                media_type="application/json",
-                status_code=500
-            )
+            logging.error(f"Error committing volume: {e}")
+        
+        # Return carousel UI with all results
+        return carousel_ui(batch_results)
 
-    @fasthtml_app.get("/token-map/{image_key}/{token_idx}")
+    @rt("/token-map/{image_key}/{token_idx}")
     async def get_token_map(image_key: str, token_idx: int):
         """Return the token map image HTML for display in the UI"""
         # Get the file path
