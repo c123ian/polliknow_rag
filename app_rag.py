@@ -730,7 +730,7 @@ def serve_fasthtml():
                 return classification
         
         # If no "Answer:" pattern, look for specific categories in the response
-        categories = ["bumblebee", "honeybee", "wasp", "hoverfly", "flies", "butterfly", "moth", "other"]
+        categories = ["bumblebee", "honeybee", "wasp", "solitary bee", "hoverfly", "flies", "butterfly", "moth", "other"]
         
         # Check for each category in the text
         response_lower = response_text.lower()
@@ -948,9 +948,9 @@ def serve_fasthtml():
             traceback.print_exc()
             return [], []
 
-    # Modified generate_similarity_maps function to focus on 'Classify' token
+    # Modified generate_similarity_maps function to use similarity score selection
     async def generate_similarity_maps(query, image_key):
-        """Generate token similarity maps for a retrieved document, focusing on 'Classify' token"""
+        """Generate token similarity maps for a retrieved document based on similarity scores"""
         global colpali_model, colpali_processor, page_images
         
         if not image_key or image_key not in page_images:
@@ -969,10 +969,6 @@ def serve_fasthtml():
                     filename = '_'.join(parts[:-1])
                     page_num = parts[-1]
                     
-                    # Log all these details for debugging
-                    logging.info(f"Trying to find image for key: {image_key}")
-                    logging.info(f"Parsed filename: {filename}, page: {page_num}")
-                    
                     # Check different potential locations
                     potential_paths = [
                         os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
@@ -981,7 +977,6 @@ def serve_fasthtml():
                     ]
                     
                     for potential_path in potential_paths:
-                        logging.info(f"Checking potential path: {potential_path}")
                         if os.path.exists(potential_path):
                             logging.info(f"Found image at: {potential_path}")
                             image_path = potential_path
@@ -1009,10 +1004,6 @@ def serve_fasthtml():
                 spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
             )
             
-            # Log patch info for debugging
-            logging.info(f"Image size: {image.size}, Patch size: {colpali_model.patch_size}")
-            logging.info(f"Number of patches: {n_patches}")
-            
             # Get image mask
             image_mask = colpali_processor.get_image_mask(batch_images)
             
@@ -1027,97 +1018,65 @@ def serve_fasthtml():
             # Get the similarity map for this image
             similarity_maps = batched_similarity_maps[0]  # (query_length, n_patches_x, n_patches_y)
             
-            # Log similarity maps shape for debugging
-            logging.info(f"Generated similarity maps with shape: {similarity_maps.shape}")
-            
             # Get tokens for the query
             query_tokens = colpali_processor.tokenizer.tokenize(query)
-            logging.info(f"Query tokens: {query_tokens}")
             
-            # Try multiple approaches to find a token for mapping
+            # Filter to meaningful tokens - approach from older version
+            token_sims = []
+            stopwords = set(["<bos>", "<eos>", "<pad>", "a", "an", "the", "in", "on", "at", "of", "for", "with", "by", "to", "from"])
             
-            # First approach: Find the 'Classify' token
-            classify_token_idx = -1
             for token_idx, token in enumerate(query_tokens):
-                token_display = token.replace("Ġ", "").replace("▁", "")
-                if "Classify" in token_display:
-                    classify_token_idx = token_idx
-                    logging.info(f"Found 'Classify' token at index {classify_token_idx}: {token}")
-                    break
+                if token_idx >= similarity_maps.shape[0]:
+                    continue
+                    
+                # Skip stopwords and short tokens
+                if token in stopwords or len(token) <= 1:
+                    continue
+                    
+                token_clean = token.replace("Ġ", "").replace("▁", "")
+                if token_clean and len(token_clean) > 1:
+                    max_sim = similarity_maps[token_idx].max().item()
+                    token_sims.append((token_idx, token, max_sim))
             
-            # Second approach: If no 'Classify' token, use token with 'insect'
-            if classify_token_idx == -1:
-                for token_idx, token in enumerate(query_tokens):
-                    token_display = token.replace("Ġ", "").replace("▁", "")
-                    if "insect" in token_display.lower():
-                        classify_token_idx = token_idx
-                        logging.info(f"Found 'insect' token at index {classify_token_idx}: {token}")
-                        break
-            
-            # Third approach: If still not found, use the first non-prefix token
-            if classify_token_idx == -1 and len(query_tokens) > 0:
-                for token_idx, token in enumerate(query_tokens):
-                    if not token.startswith("Ġ") and not token.startswith("▁"):
-                        classify_token_idx = token_idx
-                        logging.info(f"Using first non-prefix token at index {classify_token_idx}: {token}")
-                        break
-            
-            # Last resort: Use the first token
-            if classify_token_idx == -1 and len(query_tokens) > 0:
-                classify_token_idx = 0
-                logging.info(f"Using first token as fallback at index 0: {query_tokens[0]}")
-            
-            # Generate multiple token maps including 'Classify' and first few tokens
-            image_heatmaps = []
-            tokens_to_map = set()
-            
-            # Always include the 'Classify' token if found
-            if classify_token_idx >= 0:
-                tokens_to_map.add(classify_token_idx)
-            
-            # Include first few tokens as backup
-            for i in range(min(3, len(query_tokens))):
-                tokens_to_map.add(i)
+            # Sort by similarity score and take top tokens
+            token_sims.sort(key=lambda x: x[2], reverse=True)
+            top_tokens = token_sims[:6]  # Get top 6 tokens
             
             # Create directory if it doesn't exist
             os.makedirs(HEATMAP_DIR, exist_ok=True)
             
-            # Generate maps for selected tokens
-            for token_idx in tokens_to_map:
-                if token_idx < similarity_maps.shape[0]:
-                    token = query_tokens[token_idx]
-                    score = similarity_maps[token_idx].max().item()
+            # Generate and save heatmaps
+            image_heatmaps = []
+            for token_idx, token, score in top_tokens:
+                # Skip if score is very low
+                if score < 0.1:
+                    continue
                     
-                    # Generate heatmap
-                    fig, ax = plot_similarity_map(
-                        image=image,
-                        similarity_map=similarity_maps[token_idx],
-                        figsize=(8, 8),
-                        show_colorbar=False,
-                    )
-                    
-                    # Clean token for display
-                    token_display = token.replace("Ġ", "").replace("▁", "")
-                    ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
-                    
-                    # Save heatmap with both image_key and token index in filename
-                    heatmap_filename = f"{image_key}_token_{token_idx}.png"
-                    heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
-                    
-                    # Log save path for debugging
-                    logging.info(f"Saving heatmap to: {heatmap_path}")
-                    
-                    # Use a higher DPI for better quality
-                    fig.savefig(heatmap_path, bbox_inches='tight', dpi=150)
-                    plt.close(fig)
-                    
-                    # Add to list
-                    image_heatmaps.append({
-                        "token": token_display,
-                        "score": score,
-                        "path": heatmap_filename,
-                        "token_idx": token_idx
-                    })
+                # Generate heatmap
+                fig, ax = plot_similarity_map(
+                    image=image,
+                    similarity_map=similarity_maps[token_idx],
+                    figsize=(8, 8),
+                    show_colorbar=False,
+                )
+                
+                # Clean token for display
+                token_display = token.replace("Ġ", "").replace("▁", "")
+                ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
+                
+                # Save heatmap
+                heatmap_filename = f"{image_key}_token_{token_idx}.png"
+                heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
+                fig.savefig(heatmap_path, bbox_inches='tight', dpi=150)
+                plt.close(fig)
+                
+                # Add to list
+                image_heatmaps.append({
+                    "token": token_display,
+                    "score": score,
+                    "path": heatmap_filename,
+                    "token_idx": token_idx
+                })
             
             logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
             return image_heatmaps
@@ -1140,14 +1099,24 @@ def serve_fasthtml():
             img_data = img_buffer.getvalue()
             base64_img = base64.b64encode(img_data).decode("utf-8")
             
-            # Create multimodal message format with insect classification prompt
+            # Create system prompt that incorporates the query but maintains classification focus
+            system_prompt = (
+                "You are an expert biologist. Classify the insect in the provided image into "
+                "ONE of these categories (bumblebee, honeybee, wasp, solitary bee, hoverfly, other flies, "
+                "butterfly & moths, other insect). Focus primarily on the visual characteristics "
+                f"in the image itself. {query} "
+                "Use any provided context as secondary information only. After analysis, provide the answer "
+                "as a single word, for example 'Answer: honeybee'."
+            )
+            
+            # Create multimodal message format with updated system prompt
             payload = {
             "model": DEFAULT_MISTRAL_NAME,
             "messages": [
-                {"role": "system", "content": "You are an expert biologist. Classify the insect in the provided image into ONE of these categories (bumblebee, honeybee, wasp, hoverfly, other flies, butterfly & moths, other insect). Focus primarily on the visual characteristics in the image itself. Use any provided context as secondary information only. After analysis, provide the answer as a single word, for example 'Answer: honeybee'."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": [
                     {"type": "text", "text": f"Classify this insect.{' Additional reference information:' + context_text if context_text else ''}"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
+                    {"type": "image", "image": {"data": f"data:image/jpeg;base64,{base64_img}"}}
                 ]}
             ],
                 "max_tokens": 2000,
