@@ -696,15 +696,58 @@ def serve_fasthtml():
         ]
     )
 
-    # Define query templates by analysis type
-    def get_query_for_analysis(analysis_type):
-        """Return a predefined query based on the analysis type"""
-        queries = {
-            "classify_insect": "Classify the insect in this image based on taxonomic hierarchy. Identify its order, family, and genus if possible.",
-            "identify_species": "Identify the species shown in this image. Describe its key visual characteristics and habitat.",
-            "analyze_features": "Analyze the visible features of this organism. Describe its morphology, coloration, and any distinctive anatomical structures."
+    # Helper function to extract the one-word classification from LLM response
+    def extract_classification(response_text):
+        """Extract the one-word classification from the LLM response"""
+        # Try to extract the classification after "Answer:" if present
+        if "Answer:" in response_text:
+            parts = response_text.split("Answer:")
+            if len(parts) > 1:
+                answer = parts[1].strip().lower()
+                # Take only the first word
+                classification = answer.split()[0] if answer.split() else "unknown"
+                return classification
+        
+        # If no "Answer:" pattern, look for specific categories in the response
+        categories = ["bumblebee", "honeybee", "wasp", "hoverfly", "flies", "butterfly", "moth", "other"]
+        
+        # Check for each category in the text
+        response_lower = response_text.lower()
+        for category in categories:
+            if category in response_lower:
+                if category == "flies":
+                    return "other flies"
+                elif category in ["butterfly", "moth"]:
+                    return "butterfly & moths"
+                return category
+        
+        # Default if no category found
+        return "other insect"
+
+    # Helper function to get badge color based on classification
+    def get_badge_color(classification):
+        """Return the appropriate badge color for a classification"""
+        colors = {
+            "bumblebee": "badge-primary",      # Blue
+            "honeybee": "badge-warning",       # Yellow
+            "wasp": "badge-accent",            # Dark yellow/orange
+            "hoverfly": "badge-success",       # Green
+            "other flies": "badge-info",       # Light blue
+            "butterfly & moths": "badge-secondary", # Purple
+            "other insect": "badge-neutral",   # Gray
+            "error": "badge-error"             # Red
         }
-        return queries.get(analysis_type, queries["classify_insect"])
+        
+        # Normalize the classification
+        classification = classification.lower()
+        
+        # Check for partial matches - simplified for accurate matching
+        for key, color in colors.items():
+            if key == classification:
+                return color
+        
+        # Default to neutral if no match
+        return "badge-neutral"
         
     # Helper functions for saving to database
     async def save_to_database(analysis_id, image_path, analysis_type, query, response, top_sources):
@@ -884,9 +927,9 @@ def serve_fasthtml():
             traceback.print_exc()
             return [], []
 
-    # Generate similarity maps for context document
+    # Modified generate_similarity_maps function to focus on 'Classify' token
     async def generate_similarity_maps(query, image_key):
-        """Generate token similarity maps for a retrieved document"""
+        """Generate token similarity maps for a retrieved document, focusing on 'Classify' token"""
         global colpali_model, colpali_processor, page_images
         
         if not image_key or image_key not in page_images:
@@ -936,38 +979,28 @@ def serve_fasthtml():
             # Get tokens for the query
             query_tokens = colpali_processor.tokenizer.tokenize(query)
             
-            # Filter to meaningful tokens
-            token_sims = []
-            stopwords = set(["<bos>", "<eos>", "<pad>", "a", "an", "the", "in", "on", "at", "of", "for", "with", "by", "to", "from"])
-            
+            # Find the 'Classify' token - hardcoded as specified
+            classify_token_idx = -1
             for token_idx, token in enumerate(query_tokens):
-                if token_idx >= similarity_maps.shape[0]:
-                    continue
-                    
-                # Skip stopwords and short tokens
-                if token in stopwords or len(token) <= 1:
-                    continue
-                    
-                token_clean = token[1:] if token.startswith("▁") else token
-                if token_clean and len(token_clean) > 1:
-                    max_sim = similarity_maps[token_idx].max().item()
-                    token_sims.append((token_idx, token, max_sim))
+                token_display = token[1:] if token.startswith("▁") else token
+                if "Classify" in token_display:
+                    classify_token_idx = token_idx
+                    break
             
-            # Sort by similarity score and take top tokens
-            token_sims.sort(key=lambda x: x[2], reverse=True)
-            top_tokens = token_sims[:6]  # Get top 6 tokens
+            # If 'Classify' token not found, use the first token as fallback
+            if classify_token_idx == -1 and len(query_tokens) > 0:
+                classify_token_idx = 0
             
-            # Generate and save heatmaps
+            # Generate only one token map for 'Classify'
             image_heatmaps = []
-            for token_idx, token, score in top_tokens:
-                # Skip if score is very low
-                if score < 0.1:
-                    continue
-                    
+            if classify_token_idx >= 0 and classify_token_idx < similarity_maps.shape[0]:
+                token = query_tokens[classify_token_idx]
+                score = similarity_maps[classify_token_idx].max().item()
+                
                 # Generate heatmap
                 fig, ax = plot_similarity_map(
                     image=image,
-                    similarity_map=similarity_maps[token_idx],
+                    similarity_map=similarity_maps[classify_token_idx],
                     figsize=(8, 8),
                     show_colorbar=False,
                 )
@@ -977,7 +1010,7 @@ def serve_fasthtml():
                 ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
                 
                 # Save heatmap
-                heatmap_filename = f"{image_key}_token_{token_idx}.png"
+                heatmap_filename = f"{image_key}_token_{classify_token_idx}.png"
                 heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
                 fig.savefig(heatmap_path, bbox_inches='tight')
                 plt.close(fig)
@@ -987,7 +1020,7 @@ def serve_fasthtml():
                     "token": token_display,
                     "score": score,
                     "path": heatmap_filename,
-                    "token_idx": token_idx
+                    "token_idx": classify_token_idx
                 })
             
             logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
@@ -999,6 +1032,7 @@ def serve_fasthtml():
             traceback.print_exc()
             return []
 
+    # Updated process_with_mistral function with insect classification system prompt
     async def process_with_mistral(image, query, context_text="", analysis_id=""):
         """Process the image with Mistral LLM including context from retrieved documents"""
         logging.info(f"Processing image {analysis_id} with Mistral using query: {query}")
@@ -1010,19 +1044,19 @@ def serve_fasthtml():
             img_data = img_buffer.getvalue()
             base64_img = base64.b64encode(img_data).decode("utf-8")
             
-            # Create multimodal message format - simplified for clarity
+            # Create multimodal message format with insect classification prompt
             payload = {
                 "model": DEFAULT_MISTRAL_NAME,
                 "messages": [
-                    {"role": "system", "content": "You are an expert biologist analyzing visual specimens."},
+                    {"role": "system", "content": "You are an expert biologist, classify the insect in the image_url into ONE of these categories (bumblebee, honeybee, wasp, hoverfly, other flies, butterfly & moths, other insect) and refer to provided context_text to help you. After thinking provide the answer as a single word, for example 'Answer: honeybee'."},
                     {"role": "user", "content": [
-                        {"type": "text", "text": f"{query}\n\n{context_text if context_text else ''}"},
+                        {"type": "text", "text": f"Classify this insect.\n\n{context_text if context_text else ''}"},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
                     ]}
                 ],
-                "max_tokens": 2000,  # Increased from 500
+                "max_tokens": 2000,
                 "temperature": 0.7,
-                "stream": False  # Explicitly disable streaming
+                "stream": False
             }
             
             # Send to vLLM endpoint
@@ -1039,7 +1073,7 @@ def serve_fasthtml():
                         if "choices" in result and len(result["choices"]) > 0:
                             model_response = result["choices"][0]["message"]["content"]
                             
-                            # Original logging for the full response content
+                            # Log the full response content
                             logging.info(f"Full LLM response for analysis {analysis_id}:\n{'='*50}\n{model_response}\n{'='*50}")
                             
                             return model_response.strip()
@@ -1056,100 +1090,27 @@ def serve_fasthtml():
             return f"Error: {str(e)}"
 
     # Define UI components
-    def upload_form():
-        """Render upload form for images with proper interactive elements"""
-        # File input with visual styling
-        upload_input = Input(
-            type="file",
-            name="image",
-            accept=".jpg,.jpeg,.png",
-            required=True,
-            cls="file-input file-input-bordered file-input-secondary w-full"
-        )
-        
-        # Analysis type selection
-        analysis_selector = Div(
-            Label("Select Analysis Type:", cls="text-white text-sm font-medium mb-2"),
-            Select(
-                Option("Classify Insect", value="classify_insect", selected=True),
-                Option("Identify Species", value="identify_species"),
-                Option("Analyze Features", value="analyze_features"),
-                name="analysis_type",
-                cls="select select-bordered w-full mb-4"
-            ),
-            cls="mb-4"
-        )
-        
-        # Process button with loading state - using direct form action to ensure it works
-        process_button = Button(
-            "Analyze Image",
-            type="submit",
-            id="analyze-button",
-            cls="btn btn-primary w-full hover:bg-blue-600 active:bg-blue-700"
-        )
-        
-        # Instructions
-        instructions = Div(
-            P("Upload an image of an insect or other species for AI analysis.", 
-              cls="text-zinc-300 text-center mb-2"),
-            P("The system will analyze the image and provide visual insights into how the AI interprets it.",
-              cls="text-zinc-300 text-center text-sm"),
-            cls="mt-4 mb-6"
-        )
-        
-        # Create form with action and method (for non-HTMX fallback) and HTMX attributes
-        return Form(
-            Div(
-                H2("Upload Image for Analysis", cls="text-xl font-semibold text-white mb-4"),
-                instructions,
-                
-                # Image upload card
-                Div(
-                    Div(
-                        Label("Upload Image:", cls="text-white font-medium mb-2"),
-                        upload_input,
-                        cls="grid place-items-center p-4"
-                    ),
-                    cls="card bg-zinc-800 border border-zinc-700 rounded-box w-full mb-4"
-                ),
-                
-                # Analysis selector & Process button
-                analysis_selector,
-                process_button,
-                
-                cls="bg-zinc-900 rounded-md p-6 w-full max-w-lg border border-zinc-700"
-            ),
-            action="/process-image",  # Direct action for fallback
-            method="post",            # Direct method for fallback
-            enctype="multipart/form-data",
-            id="upload-form",
-            hx_post="/process-image",
-            hx_target="#analysis-results",
-            hx_indicator="#loading-indicator",
-        )
-
-    # BATCH PROCESSING COMPONENTS
     def batch_upload_form():
-        """Render form for uploading multiple images for batch processing"""
+        """Render form for uploading multiple images for batch insect classification"""
         
         return Form(
             Div(
-                H2("Batch Image Analysis", cls="text-xl font-semibold text-white mb-4"),
+                H2("Batch Insect Classification", cls="text-xl font-semibold text-white mb-4"),
                 
-                P("Upload multiple images (up to 10) for batch processing.", 
+                P("Upload multiple insect images (up to 10) for AI classification.", 
                   cls="text-zinc-300 text-center mb-6"),
                 
                 # Image upload card
                 Div(
                     Div(
-                        Label("Upload Images:", cls="text-white font-medium mb-2"),
+                        Label("Upload Insect Images:", cls="text-white font-medium mb-2"),
                         Input(
                             type="file",
                             name="image_files",
                             accept=".jpg,.jpeg,.png",
                             required=True,
                             multiple=True,
-                            cls="file-input file-input-bordered file-input-primary w-full",
+                            cls="file-input file-input-bordered file-input-warning w-full",
                             onchange="handleMultipleFiles(this)"
                         ),
                         P(id="file-count", cls="text-sm text-zinc-400 mt-2"),
@@ -1160,27 +1121,14 @@ def serve_fasthtml():
                     cls="card bg-zinc-800 border border-zinc-700 rounded-box w-full mb-4"
                 ),
                 
-                # Analysis type selection
-                Div(
-                    Label("Select Analysis Type:", cls="text-white text-sm font-medium mb-2"),
-                    Select(
-                        Option("Classify Insect", value="classify_insect", selected=True),
-                        Option("Identify Species", value="identify_species"),
-                        Option("Analyze Features", value="analyze_features"),
-                        name="analysis_type",
-                        cls="select select-bordered w-full mb-2"
-                    ),
-                    cls="mb-4"
-                ),
-                
                 # Context sharing option
                 Div(
                     Label(
-                        Input(type="checkbox", name="share_context", value="true", cls="checkbox checkbox-primary mr-2"),
+                        Input(type="checkbox", name="share_context", value="true", cls="checkbox checkbox-warning mr-2"),
                         "Share context across all images (faster)",
                         cls="flex items-center cursor-pointer text-white"
                     ),
-                    P("Uses the same retrieved document for all images instead of finding unique matches.",
+                    P("Uses the same reference document for all insects instead of finding unique matches.",
                       cls="text-zinc-400 text-sm mt-1 ml-6"),
                     cls="mb-6"
                 ),
@@ -1188,12 +1136,12 @@ def serve_fasthtml():
                 # Process button
                 Button(
                     Div(
-                        "Process Batch",
+                        "Classify Insects",
                         cls="flex items-center justify-center"
                     ),
                     id="batch-button",
                     type="submit",
-                    cls="btn btn-primary w-full"
+                    cls="btn btn-warning w-full"
                 ),
                 
                 # JavaScript for handling multiple files
@@ -1241,12 +1189,14 @@ def serve_fasthtml():
             hx_target="#main-content",
             hx_indicator="#loading-indicator",
         )
-        
+
+    # Updated carousel UI with the new design for insect classification
     def carousel_ui(batch_results):
-        """Create a carousel UI to display multiple image analysis results"""
+        """Create a carousel UI to display multiple image analysis results with the new design"""
         
         # Create carousel items
         carousel_items = []
+        carousel_indicators = []
         
         for i, result in enumerate(batch_results):
             # Extract data
@@ -1257,159 +1207,227 @@ def serve_fasthtml():
             top_sources = result.get("top_sources", [])
             token_maps = result.get("token_maps", {})
             has_error = result.get("error", False)
-            error_message = result.get("message", "Unknown error")
             
-            # Create result card
-            if has_error:
-                # Error card
-                result_card = Div(
-                    Div(
-                        H3(f"Error in Result {i+1}", cls="text-xl font-semibold text-red-500 mb-2"),
-                        P(error_message, cls="text-red-400 mb-4"),
-                        cls="bg-zinc-800 rounded-md p-6 w-full"
-                    ),
-                    id=f"slide-{i}",
-                    cls="carousel-item relative w-full flex justify-center"
+            # Extract the one-word classification
+            classification = "error" if has_error else extract_classification(response)
+            badge_color = get_badge_color(classification)
+            
+            # Create carousel item for the image
+            carousel_items.append(
+                Div(
+                    # Image display
+                    try_read_image(image_path),
+                    id=f"item{i+1}",
+                    cls="carousel-item w-full"
                 )
-            else:
-                # Success card - FIX: Store children as a list of components
-                card_content = [
-                    # Result header
+            )
+            
+            # Create indicator buttons
+            carousel_indicators.append(
+                A(
+                    str(i+1),
+                    href=f"#item{i+1}",
+                    cls=f"btn btn-xs {'' if i > 0 else 'btn-active'}"
+                )
+            )
+        
+        # Create the classification badges and context containers below the carousel
+        classification_sections = []
+        
+        for i, result in enumerate(batch_results):
+            # Extract data again
+            response = result.get("response", "No response generated")
+            context_paragraphs = result.get("context_paragraphs", [])
+            top_sources = result.get("top_sources", [])
+            token_maps = result.get("token_maps", {})
+            has_error = result.get("error", False)
+            
+            # Extract the one-word classification
+            classification = "error" if has_error else extract_classification(response)
+            badge_color = get_badge_color(classification)
+            
+            # Create collapsible context section
+            context_section = Div()
+            
+            if top_sources and len(top_sources) > 0:
+                top_source = top_sources[0]
+                image_key = top_source.get('image_key', '')
+                
+                # Get token maps for this image if available
+                current_token_maps = token_maps.get(image_key, [])
+                
+                context_section = Div(
+                    # Badge and toggle section
                     Div(
-                        H3(f"Result {i+1} of {len(batch_results)}", 
-                           cls="text-xl font-semibold text-white text-center mb-4"),
-                        
-                        # Main content - image/analysis layout
+                        # Classification badge
                         Div(
-                            # Left column - image 
-                            Div(
-                                H4("Uploaded Image", cls="text-lg font-semibold text-white mb-2"),
-                                try_read_image(image_path),
-                                cls="lg:w-1/2 lg:pr-4 mb-6 lg:mb-0"
-                            ),
-                            
-                            # Right column - analysis
-                            Div(
-                                H4("AI Analysis", cls="text-lg font-semibold text-white mb-2"),
-                                Div(
-                                    response,
-                                    cls="bg-zinc-700 rounded-md p-4 text-white overflow-y-auto max-h-[300px]"
-                                ),
-                                cls="lg:w-1/2 lg:pl-4"
-                            ),
-                            
-                            cls="flex flex-col lg:flex-row w-full mb-6"
+                            classification,
+                            cls=f"badge {badge_color} text-lg p-3 mr-4"
                         ),
                         
-                        # Context section
-                        (Div(
-                            H4("Context Document", cls="text-lg font-semibold text-white mb-2"),
-                            
-                            # Context document display
-                            (context_document_ui(top_sources[0]) if top_sources else 
-                                Div("No context retrieved", cls="text-zinc-400 p-4")),
-                            
-                            # Token maps for visual explanation (if available)
-                            (token_maps_ui(top_sources[0].get('image_key'), 
-                                            token_maps.get(top_sources[0].get('image_key', ''), [])) 
-                             if top_sources and top_sources[0].get('image_key') in token_maps else 
-                                Div("No token maps available", cls="text-zinc-400 mt-4 p-4")),
-                            
-                            cls="mt-4"
-                        ) if top_sources else ""),
+                        # Toggle button (dummy for now)
+                        Label(
+                            Input(type="checkbox", cls="toggle-checkbox"),
+                            Svg(
+                                NotStr('<g stroke-linejoin="round" stroke-linecap="round" stroke-width="4" fill="none" stroke="currentColor"><path d="M20 6 9 17l-5-5"></path></g>'),
+                                aria_label="enabled",
+                                xmlns="http://www.w3.org/2000/svg", 
+                                viewBox="0 0 24 24",
+                                cls="toggle-enabled"
+                            ),
+                            Svg(
+                                NotStr('<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'),
+                                aria_label="disabled",
+                                xmlns="http://www.w3.org/2000/svg", 
+                                viewBox="0 0 24 24",
+                                fill="none", 
+                                stroke="currentColor", 
+                                stroke_width="4",
+                                stroke_linecap="round", 
+                                stroke_linejoin="round",
+                                cls="toggle-disabled"
+                            ),
+                            cls="toggle text-base-content"
+                        ),
                         
-                        cls="bg-zinc-800 rounded-md p-6 w-full"
-                    )
-                ]
-                
-                # Success card with list of children elements that can be appended to
-                result_card = Div(
-                    *card_content,  # Unpack the list of components
-                    id=f"slide-{i}",
-                    cls="carousel-item relative w-full flex justify-center"
+                        cls="flex items-center mb-4"
+                    ),
+                    
+                    # Collapsible context section
+                    Div(
+                        # Collapse title
+                        Div(
+                            "View Context",
+                            cls="collapse-title font-semibold"
+                        ),
+                        
+                        # Collapse content
+                        Div(
+                            # Context document
+                            (Div(
+                                H4("Context Document", cls="text-lg font-semibold text-white mb-2"),
+                                try_read_pdf_image(top_source.get('image_key', '')),
+                                cls="mb-4"
+                            ) if top_source else ""),
+                            
+                            # Context paragraphs if available
+                            (Div(
+                                H4("Retrieved Context", cls="text-lg font-semibold text-white mb-2"),
+                                P(context_paragraphs[0] if context_paragraphs else "No context available", 
+                                  cls="text-white text-sm bg-zinc-700 p-3 rounded-md"),
+                                cls="mb-4"
+                            ) if context_paragraphs else ""),
+                            
+                            # Token map for "Classify" token
+                            (Div(
+                                H4("Token Similarity Map", cls="text-lg font-semibold text-white mb-2"),
+                                (Img(
+                                    src=f"/heatmap-image/{current_token_maps[0]['path']}" if current_token_maps else "",
+                                    cls="w-full max-h-80 object-contain rounded-md"
+                                ) if current_token_maps else 
+                                  Div("No token maps available", cls="text-zinc-400 text-center p-4")),
+                                cls="mb-4"
+                            ) if current_token_maps else ""),
+                            
+                            cls="collapse-content text-sm"
+                        ),
+                        
+                        tabindex="0",
+                        cls="bg-zinc-800 text-white focus:bg-zinc-700 collapse rounded-md",
+                    ),
+                    
+                    id=f"classification-section-{i}",
+                    cls=f"mb-6 {'hidden' if i > 0 else ''}"
                 )
-            
-            carousel_items.append(result_card)
-        
-        # Create the carousel navigation controls separately
-        if len(batch_results) > 1:
-            for i in range(len(carousel_items)):
-                prev_idx = (i - 1) % len(batch_results)
-                next_idx = (i + 1) % len(batch_results)
-                
-                # Add navigation buttons - FIX: Add as an additional component to Div's children
-                nav_controls = Div(
-                    A("❮", href=f"#slide-{prev_idx}", 
-                      cls="btn btn-circle btn-outline"),
-                    A("❯", href=f"#slide-{next_idx}", 
-                      cls="btn btn-circle btn-outline"),
-                    cls="absolute flex justify-between transform -translate-y-1/2 left-5 right-5 top-1/2"
+            else:
+                # Simplified section when no context is available
+                context_section = Div(
+                    # Classification badge only
+                    Div(
+                        classification,
+                        cls=f"badge {badge_color} text-lg p-3"
+                    ),
+                    id=f"classification-section-{i}",
+                    cls=f"mb-6 {'hidden' if i > 0 else ''}"
                 )
                 
-                # Recreate the carousel item with navigation controls included
-                item = carousel_items[i]
-                new_item = Div(
-                    *item.children,  # Existing children
-                    nav_controls,    # Add navigation controls
-                    id=item.id,
-                    cls=item.cls
-                )
-                carousel_items[i] = new_item
+            classification_sections.append(context_section)
         
         # Create the complete carousel component
         return Div(
-            H2("Batch Analysis Results", cls="text-2xl font-bold text-white mb-4 text-center"),
+            H2("Insect Classification Results", cls="text-2xl font-bold text-white mb-4 text-center"),
             
-            # Carousel container
+            # Main carousel container with images
             Div(
                 *carousel_items,
-                cls="carousel w-full max-w-5xl rounded-lg overflow-hidden"
+                cls="carousel w-full rounded-lg overflow-hidden mb-4"
             ),
             
-            # Pagination dots for larger batches
-            (Div(
-                *[A(str(i+1), href=f"#slide-{i}", 
-                   cls="btn btn-xs rounded-full mr-1 " + 
-                       ("btn-primary" if i == 0 else "btn-outline")) 
-                  for i in range(len(batch_results))],
-                cls="flex justify-center w-full py-4 gap-1"
-            ) if len(batch_results) > 3 else ""),
+            # Carousel indicators
+            Div(
+                *carousel_indicators,
+                cls="flex justify-center w-full gap-2 py-2"
+            ),
+            
+            # Classification sections container
+            Div(
+                *classification_sections,
+                id="classification-sections",
+                cls="mt-4"
+            ),
             
             # Process another batch button
             Div(
                 Button(
-                    "Process Another Batch",
+                    "Classify More Insects",
                     hx_get="/batch-upload",
                     hx_target="#main-content",
-                    cls="btn btn-secondary w-full max-w-xs"
+                    cls="btn btn-warning w-full max-w-xs"
                 ),
                 cls="mt-8 text-center w-full"
             ),
             
-            # Script to handle carousel navigation
+            # JavaScript to handle carousel navigation and show appropriate classification section
             Script("""
             document.addEventListener('DOMContentLoaded', function() {
-                // Highlight current slide in pagination
-                const updateActiveDot = function() {
+                // Function to show the right classification section based on active carousel item
+                const updateClassificationSection = function() {
                     const id = window.location.hash.substring(1);
                     if (!id) return;
                     
-                    document.querySelectorAll('[href^="#slide-"]').forEach(dot => {
-                        if (dot.getAttribute('href') === '#' + id) {
-                            dot.classList.add('btn-primary');
-                            dot.classList.remove('btn-outline');
+                    // Get the index from the item id (item1, item2, etc.)
+                    const index = parseInt(id.replace('item', '')) - 1;
+                    
+                    // Hide all classification sections
+                    document.querySelectorAll('[id^="classification-section-"]').forEach(section => {
+                        section.classList.add('hidden');
+                    });
+                    
+                    // Show the corresponding section
+                    const currentSection = document.getElementById(`classification-section-${index}`);
+                    if (currentSection) {
+                        currentSection.classList.remove('hidden');
+                    }
+                    
+                    // Update active indicator
+                    document.querySelectorAll('[href^="#item"]').forEach(indicator => {
+                        if (indicator.getAttribute('href') === '#' + id) {
+                            indicator.classList.add('btn-active');
                         } else {
-                            dot.classList.remove('btn-primary');
-                            dot.classList.add('btn-outline');
+                            indicator.classList.remove('btn-active');
                         }
                     });
                 };
                 
                 // Listen for hash changes
-                window.addEventListener('hashchange', updateActiveDot);
+                window.addEventListener('hashchange', updateClassificationSection);
                 
-                // Initial update
-                updateActiveDot();
+                // Initial update - if no hash, set to first item
+                if (!window.location.hash) {
+                    window.location.hash = 'item1';
+                } else {
+                    updateClassificationSection();
+                }
             });
             """),
             
@@ -1440,7 +1458,7 @@ def serve_fasthtml():
                 # Display as embedded base64 image
                 return Img(
                     src=f"data:{media_type};base64,{base64_img}",
-                    cls="mx-auto max-h-64 rounded-lg border border-zinc-700"
+                    cls="mx-auto max-h-96 w-full object-contain rounded-lg border border-zinc-700"
                 )
             else:
                 # Try to find any image with the same analysis ID prefix
@@ -1471,7 +1489,7 @@ def serve_fasthtml():
                             
                             return Img(
                                 src=f"data:{media_type};base64,{base64_img}",
-                                cls="mx-auto max-h-64 rounded-lg border border-zinc-700"
+                                cls="mx-auto max-h-96 w-full object-contain rounded-lg border border-zinc-700"
                             )
                 
                 # If all fails, show placeholder
@@ -1487,121 +1505,6 @@ def serve_fasthtml():
                 P(f"Error displaying image: {str(e)}", cls="text-red-500 text-center"),
                 cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
             )
-
-    def chat_message(msg_idx, messages):
-        msg = messages[msg_idx]
-        # Improved content class to better handle long messages
-        content_cls = f"px-2.5 py-1.5 rounded-lg max-w-lg {'rounded-br-none border-green-700 border' if msg['role'] == 'user' else 'rounded-bl-none border-zinc-400 border'}"
-        
-        # Log the message content for debugging
-        logging.info(f"Rendering message {msg_idx} from {msg['role']}: {msg['content'][:100]}...")
-        
-        return Div(
-            Div(msg["role"], cls="text-xs text-zinc-500 mb-1"),
-            Div(
-                msg["content"],
-                # Updated styling to handle long text better
-                cls=f"bg-{'green-600 text-white' if msg['role'] == 'user' else 'zinc-200 text-black'} {content_cls} whitespace-pre-wrap break-words",
-                id=f"msg-content-{msg_idx}",
-            ),
-            id=f"msg-{msg_idx}",
-            cls=f"self-{'end' if msg['role'] == 'user' else 'start'} max-w-[85%]",
-        )
-
-    def token_maps_ui(image_key, heatmaps):
-        """Create token map UI with tabs and display area"""
-        if not heatmaps:
-            return Div("No token maps available", cls="text-zinc-400 text-center")
-            
-        # Create a list of button elements first
-        tab_buttons = []
-        
-        # Create the tabs
-        for i, heatmap in enumerate(heatmaps):
-            token_class = "btn btn-sm token-tab " + ("btn-primary active" if i == 0 else "btn-outline")
-            token_tab = Button(
-                heatmap['token'],
-                cls=token_class,
-                hx_get=f"/token-map/{image_key}/{heatmap['token_idx']}",
-                hx_target="#token-map-display",
-                hx_swap="innerHTML",
-                id=f"token-tab-{i}"
-            )
-            # Add the button to our list
-            tab_buttons.append(token_tab)
-        
-        # Create token tabs Div with all buttons at once
-        token_tabs = Div(*tab_buttons, cls="flex flex-wrap gap-2 mb-4")
-        
-        # Create the full token maps container
-        return Div(
-            H3("Token Similarity Maps", cls="text-xl font-semibold text-white mb-2"),
-            P("See how the model focuses on different parts of the context document for each word in the query:", 
-              cls="text-zinc-300 mb-3"),
-            
-            # Token tabs navigation - using our complete Div with all buttons
-            token_tabs,
-            
-            # Token map display area
-            Div(
-                Div("Select a token above to see its heatmap", cls="text-zinc-400 text-center py-8"),
-                id="token-map-display",
-                cls="w-full bg-zinc-700 rounded-md overflow-hidden"
-            ),
-            
-            # JavaScript to handle tab interaction
-            Script('''
-            document.addEventListener('htmx:afterSwap', function() {
-                if (document.getElementById('token-tab-0')) {
-                    setTimeout(function() {
-                        document.getElementById('token-tab-0').click();
-                    }, 300);
-                }
-            });
-            
-            document.addEventListener('htmx:afterRequest', function(evt) {
-                if (evt.detail.target && evt.detail.target.id === 'token-map-display') {
-                    // Remove active class from all tabs
-                    document.querySelectorAll('[id^="token-tab-"]').forEach(function(tab) {
-                        tab.classList.remove('btn-primary', 'active');
-                        tab.classList.add('btn-outline');
-                    });
-                    
-                    // Add active class to clicked tab
-                    if (evt.detail.requestConfig.triggeringElement) {
-                        evt.detail.requestConfig.triggeringElement.classList.remove('btn-outline');
-                        evt.detail.requestConfig.triggeringElement.classList.add('btn-primary', 'active');
-                    }
-                }
-            });
-            '''),
-            
-            cls="mt-6"
-        )
-
-    def context_document_ui(top_source):
-        """Create UI for displaying the context document"""
-        if not top_source:
-            return Div("No context document available", cls="text-zinc-400 text-center")
-            
-        # Get document info
-        image_key = top_source['image_key']
-        score = top_source.get('score', 0.0)
-        
-        # Create the document display
-        return Div(
-            H3("Context Document", cls="text-xl font-semibold text-white mb-2"),
-            P(f"The AI is using this document to help analyze your image (Score: {score:.2f}):", 
-              cls="text-zinc-300 mb-3"),
-            
-            # Document image - embed directly as base64
-            Div(
-                try_read_pdf_image(image_key),
-                cls="w-full mb-4"
-            ),
-            
-            cls="context-container mt-6"
-        )
 
     # Helper function to read PDF images directly
     def try_read_pdf_image(image_key):
@@ -1659,120 +1562,8 @@ def serve_fasthtml():
                 cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
             )
 
-    def analysis_results_ui(image_path, qwen_response, context_paragraphs, top_sources, token_maps, analysis_id):
-        """Create UI to display analysis results with context and token maps"""
-        
-        # Get the image filename for the UI
-        image_filename = os.path.basename(image_path)
-        
-        # Check if the file exists, log info about it
-        if os.path.exists(image_path):
-            logging.info(f"Image exists for UI: {image_path}, size: {os.path.getsize(image_path)} bytes")
-        else:
-            logging.error(f"Image does not exist for UI: {image_path}")
-        
-        # Context section
-        context_ui = None
-        if top_sources and context_paragraphs:
-            top_source = top_sources[0]
-            context_text = context_paragraphs[0] if context_paragraphs else ""
-            
-            context_ui = Div(
-                H3("Retrieved Context", cls="text-lg font-semibold text-white mb-2"),
-                
-                # Context container
-                Div(
-                    Div("The AI used this information to enhance its analysis:", cls="context-header"),
-                    P(context_text, cls="text-white text-sm"),
-                    cls="context-container"
-                ),
-                
-                # Context document display
-                context_document_ui(top_source),
-                
-                cls="mb-6"
-            )
-        
-        # Token maps section - with improved error handling
-        token_maps_section = None
-        if top_sources and token_maps and len(top_sources) > 0:
-            try:
-                top_source = top_sources[0]
-                image_key = top_source.get('image_key')
-                
-                if image_key and image_key in token_maps and token_maps[image_key]:
-                    token_maps_section = token_maps_ui(image_key, token_maps[image_key])
-            except Exception as e:
-                logging.error(f"Error rendering token maps: {e}")
-                token_maps_section = Div(
-                    H3("Token Similarity Maps", cls="text-xl font-semibold text-white mb-2"),
-                    P(f"Error displaying token maps: {str(e)}", cls="text-red-500"),
-                    cls="bg-zinc-800 p-4 rounded-md"
-                )
-        
-        if token_maps_section is None:
-            token_maps_section = Div(
-                H3("Token Similarity Maps", cls="text-xl font-semibold text-white mb-2"),
-                P("No token maps available for this analysis.", cls="text-zinc-400"),
-                cls="bg-zinc-800 p-4 rounded-md"
-            )
-        
-        return Div(
-            H2("Analysis Results", cls="text-2xl font-bold text-white mb-4"),
-            
-            # Results layout - side by side for larger screens
-            Div(
-                # Left side - image & analysis text
-                Div(
-                    # Display the original image - Read the file directly instead of using a URL
-                    Div(
-                        H3("Uploaded Image", cls="text-xl font-semibold text-white mb-2"),
-                        try_read_image(image_path),  # Use our custom function to get the image
-                        cls="mb-6"
-                    ),
-                    
-                    # Display Qwen's response
-                    Div(
-                        H3("AI Analysis", cls="text-xl font-semibold text-white mb-2"),
-                        Div(
-                            qwen_response,
-                            cls="bg-zinc-700 rounded-md p-4 text-white"
-                        ),
-                        cls="mb-6"
-                    ),
-                    
-                    # Display context if available
-                    context_ui if context_ui else "",
-                    
-                    cls="lg:w-1/2 lg:pr-4 mb-6 lg:mb-0"
-                ),
-                
-                # Right side - token maps (with error handling)
-                Div(
-                    token_maps_section,
-                    cls="lg:w-1/2 lg:pl-4"
-                ),
-                
-                cls="flex flex-col lg:flex-row w-full"
-            ),
-            
-            # Button to start over
-            Div(
-                Button(
-                    "Analyze Another Image",
-                    hx_get="/",
-                    hx_target="#main-content",
-                    cls="btn btn-secondary w-full max-w-xs"
-                ),
-                cls="mt-8 text-center w-full"
-            ),
-            
-            id="analysis-results",
-            cls="w-full max-w-2xl bg-zinc-800 rounded-md p-6 fade-in"
-        )
-
     # BATCH PROCESSING ROUTES
-    # Make this the default route
+    # Updated main route function
     @rt("/")
     def get(session):
         if 'session_id' not in session:
@@ -1781,22 +1572,22 @@ def serve_fasthtml():
         logging.info(f"New session: {session['session_id']} - showing batch upload form")
         
         return (
-            Title("Batch Image Analysis"),
+            Title("Insect Classification"),
             Main(
                 # Loading indicator with better visibility
                 Div(
-                    Div(cls="loading loading-spinner loading-lg text-primary"),
-                    Div("Processing your images...", cls="text-white mt-4 text-lg"),
+                    Div(cls="loading loading-spinner loading-lg text-warning"),
+                    Div("Processing your insect images...", cls="text-white mt-4 text-lg"),
                     id="loading-indicator",
                     cls="htmx-indicator fixed top-0 left-0 w-full h-full bg-black bg-opacity-80 flex flex-col items-center justify-center z-50"
                 ),
                 
                 # Page header 
-                H1("Batch Image Analysis", cls="text-3xl font-bold mb-4 text-white"),
+                H1("Insect Classifier", cls="text-3xl font-bold mb-4 text-white"),
                 
                 # Header info
                 Div(
-                    P("Upload multiple insect or species images for batch analysis", 
+                    P("Upload insect images for instant AI classification", 
                       cls="text-white text-center mb-6"),
                     cls="w-full max-w-2xl"
                 ),
@@ -1825,169 +1616,10 @@ def serve_fasthtml():
         logging.info(f"Showing batch upload form for session: {session['session_id']}")
         return batch_upload_form()
 
-    # Process uploaded image (for single image analysis)
-    @rt("/process-image", methods=["POST"])
-    async def process_image(request: Request):
-        form = await request.form()
-        
-        # Directly access the form data for more reliable handling
-        image_file = form.get("image")
-        analysis_type = form.get("analysis_type", "classify_insect")
-        
-        # Generate unique ID for this analysis
-        analysis_id = str(uuid.uuid4())
-        
-        if not image_file:
-            return Div("No image file uploaded", cls="text-red-500")
-        
-        logging.info(f"Image uploaded: {getattr(image_file, 'filename', 'unknown')}, Analysis type: {analysis_type}, ID: {analysis_id}")
-        
-        # Create a temporary path to save the image
-        os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
-        filename = getattr(image_file, 'filename', f"image_{analysis_id}.jpg")
-        # Make sure we have a clean filename with no spaces or special characters
-        safe_filename = "".join(c for c in filename if c.isalnum() or c in "._-")
-        if safe_filename != filename:
-            logging.info(f"Sanitized filename from '{filename}' to '{safe_filename}'")
-            filename = safe_filename
-        
-        image_path = os.path.join(TEMP_UPLOAD_DIR, f"{analysis_id}_{filename}")
-        
-        # Save the uploaded image
-        logging.info(f"Saving image to {image_path}")
-        try:
-            # Read the content of the uploaded file
-            content = await image_file.read()
-            with open(image_path, "wb") as f:
-                f.write(content)
-
-            bee_volume.commit()
-            
-            # Verify the file was saved
-            if os.path.exists(image_path):
-                file_size = os.path.getsize(image_path)
-                logging.info(f"Image saved successfully: {image_path} (size: {file_size} bytes)")
-            else:
-                logging.error(f"Failed to save image, file doesn't exist: {image_path}")
-                return Div(f"Error saving image: File doesn't exist after write operation", cls="text-red-500")
-        except Exception as e:
-            logging.error(f"Error saving image: {e}")
-            import traceback
-            traceback.print_exc()
-            return Div(f"Error saving image: {str(e)}", cls="text-red-500")
-        
-        # Open the image for processing
-        try:
-            image = Image.open(image_path)
-            logging.info(f"Image opened: {image.size}, {image.mode}")
-        except Exception as e:
-            logging.error(f"Error opening image: {e}")
-            import traceback
-            traceback.print_exc()
-            return Div(f"Error opening image: {str(e)}", cls="text-red-500")
-        
-        # Get the appropriate query based on analysis type
-        query = get_query_for_analysis(analysis_type)
-        logging.info(f"Using query: {query}")
-        
-        # Save analysis to database
-        try:
-            # Use direct SQLite for more reliable database operations
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO image_analyses (analysis_id, image_path, analysis_type, query) VALUES (?, ?, ?, ?)",
-                (analysis_id, image_path, analysis_type, query)
-            )
-            conn.commit()
-            conn.close()
-            logging.info(f"Analysis record created in database: {analysis_id}")
-        except Exception as db_error:
-            logging.error(f"Database error: {db_error}")
-            import traceback
-            traceback.print_exc()
-        
-        # Retrieve relevant documents for context
-        retrieved_paragraphs, top_sources = await retrieve_relevant_documents(query)
-        
-        if not top_sources:
-            logging.warning("No relevant documents found for context")
-        else:
-            logging.info(f"Found {len(top_sources)} relevant documents, top score: {top_sources[0].get('score', 0)}")
-        
-        # Generate context text
-        context_text = "\n\n".join(retrieved_paragraphs) if retrieved_paragraphs else ""
-        
-        # Generate similarity maps for top document
-        token_maps = {}
-        if top_sources:
-            top_source = top_sources[0]
-            image_key = top_source.get('image_key')
-            
-            if image_key:
-                logging.info(f"Generating similarity maps for image key: {image_key}")
-                
-                # Update database with context source if column exists
-                try:
-                    conn = sqlite3.connect(db_path)
-                    cursor = conn.cursor()
-                    # Check if the column exists first
-                    cursor.execute("PRAGMA table_info(image_analyses)")
-                    columns = [column[1] for column in cursor.fetchall()]
-                    if 'context_source' in columns:
-                        cursor.execute(
-                            "UPDATE image_analyses SET context_source = ? WHERE analysis_id = ?",
-                            (f"{top_source['filename']} (page {top_source['page']})", analysis_id)
-                        )
-                        conn.commit()
-                    conn.close()
-                except Exception as db_error:
-                    logging.error(f"Database error updating context source: {db_error}")
-                
-                # Generate token maps
-                image_heatmaps = await generate_similarity_maps(query, image_key)
-                if image_heatmaps:
-                    logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
-                    token_maps[image_key] = image_heatmaps
-                else:
-                    logging.warning(f"No token heatmaps generated for {image_key}")
-            else:
-                logging.warning("Top source missing image_key")
-        
-        # Process with Mistral (using our improved function)
-        mistral_response = await process_with_mistral(image, query, context_text, analysis_id)
-        
-        # Update database with response
-        try:
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE image_analyses SET response = ? WHERE analysis_id = ?",
-                (mistral_response, analysis_id)
-            )
-            conn.commit()
-            conn.close()
-            logging.info(f"Updated analysis record with response: {analysis_id}")
-        except Exception as db_error:
-            logging.error(f"Database error updating response: {db_error}")
-        
-        # Add a log just before returning UI
-        logging.info(f"Rendering UI with: image={os.path.basename(image_path)}, token_maps={len(token_maps)}, top_sources={len(top_sources)}")
-        
-        # Return the analysis results UI
-        return analysis_results_ui(
-            image_path=image_path, 
-            qwen_response=mistral_response,
-            context_paragraphs=retrieved_paragraphs,
-            top_sources=top_sources, 
-            token_maps=token_maps, 
-            analysis_id=analysis_id
-        )
-
     # Process batch of images
     @rt("/process-batch", methods=["POST"])
     async def process_batch(request: Request):
-        """Process a batch of uploaded images"""
+        """Process a batch of uploaded images for insect classification"""
         form = await request.form()
         
         # Extract all uploaded images
@@ -2004,15 +1636,13 @@ def serve_fasthtml():
         image_files = image_files[:10]
         
         if not image_files:
-            return Div("No images uploaded", cls="text-red-500 text-center p-4")
+            return Div("No insect images uploaded", cls="text-red-500 text-center p-4")
         
-        logging.info(f"Processing batch of {len(image_files)} images")
+        logging.info(f"Processing batch of {len(image_files)} insect images")
         
-        analysis_type = form.get("analysis_type", "classify_insect")
+        # Set the query for insect classification
+        query = "Classify this insect"
         share_context = form.get("share_context", "false") == "true"
-        
-        # Get the appropriate query based on analysis type
-        query = get_query_for_analysis(analysis_type)
         logging.info(f"Using query: {query}, Share context: {share_context}")
         
         # For shared context, retrieve documents once
@@ -2045,7 +1675,7 @@ def serve_fasthtml():
                 safe_filename = "".join(c for c in filename if c.isalnum() or c in "._-")
                 image_path = os.path.join(TEMP_UPLOAD_DIR, f"{analysis_id}_{safe_filename}")
                 
-                logging.info(f"Processing image {i+1}/{len(image_files)}: {filename} → {image_path}")
+                logging.info(f"Processing insect image {i+1}/{len(image_files)}: {filename} → {image_path}")
                 
                 # Save the uploaded image
                 content = await image_file.read()
@@ -2061,10 +1691,10 @@ def serve_fasthtml():
                 
                 # Get context - either shared or unique per image
                 if not share_context:
-                    logging.info(f"Retrieving unique context for image {i+1}")
+                    logging.info(f"Retrieving unique context for insect image {i+1}")
                     retrieved_paragraphs, top_sources = await retrieve_relevant_documents(query)
                 else:
-                    logging.info(f"Using shared context for image {i+1}")
+                    logging.info(f"Using shared context for insect image {i+1}")
                     retrieved_paragraphs, top_sources = shared_context, shared_top_sources
                 
                 # Generate context text
@@ -2087,19 +1717,19 @@ def serve_fasthtml():
                         # Reuse existing token maps
                         image_token_maps[image_key] = token_maps_by_image[image_key]
                 
-                # Process with Mistral - FIX: Store the response in a variable
-                logging.info(f"Processing image {i+1} with Mistral")
+                # Process with Mistral using insect classification system prompt
+                logging.info(f"Processing insect image {i+1} with Mistral")
                 response_text = await process_with_mistral(image, query, context_text, analysis_id)
                 
-                # Save to database - FIX: Use the correct variable name
+                # Save to database
                 try:
                     conn = sqlite3.connect(db_path)
                     cursor = conn.cursor()
                     
-                    # Insert basic info - FIX: Use response_text instead of mistral_response
+                    # Insert basic info
                     cursor.execute(
                         "INSERT INTO image_analyses (analysis_id, image_path, analysis_type, query, response) VALUES (?, ?, ?, ?, ?)",
-                        (analysis_id, image_path, analysis_type, query, response_text)
+                        (analysis_id, image_path, "insect_classification", query, response_text)
                     )
                     
                     # Add context source if available
@@ -2120,9 +1750,9 @@ def serve_fasthtml():
                     conn.close()
                     logging.info(f"Saved analysis {analysis_id} to database")
                 except Exception as db_error:
-                    logging.error(f"Database error for image {i+1}: {db_error}")
+                    logging.error(f"Database error for insect image {i+1}: {db_error}")
                 
-                # Add to batch results - FIX: Use response_text instead of mistral_response
+                # Add to batch results
                 batch_results.append({
                     "analysis_id": analysis_id,
                     "image_path": image_path,
@@ -2133,7 +1763,7 @@ def serve_fasthtml():
                 })
                 
             except Exception as e:
-                logging.error(f"Error processing image {i+1}: {e}")
+                logging.error(f"Error processing insect image {i+1}: {e}")
                 import traceback
                 traceback.print_exc()
                 
