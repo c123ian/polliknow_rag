@@ -486,25 +486,46 @@ def serve_fasthtml():
         if 'colpali_model' not in globals() or colpali_model is None:
             logging.info(f"Loading ColQwen2 model...")
             try:
-                # First try to find model in volume
-                model_path = os.path.join(COLQWEN_MODELS_DIR, os.path.basename(DEFAULT_COLQWEN_NAME))
-                if os.path.exists(model_path) and os.path.isdir(model_path):
-                    logging.info(f"Using local model from volume: {model_path}")
+                # First check if files exist directly in the volume root
+                model_files_in_root = False
+                volume_root = COLQWEN_MODELS_DIR
+                required_files = ["tokenizer.json", "adapter_model.safetensors", "special_tokens_map.json"]
+                
+                if os.path.exists(volume_root):
+                    root_files = os.listdir(volume_root)
+                    if all(file in root_files for file in required_files):
+                        model_files_in_root = True
+                        logging.info(f"Found model files directly in volume root: {volume_root}")
+                
+                if model_files_in_root:
+                    # Use volume root directly as model path
+                    logging.info(f"Using local model from volume root: {volume_root}")
                     colpali_model = ColQwen2.from_pretrained(
-                        model_path,
+                        volume_root,
                         torch_dtype=torch.bfloat16,
                         device_map="cuda" if torch.cuda.is_available() else "cpu"
                     ).eval()
-                    colpali_processor = ColQwen2Processor.from_pretrained(model_path)
+                    colpali_processor = ColQwen2Processor.from_pretrained(volume_root)
                 else:
-                    # Fall back to HuggingFace download
-                    logging.info(f"Model not found in volume, downloading from HuggingFace: {DEFAULT_COLQWEN_NAME}")
-                    colpali_model = ColQwen2.from_pretrained(
-                        DEFAULT_COLQWEN_NAME,
-                        torch_dtype=torch.bfloat16,
-                        device_map="cuda" if torch.cuda.is_available() else "cpu"
-                    ).eval()
-                    colpali_processor = ColQwen2Processor.from_pretrained(DEFAULT_COLQWEN_NAME)
+                    # Check for subdirectory structure
+                    model_path = os.path.join(COLQWEN_MODELS_DIR, os.path.basename(DEFAULT_COLQWEN_NAME))
+                    if os.path.exists(model_path) and os.path.isdir(model_path):
+                        logging.info(f"Using local model from volume subdirectory: {model_path}")
+                        colpali_model = ColQwen2.from_pretrained(
+                            model_path,
+                            torch_dtype=torch.bfloat16,
+                            device_map="cuda" if torch.cuda.is_available() else "cpu"
+                        ).eval()
+                        colpali_processor = ColQwen2Processor.from_pretrained(model_path)
+                    else:
+                        # Fall back to HuggingFace download
+                        logging.info(f"Model not found in volume, downloading from HuggingFace: {DEFAULT_COLQWEN_NAME}")
+                        colpali_model = ColQwen2.from_pretrained(
+                            DEFAULT_COLQWEN_NAME,
+                            torch_dtype=torch.bfloat16,
+                            device_map="cuda" if torch.cuda.is_available() else "cpu"
+                        ).eval()
+                        colpali_processor = ColQwen2Processor.from_pretrained(DEFAULT_COLQWEN_NAME)
                 
                 logging.info(f"ColQwen2 model loaded successfully on device: {colpali_model.device}")
                 return True
@@ -941,8 +962,34 @@ def serve_fasthtml():
             image_path = page_images[image_key]
             if not os.path.exists(image_path):
                 logging.error(f"Image file not found: {image_path}")
-                return []
                 
+                # Try to find the image by reconstructing path patterns
+                parts = image_key.split('_')
+                if len(parts) >= 2:
+                    filename = '_'.join(parts[:-1])
+                    page_num = parts[-1]
+                    
+                    # Log all these details for debugging
+                    logging.info(f"Trying to find image for key: {image_key}")
+                    logging.info(f"Parsed filename: {filename}, page: {page_num}")
+                    
+                    # Check different potential locations
+                    potential_paths = [
+                        os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                        os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
+                        os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
+                    ]
+                    
+                    for potential_path in potential_paths:
+                        logging.info(f"Checking potential path: {potential_path}")
+                        if os.path.exists(potential_path):
+                            logging.info(f"Found image at: {potential_path}")
+                            image_path = potential_path
+                            break
+                
+                if not os.path.exists(image_path):
+                    return []
+                    
             # Load the image
             image = Image.open(image_path)
             
@@ -962,6 +1009,10 @@ def serve_fasthtml():
                 spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
             )
             
+            # Log patch info for debugging
+            logging.info(f"Image size: {image.size}, Patch size: {colpali_model.patch_size}")
+            logging.info(f"Number of patches: {n_patches}")
+            
             # Get image mask
             image_mask = colpali_processor.get_image_mask(batch_images)
             
@@ -976,52 +1027,97 @@ def serve_fasthtml():
             # Get the similarity map for this image
             similarity_maps = batched_similarity_maps[0]  # (query_length, n_patches_x, n_patches_y)
             
+            # Log similarity maps shape for debugging
+            logging.info(f"Generated similarity maps with shape: {similarity_maps.shape}")
+            
             # Get tokens for the query
             query_tokens = colpali_processor.tokenizer.tokenize(query)
+            logging.info(f"Query tokens: {query_tokens}")
             
-            # Find the 'Classify' token - hardcoded as specified
+            # Try multiple approaches to find a token for mapping
+            
+            # First approach: Find the 'Classify' token
             classify_token_idx = -1
             for token_idx, token in enumerate(query_tokens):
-                token_display = token[1:] if token.startswith("▁") else token
+                token_display = token.replace("Ġ", "").replace("▁", "")
                 if "Classify" in token_display:
                     classify_token_idx = token_idx
+                    logging.info(f"Found 'Classify' token at index {classify_token_idx}: {token}")
                     break
             
-            # If 'Classify' token not found, use the first token as fallback
+            # Second approach: If no 'Classify' token, use token with 'insect'
+            if classify_token_idx == -1:
+                for token_idx, token in enumerate(query_tokens):
+                    token_display = token.replace("Ġ", "").replace("▁", "")
+                    if "insect" in token_display.lower():
+                        classify_token_idx = token_idx
+                        logging.info(f"Found 'insect' token at index {classify_token_idx}: {token}")
+                        break
+            
+            # Third approach: If still not found, use the first non-prefix token
+            if classify_token_idx == -1 and len(query_tokens) > 0:
+                for token_idx, token in enumerate(query_tokens):
+                    if not token.startswith("Ġ") and not token.startswith("▁"):
+                        classify_token_idx = token_idx
+                        logging.info(f"Using first non-prefix token at index {classify_token_idx}: {token}")
+                        break
+            
+            # Last resort: Use the first token
             if classify_token_idx == -1 and len(query_tokens) > 0:
                 classify_token_idx = 0
+                logging.info(f"Using first token as fallback at index 0: {query_tokens[0]}")
             
-            # Generate only one token map for 'Classify'
+            # Generate multiple token maps including 'Classify' and first few tokens
             image_heatmaps = []
-            if classify_token_idx >= 0 and classify_token_idx < similarity_maps.shape[0]:
-                token = query_tokens[classify_token_idx]
-                score = similarity_maps[classify_token_idx].max().item()
-                
-                # Generate heatmap
-                fig, ax = plot_similarity_map(
-                    image=image,
-                    similarity_map=similarity_maps[classify_token_idx],
-                    figsize=(8, 8),
-                    show_colorbar=False,
-                )
-                
-                # Clean token for display
-                token_display = token[1:] if token.startswith("▁") else token
-                ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
-                
-                # Save heatmap
-                heatmap_filename = f"{image_key}_token_{classify_token_idx}.png"
-                heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
-                fig.savefig(heatmap_path, bbox_inches='tight')
-                plt.close(fig)
-                
-                # Add to list
-                image_heatmaps.append({
-                    "token": token_display,
-                    "score": score,
-                    "path": heatmap_filename,
-                    "token_idx": classify_token_idx
-                })
+            tokens_to_map = set()
+            
+            # Always include the 'Classify' token if found
+            if classify_token_idx >= 0:
+                tokens_to_map.add(classify_token_idx)
+            
+            # Include first few tokens as backup
+            for i in range(min(3, len(query_tokens))):
+                tokens_to_map.add(i)
+            
+            # Create directory if it doesn't exist
+            os.makedirs(HEATMAP_DIR, exist_ok=True)
+            
+            # Generate maps for selected tokens
+            for token_idx in tokens_to_map:
+                if token_idx < similarity_maps.shape[0]:
+                    token = query_tokens[token_idx]
+                    score = similarity_maps[token_idx].max().item()
+                    
+                    # Generate heatmap
+                    fig, ax = plot_similarity_map(
+                        image=image,
+                        similarity_map=similarity_maps[token_idx],
+                        figsize=(8, 8),
+                        show_colorbar=False,
+                    )
+                    
+                    # Clean token for display
+                    token_display = token.replace("Ġ", "").replace("▁", "")
+                    ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
+                    
+                    # Save heatmap with both image_key and token index in filename
+                    heatmap_filename = f"{image_key}_token_{token_idx}.png"
+                    heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
+                    
+                    # Log save path for debugging
+                    logging.info(f"Saving heatmap to: {heatmap_path}")
+                    
+                    # Use a higher DPI for better quality
+                    fig.savefig(heatmap_path, bbox_inches='tight', dpi=150)
+                    plt.close(fig)
+                    
+                    # Add to list
+                    image_heatmaps.append({
+                        "token": token_display,
+                        "score": score,
+                        "path": heatmap_filename,
+                        "token_idx": token_idx
+                    })
             
             logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
             return image_heatmaps
@@ -1046,14 +1142,14 @@ def serve_fasthtml():
             
             # Create multimodal message format with insect classification prompt
             payload = {
-                "model": DEFAULT_MISTRAL_NAME,
-                "messages": [
-                    {"role": "system", "content": "You are an expert biologist, classify the insect in the image_url into ONE of these categories (bumblebee, honeybee, wasp, hoverfly, other flies, butterfly & moths, other insect) and refer to provided context_text to help you. After thinking provide the answer as a single word, for example 'Answer: honeybee'."},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": f"Classify this insect.\n\n{context_text if context_text else ''}"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
-                    ]}
-                ],
+            "model": DEFAULT_MISTRAL_NAME,
+            "messages": [
+                {"role": "system", "content": "You are an expert biologist. Classify the insect in the provided image into ONE of these categories (bumblebee, honeybee, wasp, hoverfly, other flies, butterfly & moths, other insect). Focus primarily on the visual characteristics in the image itself. Use any provided context as secondary information only. After analysis, provide the answer as a single word, for example 'Answer: honeybee'."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": f"Classify this insect.{' Additional reference information:' + context_text if context_text else ''}"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
+                ]}
+            ],
                 "max_tokens": 2000,
                 "temperature": 0.7,
                 "stream": False
@@ -1236,6 +1332,7 @@ def serve_fasthtml():
         
         for i, result in enumerate(batch_results):
             # Extract data again
+            analysis_id = result.get("analysis_id", f"result_{i}")
             response = result.get("response", "No response generated")
             context_paragraphs = result.get("context_paragraphs", [])
             top_sources = result.get("top_sources", [])
@@ -1256,8 +1353,11 @@ def serve_fasthtml():
                 # Get token maps for this image if available
                 current_token_maps = token_maps.get(image_key, [])
                 
+                # Create a unique modal ID for this result
+                modal_id = f"modal_{analysis_id}"
+                
                 context_section = Div(
-                    # Badge and toggle section
+                    # Badge and controls section
                     Div(
                         # Classification badge
                         Div(
@@ -1265,29 +1365,40 @@ def serve_fasthtml():
                             cls=f"badge {badge_color} text-lg p-3 mr-4"
                         ),
                         
-                        # Toggle button (dummy for now)
+                        # Replace toggle with swap component
                         Label(
-                            Input(type="checkbox", cls="toggle-checkbox"),
-                            Svg(
-                                NotStr('<g stroke-linejoin="round" stroke-linecap="round" stroke-width="4" fill="none" stroke="currentColor"><path d="M20 6 9 17l-5-5"></path></g>'),
-                                aria_label="enabled",
-                                xmlns="http://www.w3.org/2000/svg", 
-                                viewBox="0 0 24 24",
-                                cls="toggle-enabled"
+                            # Hidden checkbox still controls the state
+                            Input(type="checkbox"),
+                            # Swap-on shows when checked (thumbs down)
+                            Div("👎", cls="swap-on"),
+                            # Swap-off shows when unchecked (thumbs up)
+                            Div("👍", cls="swap-off"),
+                            cls="swap swap-flip text-3xl mx-2"
+                        ),
+                        
+                        # Add dialog modal button
+                        Button(
+                            "view raw output",
+                            onclick=f"{modal_id}.showModal()",
+                            cls="btn btn-sm btn-outline ml-2"
+                        ),
+                        
+                        # Add dialog modal
+                        Dialog(
+                            Div(
+                                H3("LLM Response", cls="text-lg font-bold"),
+                                P(response, cls="py-4 whitespace-pre-wrap text-sm font-mono bg-black p-2 rounded overflow-auto max-h-96"),
+                                Div(
+                                    Form(
+                                        Button("Close", cls="btn"),
+                                        method="dialog"
+                                    ),
+                                    cls="modal-action"
+                                ),
+                                cls="modal-box"
                             ),
-                            Svg(
-                                NotStr('<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'),
-                                aria_label="disabled",
-                                xmlns="http://www.w3.org/2000/svg", 
-                                viewBox="0 0 24 24",
-                                fill="none", 
-                                stroke="currentColor", 
-                                stroke_width="4",
-                                stroke_linecap="round", 
-                                stroke_linejoin="round",
-                                cls="toggle-disabled"
-                            ),
-                            cls="toggle text-base-content"
+                            id=modal_id,
+                            cls="modal"
                         ),
                         
                         cls="flex items-center mb-4"
@@ -1314,7 +1425,7 @@ def serve_fasthtml():
                             (Div(
                                 H4("Retrieved Context", cls="text-lg font-semibold text-white mb-2"),
                                 P(context_paragraphs[0] if context_paragraphs else "No context available", 
-                                  cls="text-white text-sm bg-zinc-700 p-3 rounded-md"),
+                                cls="text-white text-sm bg-zinc-700 p-3 rounded-md"),
                                 cls="mb-4"
                             ) if context_paragraphs else ""),
                             
@@ -1325,7 +1436,7 @@ def serve_fasthtml():
                                     src=f"/heatmap-image/{current_token_maps[0]['path']}" if current_token_maps else "",
                                     cls="w-full max-h-80 object-contain rounded-md"
                                 ) if current_token_maps else 
-                                  Div("No token maps available", cls="text-zinc-400 text-center p-4")),
+                                Div("No token maps available", cls="text-zinc-400 text-center p-4")),
                                 cls="mb-4"
                             ) if current_token_maps else ""),
                             
