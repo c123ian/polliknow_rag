@@ -1277,13 +1277,113 @@ def serve_fasthtml():
             classification = "error" if has_error else extract_classification(response)
             badge_color = get_badge_color(classification)
             
-            # Create carousel item for the image
+            # Create a unique modal ID for this result
+            modal_id = f"modal_{analysis_id}"
+            
+            # Create carousel item for the image WITH its classification elements
             carousel_items.append(
                 Div(
                     # Image display
                     try_read_image(image_path),
+                    
+                    # Classification elements directly under each image
+                    Div(
+                        # Badge and controls section
+                        Div(
+                            # Classification badge
+                            Div(
+                                classification,
+                                cls=f"badge {badge_color} text-lg p-3 mr-4"
+                            ),
+                            
+                            # Swap component
+                            Label(
+                                # Hidden checkbox controls the state
+                                Input(type="checkbox"),
+                                # Swap-on shows when checked (thumbs down)
+                                Div("👎", cls="swap-on"),
+                                # Swap-off shows when unchecked (thumbs up)
+                                Div("👍", cls="swap-off"),
+                                cls="swap swap-flip text-3xl mx-2"
+                            ),
+                            
+                            # View raw output modal button
+                            Button(
+                                "view raw output",
+                                onclick=f"{modal_id}.showModal()",
+                                cls="btn btn-sm btn-outline ml-2"
+                            ),
+                            
+                            # Add dialog modal
+                            Dialog(
+                                Div(
+                                    H3("LLM Response", cls="text-lg font-bold"),
+                                    P(response, cls="py-4 whitespace-pre-wrap text-sm font-mono bg-black p-2 rounded overflow-auto max-h-96"),
+                                    Div(
+                                        Form(
+                                            Button("Close", cls="btn"),
+                                            method="dialog"
+                                        ),
+                                        cls="modal-action"
+                                    ),
+                                    cls="modal-box"
+                                ),
+                                id=modal_id,
+                                cls="modal"
+                            ),
+                            
+                            cls="flex items-center mt-4 mb-2 justify-center"
+                        ),
+                        
+                        # Collapsible context section - only if context exists
+                        (Div(
+                            # Collapse title
+                            Div(
+                                "View Context",
+                                cls="collapse-title font-semibold"
+                            ),
+                            
+                            # Collapse content
+                            Div(
+                                # Context document
+                                (Div(
+                                    H4("Context Document", cls="text-lg font-semibold text-white mb-2"),
+                                    try_read_pdf_image(top_sources[0].get('image_key', '')),
+                                    cls="mb-4"
+                                ) if top_sources else ""),
+                                
+                                # Context paragraphs if available
+                                (Div(
+                                    H4("Retrieved Context", cls="text-lg font-semibold text-white mb-2"),
+                                    P(context_paragraphs[0] if context_paragraphs else "No context available", 
+                                    cls="text-white text-sm bg-zinc-700 p-3 rounded-md"),
+                                    cls="mb-4"
+                                ) if context_paragraphs else ""),
+                                
+                                # Token map
+                                (Div(
+                                    H4("Token Similarity Map", cls="text-lg font-semibold text-white mb-2"),
+                                    (Img(
+                                        src=f"/heatmap-image/{token_maps.get(top_sources[0].get('image_key', ''), [])[0]['path']}" 
+                                            if top_sources and token_maps.get(top_sources[0].get('image_key', ''), []) else "",
+                                        cls="w-full max-h-80 object-contain rounded-md"
+                                    ) if top_sources and token_maps.get(top_sources[0].get('image_key', ''), []) else 
+                                    Div("No token maps available", cls="text-zinc-400 text-center p-4")),
+                                    cls="mb-4"
+                                ) if top_sources and token_maps else ""),
+                                
+                                cls="collapse-content text-sm"
+                            ),
+                            
+                            tabindex="0",
+                            cls="bg-zinc-800 text-white focus:bg-zinc-700 collapse rounded-md",
+                        ) if top_sources else ""),
+                        
+                        cls="w-full px-4 pb-4"
+                    ),
+                    
                     id=f"item{i+1}",
-                    cls="carousel-item w-full"
+                    cls="carousel-item w-full flex flex-col"
                 )
             )
             
@@ -1296,148 +1396,11 @@ def serve_fasthtml():
                 )
             )
         
-        # Create the classification badges and context containers below the carousel
-        classification_sections = []
-        
-        for i, result in enumerate(batch_results):
-            # Extract data again
-            analysis_id = result.get("analysis_id", f"result_{i}")
-            response = result.get("response", "No response generated")
-            context_paragraphs = result.get("context_paragraphs", [])
-            top_sources = result.get("top_sources", [])
-            token_maps = result.get("token_maps", {})
-            has_error = result.get("error", False)
-            
-            # Extract the one-word classification
-            classification = "error" if has_error else extract_classification(response)
-            badge_color = get_badge_color(classification)
-            
-            # Create collapsible context section
-            context_section = Div()
-            
-            if top_sources and len(top_sources) > 0:
-                top_source = top_sources[0]
-                image_key = top_source.get('image_key', '')
-                
-                # Get token maps for this image if available
-                current_token_maps = token_maps.get(image_key, [])
-                
-                # Create a unique modal ID for this result
-                modal_id = f"modal_{analysis_id}"
-                
-                context_section = Div(
-                    # Badge and controls section
-                    Div(
-                        # Classification badge
-                        Div(
-                            classification,
-                            cls=f"badge {badge_color} text-lg p-3 mr-4"
-                        ),
-                        
-                        # Replace toggle with swap component
-                        Label(
-                            # Hidden checkbox still controls the state
-                            Input(type="checkbox"),
-                            # Swap-on shows when checked (thumbs down)
-                            Div("👎", cls="swap-on"),
-                            # Swap-off shows when unchecked (thumbs up)
-                            Div("👍", cls="swap-off"),
-                            cls="swap swap-flip text-3xl mx-2"
-                        ),
-                        
-                        # Add dialog modal button
-                        Button(
-                            "view raw output",
-                            onclick=f"{modal_id}.showModal()",
-                            cls="btn btn-sm btn-outline ml-2"
-                        ),
-                        
-                        # Add dialog modal
-                        Dialog(
-                            Div(
-                                H3("LLM Response", cls="text-lg font-bold"),
-                                P(response, cls="py-4 whitespace-pre-wrap text-sm font-mono bg-black p-2 rounded overflow-auto max-h-96"),
-                                Div(
-                                    Form(
-                                        Button("Close", cls="btn"),
-                                        method="dialog"
-                                    ),
-                                    cls="modal-action"
-                                ),
-                                cls="modal-box"
-                            ),
-                            id=modal_id,
-                            cls="modal"
-                        ),
-                        
-                        cls="flex items-center mb-4"
-                    ),
-                    
-                    # Collapsible context section
-                    Div(
-                        # Collapse title
-                        Div(
-                            "View Context",
-                            cls="collapse-title font-semibold"
-                        ),
-                        
-                        # Collapse content
-                        Div(
-                            # Context document
-                            (Div(
-                                H4("Context Document", cls="text-lg font-semibold text-white mb-2"),
-                                try_read_pdf_image(top_source.get('image_key', '')),
-                                cls="mb-4"
-                            ) if top_source else ""),
-                            
-                            # Context paragraphs if available
-                            (Div(
-                                H4("Retrieved Context", cls="text-lg font-semibold text-white mb-2"),
-                                P(context_paragraphs[0] if context_paragraphs else "No context available", 
-                                cls="text-white text-sm bg-zinc-700 p-3 rounded-md"),
-                                cls="mb-4"
-                            ) if context_paragraphs else ""),
-                            
-                            # Token map for "Classify" token
-                            (Div(
-                                H4("Token Similarity Map", cls="text-lg font-semibold text-white mb-2"),
-                                (Img(
-                                    src=f"/heatmap-image/{current_token_maps[0]['path']}" if current_token_maps else "",
-                                    cls="w-full max-h-80 object-contain rounded-md"
-                                ) if current_token_maps else 
-                                Div("No token maps available", cls="text-zinc-400 text-center p-4")),
-                                cls="mb-4"
-                            ) if current_token_maps else ""),
-                            
-                            cls="collapse-content text-sm"
-                        ),
-                        
-                        tabindex="0",
-                        cls="bg-zinc-800 text-white focus:bg-zinc-700 collapse rounded-md",
-                    ),
-                    
-                    id=f"classification-section-{i}",
-                    cls=f"mb-6 {'hidden' if i > 0 else ''}"
-                )
-            else:
-                # Simplified section when no context is available
-                context_section = Div(
-                    # Classification badge only
-                    Div(
-                        classification,
-                        cls=f"badge {badge_color} text-lg p-3"
-                    ),
-                    id=f"classification-section-{i}",
-                    cls=f"mb-6 {'hidden' if i > 0 else ''}"
-                )
-                
-            classification_sections.append(context_section)
-        
         # Create the complete carousel component
         return Div(
             H2("Insect Classification Results", cls="text-2xl font-bold text-white mb-4 text-center"),
             
-            # Main carousel container with images
+            # Main carousel container with images and their classification elements
             Div(
                 *carousel_items,
                 cls="carousel w-full rounded-lg overflow-hidden mb-4"
@@ -1447,13 +1410,6 @@ def serve_fasthtml():
             Div(
                 *carousel_indicators,
                 cls="flex justify-center w-full gap-2 py-2"
-            ),
-            
-            # Classification sections container
-            Div(
-                *classification_sections,
-                id="classification-sections",
-                cls="mt-4"
             ),
             
             # Process another batch button
@@ -1467,27 +1423,13 @@ def serve_fasthtml():
                 cls="mt-8 text-center w-full"
             ),
             
-            # JavaScript to handle carousel navigation and show appropriate classification section
+            # Simplified JavaScript - we no longer need to toggle sections visibility
             Script("""
             document.addEventListener('DOMContentLoaded', function() {
-                // Function to show the right classification section based on active carousel item
-                const updateClassificationSection = function() {
+                // Update active indicator on hash change
+                const updateActiveIndicator = function() {
                     const id = window.location.hash.substring(1);
                     if (!id) return;
-                    
-                    // Get the index from the item id (item1, item2, etc.)
-                    const index = parseInt(id.replace('item', '')) - 1;
-                    
-                    // Hide all classification sections
-                    document.querySelectorAll('[id^="classification-section-"]').forEach(section => {
-                        section.classList.add('hidden');
-                    });
-                    
-                    // Show the corresponding section
-                    const currentSection = document.getElementById(`classification-section-${index}`);
-                    if (currentSection) {
-                        currentSection.classList.remove('hidden');
-                    }
                     
                     // Update active indicator
                     document.querySelectorAll('[href^="#item"]').forEach(indicator => {
@@ -1500,13 +1442,13 @@ def serve_fasthtml():
                 };
                 
                 // Listen for hash changes
-                window.addEventListener('hashchange', updateClassificationSection);
+                window.addEventListener('hashchange', updateActiveIndicator);
                 
                 // Initial update - if no hash, set to first item
                 if (!window.location.hash) {
                     window.location.hash = 'item1';
                 } else {
-                    updateClassificationSection();
+                    updateActiveIndicator();
                 }
             });
             """),
@@ -1514,7 +1456,22 @@ def serve_fasthtml():
             id="batch-results",
             cls="w-full flex flex-col items-center bg-zinc-900 rounded-md p-6 fade-in"
         )
-
+    #
+    def get_base64_heatmap(filename):
+        """Read heatmap image and return as base64 data URL"""
+        heatmap_path = os.path.join(HEATMAP_DIR, filename)
+        if os.path.exists(heatmap_path):
+            try:
+                with open(heatmap_path, "rb") as f:
+                    img_data = f.read()
+                    return f"data:image/png;base64,{base64.b64encode(img_data).decode('utf-8')}"
+            except Exception as e:
+                logging.error(f"Error reading heatmap {filename}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        else:
+            logging.error(f"Heatmap file not found: {heatmap_path}")
+        return None
     # Add this helper function to directly embed images in the UI
     def try_read_image(image_path):
         """Attempt to read an image and return it as an embedded element"""
@@ -1641,6 +1598,93 @@ def serve_fasthtml():
                 P(f"Error displaying context document: {str(e)}", cls="text-red-500 text-center"),
                 cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
             )
+        
+
+    def token_maps_ui(image_key, heatmaps):
+        """Create token map UI with tabs and display area"""
+        if not heatmaps:
+            return Div("No token maps available", cls="text-zinc-400 text-center")
+                
+        # Create a list of button elements first
+        tab_buttons = []
+        
+        # Get the first heatmap for initial display
+        first_heatmap = None
+        if len(heatmaps) > 0:
+            first_heatmap_filename = f"{image_key}_token_{heatmaps[0]['token_idx']}.png"
+            first_heatmap = get_base64_heatmap(first_heatmap_filename)
+        
+        # Create the tabs
+        for i, heatmap in enumerate(heatmaps):
+            token_class = "btn btn-sm token-tab " + ("btn-primary active" if i == 0 else "btn-outline")
+            token_tab = Button(
+                heatmap['token'],
+                cls=token_class,
+                hx_get=f"/token-map/{image_key}/{heatmap['token_idx']}",
+                hx_target="#token-map-display",
+                hx_swap="innerHTML",
+                id=f"token-tab-{i}"
+            )
+            # Add the button to our list
+            tab_buttons.append(token_tab)
+        
+        # Create token tabs Div with all buttons at once
+        token_tabs = Div(*tab_buttons, cls="flex flex-wrap gap-2 mb-4")
+        
+        # Create the initial token map display
+        initial_display = Div(
+            Img(
+                src=first_heatmap,
+                cls="mx-auto max-h-96 w-full object-contain token-map"
+            ),
+            cls="p-2 flex items-center justify-center min-h-[300px]"
+        ) if first_heatmap else Div("Select a token above to see its heatmap", cls="text-zinc-400 text-center py-8")
+        
+        # Create the full token maps container
+        return Div(
+            H3("Token Similarity Maps", cls="text-xl font-semibold text-white mb-2"),
+            P("See how the model focuses on different parts of the context document for each word in the query:", 
+                cls="text-zinc-300 mb-3"),
+            
+            # Token tabs navigation - using our complete Div with all buttons
+            token_tabs,
+            
+            # Token map display area with initial content
+            Div(
+                initial_display,
+                id="token-map-display",
+                cls="w-full bg-zinc-700 rounded-md overflow-hidden"
+            ),
+            
+            # JavaScript to handle tab interaction
+            Script('''
+            document.addEventListener('htmx:afterSwap', function() {
+                if (document.getElementById('token-tab-0')) {
+                    setTimeout(function() {
+                        document.getElementById('token-tab-0').click();
+                    }, 300);
+                }
+            });
+            
+            document.addEventListener('htmx:afterRequest', function(evt) {
+                if (evt.detail.target && evt.detail.target.id === 'token-map-display') {
+                    // Remove active class from all tabs
+                    document.querySelectorAll('[id^="token-tab-"]').forEach(function(tab) {
+                        tab.classList.remove('btn-primary', 'active');
+                        tab.classList.add('btn-outline');
+                    });
+                    
+                    // Add active class to clicked tab
+                    if (evt.detail.requestConfig.triggeringElement) {
+                        evt.detail.requestConfig.triggeringElement.classList.remove('btn-outline');
+                        evt.detail.requestConfig.triggeringElement.classList.add('btn-primary', 'active');
+                    }
+                }
+            });
+            '''),
+            
+            cls="mt-6"
+        )
 
     # BATCH PROCESSING ROUTES
     # Updated main route function
