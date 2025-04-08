@@ -140,7 +140,7 @@ engine = None
 
 @app.function(
     image=image,
-    gpu=modal.gpu.A100(count=1, size="80GB"),  # Changed to A100 to match actual needs
+    gpu=modal.gpu.A10G(count=1),  
     container_idle_timeout=10 * 60,  # Increased idle timeout
     timeout=24 * 60 * 60,
     allow_concurrent_inputs=20,  # Reduced from 100 for better stability
