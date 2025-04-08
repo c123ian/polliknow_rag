@@ -110,11 +110,12 @@ try:
 except modal.exception.NotFoundError:
     db_volume = modal.Volume.persisted("db_data")
 
-# Setup image with required dependencies
+# Image definition with environment variables
 image = modal.Image.debian_slim(python_version="3.10") \
+    .apt_install("libgl1-mesa-glx","libglib2.0-0","libsm6","libxrender1","libxext6","poppler-utils") \
     .pip_install(
-        "vllm==0.8.1",              # Updated to minimum required version
-        "mistral_common>=1.5.4",    # Required for Mistral 3.1
+        "vllm==0.8.1",
+        "mistral_common>=1.5.4",
         "python-fasthtml==0.4.3",
         "aiohttp",
         "faiss-cpu",
@@ -129,29 +130,39 @@ image = modal.Image.debian_slim(python_version="3.10") \
         "nltk",
         "sqlalchemy",
         "pdf2image",
-        "colpali-engine[interpretability]>=0.3.2",  # Add interpretability extras
+        "colpali-engine[interpretability]>=0.3.2",
         "torch",
         "matplotlib"
-    )
+    ) \
+    .env({"VLLM_USE_V1": "0"})  # Set VLLM_USE_V1=0 to fix Mistral compatibility
 
 app = modal.App(APP_NAME)
-# Define global engine variable
-engine = None
+
+# Helper function to convert image to data URI
+def format_image(image):
+    """Convert PIL Image to data URI for multimodal API"""
+    buffered = io.BytesIO()
+    # Convert to RGB if it has alpha channel
+    if image.mode == "RGBA":
+        image = image.convert("RGB")
+    image.save(buffered, format="JPEG", quality=90)
+    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    image_data_uri = f'data:image/jpeg;base64,{img_base64}'
+    return image_data_uri
 
 @app.function(
     image=image,
-    gpu=modal.gpu.A10G(count=1),  
-    container_idle_timeout=10 * 60,  # Increased idle timeout
+    gpu=modal.gpu.A100(count=1, size="80GB"),
+    container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
-    allow_concurrent_inputs=20,  # Reduced from 100 for better stability
+    allow_concurrent_inputs=20,
     volumes={
         MISTRAL_MODELS_DIR: mistral_volume,
         COLQWEN_MODELS_DIR: colqwen_volume,
         DATA_DIR: bee_volume,
         DATABASE_DIR: db_volume
-    },
+    }
 )
-
 @modal.asgi_app()
 def serve_vllm():
     import os
@@ -159,23 +170,21 @@ def serve_vllm():
     import fastapi
     import uuid
     import datetime
+    import base64
+    import io
     from fastapi.responses import StreamingResponse, JSONResponse
-    from typing import Optional
+    from typing import Optional, List, Dict, Any
+    from PIL import Image
 
-    from vllm.config import ModelConfig
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.engine.async_llm_engine import AsyncLLMEngine
-    from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-    from vllm.entrypoints.openai.serving_models import OpenAIServingModels
-    from vllm.entrypoints.logger import RequestLogger
+    from vllm import LLM
     from vllm.sampling_params import SamplingParams
 
-    global engine
-    MODELS_DIR = "/Mistral"
+    # Log environment configuration
+    logging.info(f"VLLM_USE_V1 environment variable: {os.environ.get('VLLM_USE_V1', 'not set')}")
 
     web_app = fastapi.FastAPI(
         title=f"OpenAI-compatible {DEFAULT_MISTRAL_NAME} server",
-        description="Run an OpenAI-compatible LLM server with vLLM",
+        description="Multimodal LLM server for insect classification",
         version="0.0.1",
         docs_url="/docs",
     )
@@ -186,152 +195,29 @@ def serve_vllm():
                 return root
         return None
 
-    def find_tokenizer_path(base_dir):
-        for root, _, files in os.walk(base_dir):
-            if "tokenizer_config.json" in files:
-                return root
-        return None
-
-    model_path = find_model_path(MODELS_DIR)
+    model_path = find_model_path(MISTRAL_MODELS_DIR)
     if not model_path:
-        raise Exception(f"Could not find model files in {MODELS_DIR}")
+        raise Exception(f"Could not find model files in {MISTRAL_MODELS_DIR}")
 
-    tokenizer_path = find_tokenizer_path(MODELS_DIR)
-    if not tokenizer_path:
-        raise Exception(f"Could not find tokenizer files in {MODELS_DIR}")
-
-    logging.info(f"Initializing AsyncLLMEngine with model path: {model_path} and tokenizer path: {tokenizer_path}")
-
-    # Add these parameters to your AsyncEngineArgs
-    engine_args = AsyncEngineArgs(
-        model=model_path,
-        tokenizer=tokenizer_path,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.95,
-        max_model_len=4096,
-        tokenizer_mode="mistral",
-        config_format="mistral",
-        load_format="mistral",
-        dtype="float16",
-        # ADD THESE NEW PARAMETERS:
-        limit_mm_per_prompt={"image": 4},  # Allow up to 4 images per prompt
-        disable_mm_preprocessor_cache=False  # Enable caching for better performance
-    )
-
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    # Initialize the LLM
+    logging.info(f"Initializing LLM with model path: {model_path}")
     
-    event_loop: Optional[asyncio.AbstractEventLoop] = None
     try:
-        event_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        pass
-
-    if event_loop and event_loop.is_running():
-        model_config = event_loop.run_until_complete(engine.get_model_config())
-    else:
-        model_config = asyncio.run(engine.get_model_config())
-
-    models = OpenAIServingModels(engine_client=engine, model_config=model_config, base_model_paths={DEFAULT_MISTRAL_NAME: model_path})
-    request_logger = RequestLogger(max_log_len=256)
-
-    openai_serving_chat = OpenAIServingChat(
-        engine_client=engine,
-        model_config=model_config,
-        models=models,
-        response_role="assistant",
-        request_logger=request_logger,
-        chat_template=None,  
-        #chat_template="mistral",  # Use Mistral's template instead of None
-        chat_template_content_format="string",  
-    )
-    @web_app.post("/v1/completions")
-    async def completion_generator(request: fastapi.Request) -> StreamingResponse:
-        try:
-            body = await request.json()
-            prompt = body.get("prompt", "")
-            max_tokens = body.get("max_tokens", 100)
-            stream = body.get("stream", True)
-            request_id = str(uuid.uuid4())
-
-            logging.info(f"Received completion request: max_tokens={max_tokens}, stream={stream}")
-
-            sampling_params = SamplingParams(max_tokens=8192, temperature=0.7)
-
-            if stream:
-                async def generate_text():
-                    full_response = ""
-                    last_yielded_position = 0
-                    assistant_prefix_removed = False
-                    buffer = ""
-
-                    async for result in engine.generate(prompt, sampling_params, request_id):
-                        if len(result.outputs) > 0:
-                            new_text = result.outputs[0].text
-
-                            if not assistant_prefix_removed:
-                                new_text = new_text.split("Assistant:")[-1].lstrip()
-                                assistant_prefix_removed = True
-
-                            if len(new_text) > last_yielded_position:
-                                new_part = new_text[last_yielded_position:]
-                                buffer += new_part
-
-                                words = buffer.split()
-                                if len(words) > 1:
-                                    to_yield = ' '.join(words[:-1]) + ' '
-                                    for punct in ['.', '!', '?']:
-                                        to_yield = to_yield.replace(f"{punct}", f"{punct} ")
-                                    to_yield = ' '.join(to_yield.split())
-                                    buffer = words[-1]
-                                    yield to_yield + ' '
-
-                                last_yielded_position = len(new_text)
-
-                            full_response = new_text
-
-                    if buffer:
-                        for punct in ['.', '!', '?']:
-                            buffer = buffer.replace(f"{punct}", f"{punct} ")
-                        buffer = ' '.join(buffer.split())
-                        yield buffer
-
-                return StreamingResponse(generate_text(), media_type="text/plain")
-            else:
-                # Non-streaming response - FIXED to properly collect from generator
-                final_output = None
-                try:
-                    # Collect the final result from the generator
-                    async for result in engine.generate(prompt, sampling_params, request_id):
-                        final_output = result
-                    
-                    # Now check if we got a valid result
-                    if final_output and len(final_output.outputs) > 0:
-                        response_text = final_output.outputs[0].text
-                        # Remove Assistant: prefix if present
-                        response_text = response_text.split("Assistant:")[-1].lstrip()
-                        
-                        return JSONResponse(content={
-                            "id": request_id,
-                            "choices": [
-                                {
-                                    "text": response_text,
-                                    "finish_reason": "stop"
-                                }
-                            ]
-                        })
-                    else:
-                        return JSONResponse(content={"error": "No output generated"}, status_code=500)
-                except Exception as gen_error:
-                    logging.error(f"Error in non-streaming generation: {str(gen_error)}")
-                    import traceback
-                    traceback.print_exc()
-                    return JSONResponse(content={"error": f"Generation error: {str(gen_error)}"}, status_code=500)
-                
-        except Exception as e:
-            logging.error(f"Error in completion_generator: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse(status_code=500, content={"error": str(e)})
+        # Initialize with multimodal support
+        llm = LLM(
+            model=model_path,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.95,
+            trust_remote_code=True,
+            max_model_len=4096,
+            dtype="float16"
+        )
+        logging.info("LLM initialized successfully!")
+    except Exception as init_error:
+        logging.error(f"Error initializing LLM: {init_error}")
+        import traceback
+        traceback.print_exc()
+        raise
 
     @web_app.post("/v1/chat/completions")
     async def chat_completions(request: fastapi.Request) -> JSONResponse:
@@ -344,44 +230,28 @@ def serve_vllm():
             temperature = body.get("temperature", 0.7)
             request_id = str(uuid.uuid4())
             
-            # Format messages into a prompt manually for Mistral
-            formatted_messages = []
-            for msg in messages:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                
-                # Handle different message formats
-                if isinstance(content, list):
-                    # Multimodal message
-                    text_parts = []
-                    for part in content:
-                        if part.get("type") == "text":
-                            text_parts.append(part.get("text", ""))
-                    formatted_text = " ".join(text_parts)
-                    formatted_messages.append(f"{role.capitalize()}: {formatted_text}")
-                else:
-                    # Text-only message - FIXED INDENTATION HERE
-                    formatted_messages.append(f"{role.capitalize()}: {content}")
+            # Process multimodal messages without stripping images
+            logging.info(f"Received chat completion request with {len(messages)} messages")
             
-            # Join messages with newlines
-            prompt = "\n".join(formatted_messages) + "\nAssistant:"
+            # Debug log the first message content structure
+            if messages and len(messages) > 0:
+                first_msg = messages[0]
+                if isinstance(first_msg.get("content"), list):
+                    content_types = [part.get("type") for part in first_msg["content"] if "type" in part]
+                    logging.info(f"First message contains content types: {content_types}")
             
-            # Create sampling params
+            # Use the LLM's chat method for multimodal support
             sampling_params = SamplingParams(
                 temperature=temperature,
                 max_tokens=max_tokens,
-                #stop=["User:", "System:", "\n\n"],
+                stop=["User:", "System:"]
             )
             
-            # Generate response - collect all outputs from the generator
-            final_output = None
-            async for output in engine.generate(prompt, sampling_params, request_id):
-                final_output = output
+            outputs = llm.chat(messages=messages, sampling_params=sampling_params)
             
-            if final_output and len(final_output.outputs) > 0:
-                response_text = final_output.outputs[0].text
+            if outputs and len(outputs) > 0 and len(outputs[0].outputs) > 0:
+                response_text = outputs[0].outputs[0].text
                 
-                # Create a properly formatted response
                 return JSONResponse(content={
                     "id": request_id,
                     "object": "chat.completion",
@@ -398,15 +268,53 @@ def serve_vllm():
                     ]
                 })
             else:
+                logging.error("No output generated from LLM.chat()")
                 return JSONResponse(status_code=500, content={"error": "No output generated"})
         except Exception as e:
             logging.error(f"Error in chat_completions: {str(e)}")
             import traceback
             traceback.print_exc()
             return JSONResponse(status_code=500, content={"error": str(e)})
-                
 
-    # Add a simple health check endpoint
+    # Add completions endpoint for text-only requests
+    @web_app.post("/v1/completions")
+    async def completions(request: fastapi.Request) -> JSONResponse:
+        """Handle basic completions - useful for text-only requests"""
+        try:
+            body = await request.json()
+            prompt = body.get("prompt", "")
+            max_tokens = body.get("max_tokens", 500)
+            temperature = body.get("temperature", 0.7)
+            request_id = str(uuid.uuid4())
+            
+            sampling_params = SamplingParams(
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            
+            outputs = llm.generate(prompt, sampling_params)
+            
+            if outputs and len(outputs) > 0 and len(outputs[0].outputs) > 0:
+                response_text = outputs[0].outputs[0].text
+                
+                return JSONResponse(content={
+                    "id": request_id,
+                    "choices": [
+                        {
+                            "text": response_text,
+                            "finish_reason": "stop"
+                        }
+                    ]
+                })
+            else:
+                return JSONResponse(status_code=500, content={"error": "No output generated"})
+        except Exception as e:
+            logging.error(f"Error in completions: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    # Health check endpoint
     @web_app.get("/health")
     async def health_check():
         """Check if the server is running and the model is loaded"""
@@ -414,7 +322,7 @@ def serve_vllm():
             "status": "healthy", 
             "model": DEFAULT_MISTRAL_NAME,
             "supports_multimodal": True,
-            "max_tokens": 32768
+            "max_tokens": 4096
         })
 
     return web_app
@@ -454,7 +362,6 @@ def serve_fasthtml():
     import numpy as np
     from rank_bm25 import BM25Okapi
     from pdf2image import convert_from_path
-    from vllm.sampling_params import SamplingParams
     
     # Setup NLTK
     NLTK_DATA_DIR = "/tmp/nltk_data"
@@ -626,186 +533,162 @@ def serve_fasthtml():
         # Only include context_source if we verified it exists
         context_source = Column(String, nullable=True)
 
-    # Initialize the FastHTML app
-    fasthtml_app, rt = fast_app(
-        hdrs=(
-            # Explicit HTMX loading and other scripts
-            Script(src="https://unpkg.com/htmx.org@1.9.6"),
-            Script(src="https://cdn.tailwindcss.com"),
-            Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/daisyui@4.11.1/dist/full.min.css"),
-            # Add custom CSS for better interactive elements
-            Style("""
-                button, .btn, a[href] {
-                    cursor: pointer !important;
-                }
-                
-                button:hover, .btn:hover, a[href]:hover {
-                    opacity: 0.9;
-                }
-                
-                .file-input {
-                    cursor: pointer !important;
-                }
-                
-                /* Ensure nothing blocks interaction */
-                #main-content, #analysis-results {
-                    position: relative;
-                    z-index: 1;
-                }
-                
-                /* Only show loading indicator when active */
-                #loading-indicator:not(.htmx-request) {
-                    display: none !important;
-                }
-                
-                /* Custom styles for token maps */
-                .token-tab.active {
-                    background-color: #4CAF50;
-                    color: white;
-                }
-                
-                /* Custom animations */
-                .fade-in {
-                    animation: fadeIn 0.5s;
-                }
-                
-                @keyframes fadeIn {
-                    from { opacity: 0; }
-                    to { opacity: 1; }
-                }
-                
-                /* Custom styling for token map display */
-                .token-map {
-                    max-height: 350px;
-                    object-fit: contain;
-                }
-                
-                .context-container {
-                    background-color: #2a2a2a;
-                    border: 1px solid #3a3a3a;
-                    border-radius: 8px;
-                    padding: 10px;
-                    margin-bottom: 12px;
-                }
-                
-                .context-header {
-                    color: #aaa;
-                    font-size: 14px;
-                    margin-bottom: 8px;
-                }
-                
-                /* Carousel styles */
-                .carousel-item {
-                    scroll-snap-align: start;
-                }
-                
-                .carousel {
-                    scroll-behavior: smooth;
-                    scroll-snap-type: x mandatory;
-                }
-            """),
-        ),
-        middleware=[
-            Middleware(
-                SessionMiddleware,
-                secret_key=os.environ.get('YOUR_KEY', 'default-secret-key'),
-                session_cookie="secure_session",
-                max_age=86400,
-                same_site="strict",
-                https_only=True
-            )
-        ]
-    )
-
-    # Helper function to extract the one-word classification from LLM response
-    def extract_classification(response_text):
-        """Extract the one-word classification from the LLM response"""
-        # Try to extract the classification after "Answer:" if present
-        if "Answer:" in response_text:
-            parts = response_text.split("Answer:")
-            if len(parts) > 1:
-                answer = parts[1].strip().lower()
-                # Take only the first word
-                classification = answer.split()[0] if answer.split() else "unknown"
-                return classification
+    # Helper function to get context image from PDF pages
+    def get_context_image(top_sources):
+        """Get the context image from retrieved PDF pages"""
+        global page_images
         
-        # If no "Answer:" pattern, look for specific categories in the response
-        categories = ["bumblebee", "honeybee", "wasp", "solitary bee", "hoverfly", "flies", "butterfly", "moth", "other"]
+        if not top_sources or len(top_sources) == 0:
+            return None
+            
+        # Get the top source document
+        top_source = top_sources[0]
+        image_key = top_source.get('image_key')
         
-        # Check for each category in the text
-        response_lower = response_text.lower()
-        for category in categories:
-            if category in response_lower:
-                if category == "flies":
-                    return "other flies"
-                elif category in ["butterfly", "moth"]:
-                    return "butterfly & moths"
-                return category
-        
-        # Default if no category found
-        return "other insect"
-
-    # Helper function to get badge color based on classification
-    def get_badge_color(classification):
-        """Return the appropriate badge color for a classification"""
-        colors = {
-            "bumblebee": "badge-primary",      # Blue
-            "honeybee": "badge-warning",       # Yellow
-            "wasp": "badge-accent",            # Dark yellow/orange
-            "hoverfly": "badge-success",       # Green
-            "other flies": "badge-info",       # Light blue
-            "butterfly & moths": "badge-secondary", # Purple
-            "other insect": "badge-neutral",   # Gray
-            "error": "badge-error"             # Red
-        }
-        
-        # Normalize the classification
-        classification = classification.lower()
-        
-        # Check for partial matches - simplified for accurate matching
-        for key, color in colors.items():
-            if key == classification:
-                return color
-        
-        # Default to neutral if no match
-        return "badge-neutral"
-        
-    # Helper functions for saving to database
-    async def save_to_database(analysis_id, image_path, analysis_type, query, response, top_sources):
-        """Save analysis results to the database"""
+        if not image_key or image_key not in page_images:
+            logging.warning(f"Context image not found for key: {image_key}")
+            
+            # Try to find the image by reconstructing path patterns
+            parts = image_key.split('_')
+            if len(parts) >= 2:
+                filename = '_'.join(parts[:-1])
+                page_num = parts[-1]
+                
+                # Check different potential locations
+                potential_paths = [
+                    os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                    os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
+                    os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
+                ]
+                
+                for potential_path in potential_paths:
+                    if os.path.exists(potential_path):
+                        logging.info(f"Found context image at: {potential_path}")
+                        return Image.open(potential_path)
+                
+            return None
+            
         try:
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
+            image_path = page_images[image_key]
+            if os.path.exists(image_path):
+                context_image = Image.open(image_path)
+                return context_image
+            else:
+                logging.error(f"Context image file not found: {image_path}")
+        except Exception as e:
+            logging.error(f"Error loading context image: {e}")
+        
+        return None
+
+    # Updated process_with_mistral function to handle multimodal API properly
+    async def process_with_mistral(image, query, context_text="", analysis_id=""):
+        """Process the insect image with Mistral, using context image if available"""
+        logging.info(f"Processing image {analysis_id} with Mistral using query: {query}")
+        
+        try:
+            # Retrieve relevant documents using ColPali
+            retrieved_paragraphs, top_sources = await retrieve_relevant_documents(query)
             
-            # Insert basic info
-            cursor.execute(
-                "INSERT INTO image_analyses (analysis_id, image_path, analysis_type, query, response) VALUES (?, ?, ?, ?, ?)",
-                (analysis_id, image_path, analysis_type, query, response)
+            # Get context image from retrieved documents
+            context_image = None
+            if top_sources:
+                context_image = get_context_image(top_sources)
+                if context_image:
+                    logging.info(f"Found context image from document: {top_sources[0].get('filename', 'unknown')}, page {top_sources[0].get('page', 'unknown')}")
+                else:
+                    logging.warning(f"No context image found for {top_sources[0].get('image_key', 'unknown')}")
+            
+            # Convert main insect image to data URI
+            insect_image_uri = format_image(image)
+            logging.info(f"Converted insect image to data URI (length: {len(insect_image_uri)})")
+            
+            # Convert context image to data URI if available
+            context_image_uri = None
+            if context_image:
+                context_image_uri = format_image(context_image)
+                logging.info(f"Converted context image to data URI (length: {len(context_image_uri)})")
+            
+            # Create system prompt that focuses on the insect image
+            system_prompt = (
+                "You are an expert biologist. Classify the insect in the provided image into "
+                "ONE of these categories (bumblebee, honeybee, wasp, solitary bee, hoverfly, other flies, "
+                "butterfly & moths, other insect). Focus primarily on the visual characteristics "
+                "in the insect image. If a second reference image is provided, use it as secondary information only. "
+                "After analysis, provide the answer as a single word, for example 'Answer: honeybee'."
             )
             
-            # Add context source if available
-            if top_sources:
-                top_source = top_sources[0]
-                context_source = f"{top_source['filename']} (page {top_source['page']})"
-                
-                # Check if the column exists
-                cursor.execute("PRAGMA table_info(image_analyses)")
-                columns = [column[1] for column in cursor.fetchall()]
-                if 'context_source' in columns:
-                    cursor.execute(
-                        "UPDATE image_analyses SET context_source = ? WHERE analysis_id = ?",
-                        (context_source, analysis_id)
-                    )
+            # Create message content based on available images
+            message_content = []
             
-            conn.commit()
-            conn.close()
-            logging.info(f"Saved analysis {analysis_id} to database")
-            return True
-        except Exception as db_error:
-            logging.error(f"Database error: {db_error}")
+            # Always add the task description text first
+            task_text = "Classify this insect shown in the image."
+            if retrieved_paragraphs:
+                task_text += " Additional reference information: " + context_text
+            
+            message_content.append({
+                "type": "text", 
+                "text": task_text
+            })
+            
+            # Add the main insect image
+            message_content.append({
+                "type": "image_url",
+                "image_url": {"url": insect_image_uri}
+            })
+            
+            # If we have a context image, add it with clear instructions
+            if context_image_uri:
+                message_content.append({
+                    "type": "text",
+                    "text": "Here is an additional reference image that may help with classification. Focus primarily on the insect in the first image."
+                })
+                message_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": context_image_uri}
+                })
+            
+            # Assemble the full message payload
+            payload = {
+                "model": DEFAULT_MISTRAL_NAME,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": message_content}
+                ],
+                "max_tokens": 2000,
+                "temperature": 0.7
+            }
+            
+            # Send to the multimodal endpoint
+            multimodal_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/chat/completions"
+            
+            async with aiohttp.ClientSession() as client_session:
+                logging.info(f"Sending multimodal request to {multimodal_url}")
+                async with client_session.post(multimodal_url, json=payload, timeout=320) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        
+                        # Add this line to log the full JSON response
+                        logging.info(f"Raw API response for analysis {analysis_id}:\n{json.dumps(result, indent=2)}")
+                        
+                        if "choices" in result and len(result["choices"]) > 0:
+                            model_response = result["choices"][0]["message"]["content"]
+                            
+                            # Log the full response content
+                            logging.info(f"Full LLM response for analysis {analysis_id}:\n{'='*50}\n{model_response}\n{'='*50}")
+                            
+                            return model_response.strip()
+                        else:
+                            return "Error: No response choices returned from model"
+                    else:
+                        error_text = await response.text()
+                        logging.error(f"Error response from multimodal API: {error_text}")
+                        return f"Error processing image: {error_text}"
+        
+        except Exception as e:
+            logging.error(f"Exception in process_with_mistral: {str(e)}")
             import traceback
             traceback.print_exc()
-            return False
+            return f"Error: {str(e)}"
 
     # Retrieve relevant documents
     async def retrieve_relevant_documents(query, top_k=5):
@@ -943,218 +826,319 @@ def serve_fasthtml():
             return sorted_paragraphs, sorted_sources
             
         except Exception as e:
-            logging.error(f"Error in document retrieval: {e}")
+            logging.error(f"Error in document retrieval: {str(e)}")
             import traceback
             traceback.print_exc()
             return [], []
 
-    # Modified generate_similarity_maps function to use similarity score selection
-    async def generate_similarity_maps(query, image_key):
-        """Generate token similarity maps for a retrieved document based on similarity scores"""
-        global colpali_model, colpali_processor, page_images
+    # Initialize the FastHTML app
+    fasthtml_app, rt = fast_app(
+        hdrs=(
+            # Explicit HTMX loading and other scripts
+            Script(src="https://unpkg.com/htmx.org@1.9.6"),
+            Script(src="https://cdn.tailwindcss.com"),
+            Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/daisyui@4.11.1/dist/full.min.css"),
+            # Add custom CSS for better interactive elements
+            Style("""
+                button, .btn, a[href] {
+                    cursor: pointer !important;
+                }
+                
+                button:hover, .btn:hover, a[href]:hover {
+                    opacity: 0.9;
+                }
+                
+                .file-input {
+                    cursor: pointer !important;
+                }
+                
+                /* Ensure nothing blocks interaction */
+                #main-content, #analysis-results {
+                    position: relative;
+                    z-index: 1;
+                }
+                
+                /* Only show loading indicator when active */
+                #loading-indicator:not(.htmx-request) {
+                    display: none !important;
+                }
+                
+                /* Custom styles for token maps */
+                .token-tab.active {
+                    background-color: #4CAF50;
+                    color: white;
+                }
+                
+                /* Custom animations */
+                .fade-in {
+                    animation: fadeIn 0.5s;
+                }
+                
+                @keyframes fadeIn {
+                    from { opacity: 0; }
+                    to { opacity: 1; }
+                }
+                
+                /* Custom styling for token map display */
+                .token-map {
+                    max-height: 350px;
+                    object-fit: contain;
+                }
+                
+                .context-container {
+                    background-color: #2a2a2a;
+                    border: 1px solid #3a3a3a;
+                    border-radius: 8px;
+                    padding: 10px;
+                    margin-bottom: 12px;
+                }
+                
+                .context-header {
+                    color: #aaa;
+                    font-size: 14px;
+                    margin-bottom: 8px;
+                }
+                
+                /* Carousel styles */
+                .carousel-item {
+                    scroll-snap-align: start;
+                }
+                
+                .carousel {
+                    scroll-behavior: smooth;
+                    scroll-snap-type: x mandatory;
+                }
+            """),
+        ),
+        middleware=[
+            Middleware(
+                SessionMiddleware,
+                secret_key=os.environ.get('YOUR_KEY', 'default-secret-key'),
+                session_cookie="secure_session",
+                max_age=86400,
+                same_site="strict",
+                https_only=True
+            )
+        ]
+    )
+
+    # Helper function to extract the one-word classification from LLM response
+    def extract_classification(response_text):
+        """Extract the one-word classification from the LLM response"""
+        # Try to extract the classification after "Answer:" if present
+        if "Answer:" in response_text:
+            parts = response_text.split("Answer:")
+            if len(parts) > 1:
+                answer = parts[1].strip().lower()
+                # Take only the first word
+                classification = answer.split()[0] if answer.split() else "unknown"
+                return classification
         
-        if not image_key or image_key not in page_images:
-            logging.error(f"Invalid image key: {image_key}")
-            return []
-            
+        # If no "Answer:" pattern, look for specific categories in the response
+        categories = ["bumblebee", "honeybee", "wasp", "solitary bee", "hoverfly", "other flies", "butterfly", "moth", "other"]
+        
+        # Check for each category in the text
+        response_lower = response_text.lower()
+        for category in categories:
+            if category in response_lower:
+                if category == "flies":
+                    return "other flies"
+                elif category in ["butterfly", "moth"]:
+                    return "butterfly & moths"
+                return category
+        
+        # Default if no category found
+        return "other insect"
+
+    # Helper function to get badge color based on classification
+    def get_badge_color(classification):
+        """Return the appropriate badge color for a classification"""
+        colors = {
+            "bumblebee": "badge-primary",      # Blue
+            "honeybee": "badge-warning",       # Yellow
+            "wasp": "badge-accent",            # Dark yellow/orange
+            "hoverfly": "badge-success",       # Green
+            "other flies": "badge-info",       # Light blue
+            "butterfly & moths": "badge-secondary", # Purple
+            "other insect": "badge-neutral",   # Gray
+            "error": "badge-error"             # Red
+        }
+        
+        # Normalize the classification
+        classification = classification.lower()
+        
+        # Check for partial matches - simplified for accurate matching
+        for key, color in colors.items():
+            if key == classification:
+                return color
+        
+        # Default to neutral if no match
+        return "badge-neutral"
+        
+    # Helper functions for saving to database
+    async def save_to_database(analysis_id, image_path, analysis_type, query, response, top_sources):
+        """Save analysis results to the database"""
         try:
-            # Get image path and load image
-            image_path = page_images[image_key]
-            if not os.path.exists(image_path):
-                logging.error(f"Image file not found: {image_path}")
-                
-                # Try to find the image by reconstructing path patterns
-                parts = image_key.split('_')
-                if len(parts) >= 2:
-                    filename = '_'.join(parts[:-1])
-                    page_num = parts[-1]
-                    
-                    # Check different potential locations
-                    potential_paths = [
-                        os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
-                        os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
-                        os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
-                    ]
-                    
-                    for potential_path in potential_paths:
-                        if os.path.exists(potential_path):
-                            logging.info(f"Found image at: {potential_path}")
-                            image_path = potential_path
-                            break
-                
-                if not os.path.exists(image_path):
-                    return []
-                    
-            # Load the image
-            image = Image.open(image_path)
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
             
-            # Process query and image with ColPali
-            processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
-            batch_images = colpali_processor.process_images([image]).to(colpali_model.device)
-            
-            # Forward passes to get embeddings
-            with torch.no_grad():
-                query_embeddings = colpali_model(**processed_query)
-                image_embeddings = colpali_model(**batch_images)
-            
-            # Get the number of image patches
-            n_patches = colpali_processor.get_n_patches(
-                image_size=image.size,
-                patch_size=colpali_model.patch_size,
-                spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
+            # Insert basic info
+            cursor.execute(
+                "INSERT INTO image_analyses (analysis_id, image_path, analysis_type, query, response) VALUES (?, ?, ?, ?, ?)",
+                (analysis_id, image_path, analysis_type, query, response)
             )
             
-            # Get image mask
-            image_mask = colpali_processor.get_image_mask(batch_images)
+            # Add context source if available
+            if top_sources:
+                top_source = top_sources[0]
+                context_source = f"{top_source['filename']} (page {top_source['page']})"
+                
+                # Check if the column exists
+                cursor.execute("PRAGMA table_info(image_analyses)")
+                columns = [column[1] for column in cursor.fetchall()]
+                if 'context_source' in columns:
+                    cursor.execute(
+                        "UPDATE image_analyses SET context_source = ? WHERE analysis_id = ?",
+                        (context_source, analysis_id)
+                    )
             
-            # Generate similarity maps
-            batched_similarity_maps = get_similarity_maps_from_embeddings(
-                image_embeddings=image_embeddings,
-                query_embeddings=query_embeddings,
-                n_patches=n_patches,
-                image_mask=image_mask
-            )
-            
-            # Get the similarity map for this image
-            similarity_maps = batched_similarity_maps[0]  # (query_length, n_patches_x, n_patches_y)
-            
-            # Get tokens for the query
-            query_tokens = colpali_processor.tokenizer.tokenize(query)
-            
-            # Filter to meaningful tokens - approach from older version
-            token_sims = []
-            stopwords = set(["<bos>", "<eos>", "<pad>", "a", "an", "the", "in", "on", "at", "of", "for", "with", "by", "to", "from"])
-            
-            for token_idx, token in enumerate(query_tokens):
-                if token_idx >= similarity_maps.shape[0]:
-                    continue
-                    
-                # Skip stopwords and short tokens
-                if token in stopwords or len(token) <= 1:
-                    continue
-                    
-                token_clean = token.replace("Ġ", "").replace("▁", "")
-                if token_clean and len(token_clean) > 1:
-                    max_sim = similarity_maps[token_idx].max().item()
-                    token_sims.append((token_idx, token, max_sim))
-            
-            # Sort by similarity score and take top tokens
-            token_sims.sort(key=lambda x: x[2], reverse=True)
-            top_tokens = token_sims[:6]  # Get top 6 tokens
-            
-            # Create directory if it doesn't exist
-            os.makedirs(HEATMAP_DIR, exist_ok=True)
-            
-            # Generate and save heatmaps
-            image_heatmaps = []
-            for token_idx, token, score in top_tokens:
-                # Skip if score is very low
-                if score < 0.1:
-                    continue
-                    
-                # Generate heatmap
-                fig, ax = plot_similarity_map(
-                    image=image,
-                    similarity_map=similarity_maps[token_idx],
-                    figsize=(8, 8),
-                    show_colorbar=False,
+            conn.commit()
+            conn.close()
+            logging.info(f"Saved analysis {analysis_id} to database")
+            return True
+        except Exception as db_error:
+            logging.error(f"Database error: {db_error}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    # Add this helper function to directly embed images in the UI
+    def try_read_image(image_path):
+        """Attempt to read an image and return it as an embedded element"""
+        try:
+            if os.path.exists(image_path):
+                with open(image_path, "rb") as f:
+                    img_data = f.read()
+                    base64_img = base64.b64encode(img_data).decode('utf-8')
+                
+                # Determine image type from extension
+                ext = os.path.splitext(image_path)[1].lower()
+                if ext in ['.jpg', '.jpeg']:
+                    media_type = "image/jpeg"
+                elif ext == '.png':
+                    media_type = "image/png"
+                elif ext == '.gif':
+                    media_type = "image/gif"
+                else:
+                    media_type = "image/jpeg"  # Default to JPEG
+                
+                # Display as embedded base64 image
+                return Img(
+                    src=f"data:{media_type};base64,{base64_img}",
+                    cls="mx-auto max-h-96 w-full object-contain rounded-lg border border-zinc-700"
                 )
+            else:
+                # Try to find any image with the same analysis ID prefix
+                analysis_id = os.path.basename(image_path).split('_')[0]
+                directory = os.path.dirname(image_path)
                 
-                # Clean token for display
-                token_display = token.replace("Ġ", "").replace("▁", "")
-                ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
+                if os.path.exists(directory):
+                    files = os.listdir(directory)
+                    matching_files = [f for f in files if f.startswith(analysis_id)]
+                    
+                    if matching_files:
+                        alt_path = os.path.join(directory, matching_files[0])
+                        if os.path.exists(alt_path):
+                            with open(alt_path, "rb") as f:
+                                img_data = f.read()
+                                base64_img = base64.b64encode(img_data).decode('utf-8')
+                            
+                            # Determine image type from extension
+                            alt_ext = os.path.splitext(matching_files[0])[1].lower()
+                            if alt_ext in ['.jpg', '.jpeg']:
+                                media_type = "image/jpeg"
+                            elif alt_ext == '.png':
+                                media_type = "image/png"
+                            elif alt_ext == '.gif':
+                                media_type = "image/gif"
+                            else:
+                                media_type = "image/jpeg"  # Default to JPEG
+                            
+                            return Img(
+                                src=f"data:{media_type};base64,{base64_img}",
+                                cls="mx-auto max-h-96 w-full object-contain rounded-lg border border-zinc-700"
+                            )
                 
-                # Save heatmap
-                heatmap_filename = f"{image_key}_token_{token_idx}.png"
-                heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
-                fig.savefig(heatmap_path, bbox_inches='tight', dpi=150)
-                plt.close(fig)
-                
-                # Add to list
-                image_heatmaps.append({
-                    "token": token_display,
-                    "score": score,
-                    "path": heatmap_filename,
-                    "token_idx": token_idx
-                })
-            
-            logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
-            return image_heatmaps
-            
+                # If all fails, show placeholder
+                return Div(
+                    P("Image not found", cls="text-red-500 text-center"),
+                    cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
+                )
         except Exception as e:
-            logging.error(f"Error generating similarity maps: {e}")
+            logging.error(f"Error embedding image {image_path}: {e}")
             import traceback
             traceback.print_exc()
-            return []
+            return Div(
+                P(f"Error displaying image: {str(e)}", cls="text-red-500 text-center"),
+                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
+            )
 
-    # Updated process_with_mistral function with insect classification system prompt
-    async def process_with_mistral(image, query, context_text="", analysis_id=""):
-        """Process the image with Mistral LLM including context from retrieved documents"""
-        logging.info(f"Processing image {analysis_id} with Mistral using query: {query}")
+    # Helper function to read PDF images directly
+    def try_read_pdf_image(image_key):
+        """Attempt to read a PDF image and return it as an embedded element"""
+        global page_images
         
         try:
-            # Convert image to base64
-            img_buffer = BytesIO()
-            image.save(img_buffer, format=image.format or "JPEG")
-            img_data = img_buffer.getvalue()
-            base64_img = base64.b64encode(img_data).decode("utf-8")
+            if image_key in page_images:
+                image_path = page_images[image_key]
+                if os.path.exists(image_path):
+                    with open(image_path, "rb") as f:
+                        img_data = f.read()
+                        base64_img = base64.b64encode(img_data).decode('utf-8')
+                    
+                    # Display as embedded base64 image
+                    return Img(
+                        src=f"data:image/png;base64,{base64_img}",
+                        cls="w-full rounded-lg border border-zinc-700 max-h-80 object-contain mx-auto"
+                    )
             
-            # Create system prompt that incorporates the query but maintains classification focus
-            system_prompt = (
-                "You are an expert biologist. Classify the insect in the provided image into "
-                "ONE of these categories (bumblebee, honeybee, wasp, solitary bee, hoverfly, other flies, "
-                "butterfly & moths, other insect). Focus primarily on the visual characteristics "
-                f"in the image itself. {query} "
-                "Use any provided context as secondary information only. After analysis, provide the answer "
-                "as a single word, for example 'Answer: honeybee'."
+            # If path not found, try alternative paths
+            parts = image_key.split('_')
+            if len(parts) >= 2:
+                filename = '_'.join(parts[:-1])
+                page_num = int(parts[-1]) if parts[-1].isdigit() else 0
+                potential_paths = [
+                    os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                    os.path.join(PDF_IMAGES_DIR, f"{filename}", f"page_{page_num}.png"),
+                    os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
+                ]
+                
+                for path in potential_paths:
+                    if os.path.exists(path):
+                        with open(path, "rb") as f:
+                            img_data = f.read()
+                            base64_img = base64.b64encode(img_data).decode('utf-8')
+                        
+                        # Display as embedded base64 image
+                        return Img(
+                            src=f"data:image/png;base64,{base64_img}",
+                            cls="w-full rounded-lg border border-zinc-700 max-h-80 object-contain mx-auto"
+                        )
+            
+            # If all fails, show a placeholder
+            return Div(
+                P("Context document image not found", cls="text-red-500 text-center"),
+                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
             )
-            
-            # Create multimodal message format with updated system prompt
-            payload = {
-            "model": DEFAULT_MISTRAL_NAME,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": [
-                    {"type": "text", "text": f"Classify this insect.{' Additional reference information:' + context_text if context_text else ''}"},
-                    {"type": "image", "image": {"data": f"data:image/jpeg;base64,{base64_img}"}}
-                ]}
-            ],
-                "max_tokens": 2000,
-                "temperature": 0.7,
-                "stream": False
-            }
-            
-            # Send to vLLM endpoint
-            multimodal_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/chat/completions"
-            
-            async with aiohttp.ClientSession() as client_session:
-                async with client_session.post(multimodal_url, json=payload, timeout=320) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        
-                        # Add this line to log the full JSON response
-                        logging.info(f"Raw API response for analysis {analysis_id}:\n{json.dumps(result, indent=2)}")
-                        
-                        if "choices" in result and len(result["choices"]) > 0:
-                            model_response = result["choices"][0]["message"]["content"]
-                            
-                            # Log the full response content
-                            logging.info(f"Full LLM response for analysis {analysis_id}:\n{'='*50}\n{model_response}\n{'='*50}")
-                            
-                            return model_response.strip()
-                        else:
-                            return "Error: No response choices returned from model"
-                    else:
-                        error_text = await response.text()
-                        return f"Error processing image: {error_text}"
-        
         except Exception as e:
-            logging.error(f"Exception in process_with_mistral: {str(e)}")
+            logging.error(f"Error embedding PDF image {image_key}: {e}")
             import traceback
             traceback.print_exc()
-            return f"Error: {str(e)}"
+            return Div(
+                P(f"Error displaying context document: {str(e)}", cls="text-red-500 text-center"),
+                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
+            )
 
-    # Define UI components
     def batch_upload_form():
         """Render form for uploading multiple images for batch insect classification"""
         
@@ -1456,289 +1440,6 @@ def serve_fasthtml():
             id="batch-results",
             cls="w-full flex flex-col items-center bg-zinc-900 rounded-md p-6 fade-in"
         )
-    #
-    def get_base64_heatmap(filename):
-        """Read heatmap image and return as base64 data URL"""
-        heatmap_path = os.path.join(HEATMAP_DIR, filename)
-        if os.path.exists(heatmap_path):
-            try:
-                with open(heatmap_path, "rb") as f:
-                    img_data = f.read()
-                    return f"data:image/png;base64,{base64.b64encode(img_data).decode('utf-8')}"
-            except Exception as e:
-                logging.error(f"Error reading heatmap {filename}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-        else:
-            logging.error(f"Heatmap file not found: {heatmap_path}")
-        return None
-    # Add this helper function to directly embed images in the UI
-    def try_read_image(image_path):
-        """Attempt to read an image and return it as an embedded element"""
-        try:
-            if os.path.exists(image_path):
-                with open(image_path, "rb") as f:
-                    img_data = f.read()
-                    base64_img = base64.b64encode(img_data).decode('utf-8')
-                
-                # Determine image type from extension
-                ext = os.path.splitext(image_path)[1].lower()
-                if ext in ['.jpg', '.jpeg']:
-                    media_type = "image/jpeg"
-                elif ext == '.png':
-                    media_type = "image/png"
-                elif ext == '.gif':
-                    media_type = "image/gif"
-                else:
-                    media_type = "image/jpeg"  # Default to JPEG
-                
-                # Display as embedded base64 image
-                return Img(
-                    src=f"data:{media_type};base64,{base64_img}",
-                    cls="mx-auto max-h-96 w-full object-contain rounded-lg border border-zinc-700"
-                )
-            else:
-                # Try to find any image with the same analysis ID prefix
-                analysis_id = os.path.basename(image_path).split('_')[0]
-                directory = os.path.dirname(image_path)
-                
-                if os.path.exists(directory):
-                    files = os.listdir(directory)
-                    matching_files = [f for f in files if f.startswith(analysis_id)]
-                    
-                    if matching_files:
-                        alt_path = os.path.join(directory, matching_files[0])
-                        if os.path.exists(alt_path):
-                            with open(alt_path, "rb") as f:
-                                img_data = f.read()
-                                base64_img = base64.b64encode(img_data).decode('utf-8')
-                            
-                            # Determine image type from extension
-                            alt_ext = os.path.splitext(matching_files[0])[1].lower()
-                            if alt_ext in ['.jpg', '.jpeg']:
-                                media_type = "image/jpeg"
-                            elif alt_ext == '.png':
-                                media_type = "image/png"
-                            elif alt_ext == '.gif':
-                                media_type = "image/gif"
-                            else:
-                                media_type = "image/jpeg"  # Default to JPEG
-                            
-                            return Img(
-                                src=f"data:{media_type};base64,{base64_img}",
-                                cls="mx-auto max-h-96 w-full object-contain rounded-lg border border-zinc-700"
-                            )
-                
-                # If all fails, show placeholder
-                return Div(
-                    P("Image not found", cls="text-red-500 text-center"),
-                    cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
-                )
-        except Exception as e:
-            logging.error(f"Error embedding image {image_path}: {e}")
-            import traceback
-            traceback.print_exc()
-            return Div(
-                P(f"Error displaying image: {str(e)}", cls="text-red-500 text-center"),
-                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
-            )
-
-    # Helper function to read PDF images directly
-    def try_read_pdf_image(image_key):
-        """Attempt to read a PDF image and return it as an embedded element"""
-        global page_images
-        
-        try:
-            if image_key in page_images:
-                image_path = page_images[image_key]
-                if os.path.exists(image_path):
-                    with open(image_path, "rb") as f:
-                        img_data = f.read()
-                        base64_img = base64.b64encode(img_data).decode('utf-8')
-                    
-                    # Display as embedded base64 image
-                    return Img(
-                        src=f"data:image/png;base64,{base64_img}",
-                        cls="w-full rounded-lg border border-zinc-700 max-h-80 object-contain mx-auto"
-                    )
-            
-            # If path not found, try alternative paths
-            parts = image_key.split('_')
-            if len(parts) >= 2:
-                filename = '_'.join(parts[:-1])
-                page_num = int(parts[-1]) if parts[-1].isdigit() else 0
-                potential_paths = [
-                    os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
-                    os.path.join(PDF_IMAGES_DIR, f"{filename}", f"page_{page_num}.png"),
-                    os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
-                ]
-                
-                for path in potential_paths:
-                    if os.path.exists(path):
-                        with open(path, "rb") as f:
-                            img_data = f.read()
-                            base64_img = base64.b64encode(img_data).decode('utf-8')
-                        
-                        # Display as embedded base64 image
-                        return Img(
-                            src=f"data:image/png;base64,{base64_img}",
-                            cls="w-full rounded-lg border border-zinc-700 max-h-80 object-contain mx-auto"
-                        )
-            
-            # If all fails, show a placeholder
-            return Div(
-                P("Context document image not found", cls="text-red-500 text-center"),
-                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
-            )
-        except Exception as e:
-            logging.error(f"Error embedding PDF image {image_key}: {e}")
-            import traceback
-            traceback.print_exc()
-            return Div(
-                P(f"Error displaying context document: {str(e)}", cls="text-red-500 text-center"),
-                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
-            )
-        
-
-    def token_maps_ui(image_key, heatmaps):
-        """Create token map UI with tabs and display area"""
-        if not heatmaps:
-            return Div("No token maps available", cls="text-zinc-400 text-center")
-                
-        # Create a list of button elements first
-        tab_buttons = []
-        
-        # Get the first heatmap for initial display
-        first_heatmap = None
-        if len(heatmaps) > 0:
-            first_heatmap_filename = f"{image_key}_token_{heatmaps[0]['token_idx']}.png"
-            first_heatmap = get_base64_heatmap(first_heatmap_filename)
-        
-        # Create the tabs
-        for i, heatmap in enumerate(heatmaps):
-            token_class = "btn btn-sm token-tab " + ("btn-primary active" if i == 0 else "btn-outline")
-            token_tab = Button(
-                heatmap['token'],
-                cls=token_class,
-                hx_get=f"/token-map/{image_key}/{heatmap['token_idx']}",
-                hx_target="#token-map-display",
-                hx_swap="innerHTML",
-                id=f"token-tab-{i}"
-            )
-            # Add the button to our list
-            tab_buttons.append(token_tab)
-        
-        # Create token tabs Div with all buttons at once
-        token_tabs = Div(*tab_buttons, cls="flex flex-wrap gap-2 mb-4")
-        
-        # Create the initial token map display
-        initial_display = Div(
-            Img(
-                src=first_heatmap,
-                cls="mx-auto max-h-96 w-full object-contain token-map"
-            ),
-            cls="p-2 flex items-center justify-center min-h-[300px]"
-        ) if first_heatmap else Div("Select a token above to see its heatmap", cls="text-zinc-400 text-center py-8")
-        
-        # Create the full token maps container
-        return Div(
-            H3("Token Similarity Maps", cls="text-xl font-semibold text-white mb-2"),
-            P("See how the model focuses on different parts of the context document for each word in the query:", 
-                cls="text-zinc-300 mb-3"),
-            
-            # Token tabs navigation - using our complete Div with all buttons
-            token_tabs,
-            
-            # Token map display area with initial content
-            Div(
-                initial_display,
-                id="token-map-display",
-                cls="w-full bg-zinc-700 rounded-md overflow-hidden"
-            ),
-            
-            # JavaScript to handle tab interaction
-            Script('''
-            document.addEventListener('htmx:afterSwap', function() {
-                if (document.getElementById('token-tab-0')) {
-                    setTimeout(function() {
-                        document.getElementById('token-tab-0').click();
-                    }, 300);
-                }
-            });
-            
-            document.addEventListener('htmx:afterRequest', function(evt) {
-                if (evt.detail.target && evt.detail.target.id === 'token-map-display') {
-                    // Remove active class from all tabs
-                    document.querySelectorAll('[id^="token-tab-"]').forEach(function(tab) {
-                        tab.classList.remove('btn-primary', 'active');
-                        tab.classList.add('btn-outline');
-                    });
-                    
-                    // Add active class to clicked tab
-                    if (evt.detail.requestConfig.triggeringElement) {
-                        evt.detail.requestConfig.triggeringElement.classList.remove('btn-outline');
-                        evt.detail.requestConfig.triggeringElement.classList.add('btn-primary', 'active');
-                    }
-                }
-            });
-            '''),
-            
-            cls="mt-6"
-        )
-
-    # BATCH PROCESSING ROUTES
-    # Updated main route function
-    @rt("/")
-    def get(session):
-        if 'session_id' not in session:
-            session['session_id'] = str(uuid.uuid4())
-        
-        logging.info(f"New session: {session['session_id']} - showing batch upload form")
-        
-        return (
-            Title("Insect Classification"),
-            Main(
-                # Loading indicator with better visibility
-                Div(
-                    Div(cls="loading loading-spinner loading-lg text-warning"),
-                    Div("Processing your insect images...", cls="text-white mt-4 text-lg"),
-                    id="loading-indicator",
-                    cls="htmx-indicator fixed top-0 left-0 w-full h-full bg-black bg-opacity-80 flex flex-col items-center justify-center z-50"
-                ),
-                
-                # Page header 
-                H1("Insect Classifier", cls="text-3xl font-bold mb-4 text-white"),
-                
-                # Header info
-                Div(
-                    P("Upload insect images for instant AI classification", 
-                      cls="text-white text-center mb-6"),
-                    cls="w-full max-w-2xl"
-                ),
-                
-                # Main content area - DIRECTLY SHOW BATCH FORM
-                Div(
-                    batch_upload_form(),
-                    id="main-content",
-                    cls="w-full max-w-2xl"
-                ),
-                
-                # Results area - will be populated by process-batch
-                Div(id="analysis-results", cls="w-full max-w-5xl mt-8"),
-                
-                cls="flex flex-col items-center min-h-screen bg-black p-4",
-            )
-        )
-
-    # Add this explicit route for batch upload
-    @rt("/batch-upload", methods=["GET"])
-    def get_batch_upload(session):
-        """Show the batch upload form"""
-        if 'session_id' not in session:
-            session['session_id'] = str(uuid.uuid4())
-            
-        logging.info(f"Showing batch upload form for session: {session['session_id']}")
-        return batch_upload_form()
 
     # Process batch of images
     @rt("/process-batch", methods=["POST"])
@@ -1841,7 +1542,7 @@ def serve_fasthtml():
                         # Reuse existing token maps
                         image_token_maps[image_key] = token_maps_by_image[image_key]
                 
-                # Process with Mistral using insect classification system prompt
+                # Process with Mistral using multimodal capabilities
                 logging.info(f"Processing insect image {i+1} with Mistral")
                 response_text = await process_with_mistral(image, query, context_text, analysis_id)
                 
@@ -1908,6 +1609,7 @@ def serve_fasthtml():
         # Return carousel UI with all results
         return carousel_ui(batch_results)
 
+    # Routes for token maps, image handling, and more...
     @rt("/token-map/{image_key}/{token_idx}")
     async def get_token_map(image_key: str, token_idx: int):
         """Return the token map image HTML for display in the UI"""
@@ -1940,6 +1642,145 @@ def serve_fasthtml():
         else:
             logging.error(f"Token map not found at: {heatmap_path}")
             return Div(f"Token map not found for {image_key} token {token_idx}", cls="text-red-500 p-4")
+    
+    # Modified generate_similarity_maps function to create token similarity maps
+    async def generate_similarity_maps(query, image_key):
+        """Generate token similarity maps for a retrieved document based on similarity scores"""
+        global colpali_model, colpali_processor, page_images
+        
+        if not image_key or image_key not in page_images:
+            logging.error(f"Invalid image key: {image_key}")
+            return []
+            
+        try:
+            # Get image path and load image
+            image_path = page_images[image_key]
+            if not os.path.exists(image_path):
+                logging.error(f"Image file not found: {image_path}")
+                
+                # Try to find the image by reconstructing path patterns
+                parts = image_key.split('_')
+                if len(parts) >= 2:
+                    filename = '_'.join(parts[:-1])
+                    page_num = parts[-1]
+                    
+                    # Check different potential locations
+                    potential_paths = [
+                        os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                        os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
+                        os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
+                    ]
+                    
+                    for potential_path in potential_paths:
+                        if os.path.exists(potential_path):
+                            logging.info(f"Found image at: {potential_path}")
+                            image_path = potential_path
+                            break
+                
+                if not os.path.exists(image_path):
+                    return []
+                    
+            # Load the image
+            image = Image.open(image_path)
+            
+            # Process query and image with ColPali
+            processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
+            batch_images = colpali_processor.process_images([image]).to(colpali_model.device)
+            
+            # Forward passes to get embeddings
+            with torch.no_grad():
+                query_embeddings = colpali_model(**processed_query)
+                image_embeddings = colpali_model(**batch_images)
+            
+            # Get the number of image patches
+            n_patches = colpali_processor.get_n_patches(
+                image_size=image.size,
+                patch_size=colpali_model.patch_size,
+                spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
+            )
+            
+            # Get image mask
+            image_mask = colpali_processor.get_image_mask(batch_images)
+            
+            # Generate similarity maps
+            batched_similarity_maps = get_similarity_maps_from_embeddings(
+                image_embeddings=image_embeddings,
+                query_embeddings=query_embeddings,
+                n_patches=n_patches,
+                image_mask=image_mask
+            )
+            
+            # Get the similarity map for this image
+            similarity_maps = batched_similarity_maps[0]  # (query_length, n_patches_x, n_patches_y)
+            
+            # Get tokens for the query
+            query_tokens = colpali_processor.tokenizer.tokenize(query)
+            
+            # Filter to meaningful tokens - approach from older version
+            token_sims = []
+            stopwords = set(["<bos>", "<eos>", "<pad>", "a", "an", "the", "in", "on", "at", "of", "for", "with", "by", "to", "from"])
+            
+            for token_idx, token in enumerate(query_tokens):
+                if token_idx >= similarity_maps.shape[0]:
+                    continue
+                    
+                # Skip stopwords and short tokens
+                if token in stopwords or len(token) <= 1:
+                    continue
+                    
+                token_clean = token.replace("Ġ", "").replace("▁", "")
+                if token_clean and len(token_clean) > 1:
+                    max_sim = similarity_maps[token_idx].max().item()
+                    token_sims.append((token_idx, token, max_sim))
+            
+            # Sort by similarity score and take top tokens
+            token_sims.sort(key=lambda x: x[2], reverse=True)
+            top_tokens = token_sims[:6]  # Get top 6 tokens
+            
+            # Create directory if it doesn't exist
+            os.makedirs(HEATMAP_DIR, exist_ok=True)
+            
+            # Generate and save heatmaps
+            image_heatmaps = []
+            for token_idx, token, score in top_tokens:
+                # Skip if score is very low
+                if score < 0.1:
+                    continue
+                    
+                # Generate heatmap
+                fig, ax = plot_similarity_map(
+                    image=image,
+                    similarity_map=similarity_maps[token_idx],
+                    figsize=(8, 8),
+                    show_colorbar=False,
+                )
+                
+                # Clean token for display
+                token_display = token.replace("Ġ", "").replace("▁", "")
+                ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
+                
+                # Save heatmap
+                heatmap_filename = f"{image_key}_token_{token_idx}.png"
+                heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
+                fig.savefig(heatmap_path, bbox_inches='tight', dpi=150)
+                plt.close(fig)
+                
+                # Add to list
+                image_heatmaps.append({
+                    "token": token_display,
+                    "score": score,
+                    "path": heatmap_filename,
+                    "token_idx": token_idx
+                })
+            
+            logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
+            return image_heatmaps
+            
+        except Exception as e:
+            logging.error(f"Error generating similarity maps: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     @fasthtml_app.get("/temp-image/{filename}")
     async def serve_temp_image(filename: str):
@@ -2030,71 +1871,6 @@ def serve_fasthtml():
                 status_code=404
             )
 
-    @fasthtml_app.get("/pdf-image/{image_key}")
-    async def get_pdf_image(image_key: str):
-        """Serve PDF page images"""
-        logging.info(f"Image request for key: {image_key}")
-        try:
-            if image_key in page_images:
-                image_path = page_images[image_key]
-                logging.info(f"Found image path: {image_path}")
-                if os.path.exists(image_path):
-                    logging.info(f"Image file exists, serving from: {image_path}")
-                    try:
-                        # Open and read the file directly
-                        with open(image_path, "rb") as f:
-                            content = f.read()
-                        
-                        # Return as binary response
-                        return Response(
-                            content=content,
-                            media_type="image/png"
-                        )
-                    except Exception as e:
-                        logging.error(f"Error reading PDF image file: {e}")
-                        import traceback
-                        traceback.print_exc()
-                else:
-                    logging.error(f"Image file does not exist at path: {image_path}")
-                    # Try to find the image by reconstructing path patterns
-                    parts = image_key.split('_')
-                    if len(parts) >= 2:
-                        filename = '_'.join(parts[:-1])
-                        page_num = int(parts[-1]) if parts[-1].isdigit() else 0
-                        potential_paths = [
-                            # Check different path patterns
-                            os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
-                            os.path.join(PDF_IMAGES_DIR, f"{filename}", f"page_{page_num}.png"),
-                            os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
-                        ]
-                        
-                        for path in potential_paths:
-                            logging.info(f"Trying alternative path: {path}")
-                            if os.path.exists(path):
-                                logging.info(f"Found image at alternative path: {path}")
-                                with open(path, "rb") as f:
-                                    content = f.read()
-                                return Response(
-                                    content=content,
-                                    media_type="image/png"
-                                )
-            else:
-                logging.error(f"Image key '{image_key}' not found in page_images dictionary")
-                # List available keys for debugging
-                available_keys = list(page_images.keys())[:10]  # First 10 keys
-                logging.info(f"Available keys (first 10): {available_keys}")
-        except Exception as e:
-            logging.error(f"Error in get_pdf_image: {str(e)}")
-            import traceback
-            traceback.print_exc()
-        
-        # Return a placeholder image or error response
-        return Response(
-            content=f"Image not found for key: {image_key}", 
-            media_type="text/plain", 
-            status_code=404
-        )
-
     @fasthtml_app.get("/heatmap-image/{filename}")
     async def get_heatmap_image(filename: str):
         """Serve heatmap images"""
@@ -2138,25 +1914,58 @@ def serve_fasthtml():
                 status_code=404
             )
 
-    @fasthtml_app.get("/debug-info")
-    async def debug_info():
-        """Return debugging information about the environment"""
-        info = {
-            "temp_upload_dir_exists": os.path.exists(TEMP_UPLOAD_DIR),
-            "temp_upload_files": os.listdir(TEMP_UPLOAD_DIR)[:20] if os.path.exists(TEMP_UPLOAD_DIR) else [],
-            "heatmap_dir_exists": os.path.exists(HEATMAP_DIR),
-            "heatmap_files": os.listdir(HEATMAP_DIR)[:20] if os.path.exists(HEATMAP_DIR) else [],
-            "pdf_images_dir_exists": os.path.exists(PDF_IMAGES_DIR),
-            "pdf_images_subfolders": os.listdir(PDF_IMAGES_DIR)[:20] if os.path.exists(PDF_IMAGES_DIR) else [],
-            "page_images_count": len(page_images),
-            "page_images_sample": list(page_images.keys())[:10]
-        }
+    # Main route function
+    @rt("/")
+    def get(session):
+        if 'session_id' not in session:
+            session['session_id'] = str(uuid.uuid4())
         
-        return Div(
-            H2("Debugging Information", cls="text-xl font-semibold text-white mb-4"),
-            Pre(json.dumps(info, indent=2), cls="bg-zinc-800 p-4 rounded-md text-white"),
-            cls="w-full max-w-2xl mx-auto bg-zinc-900 rounded-md p-6"
+        logging.info(f"New session: {session['session_id']} - showing batch upload form")
+        
+        return (
+            Title("Insect Classification"),
+            Main(
+                # Loading indicator with better visibility
+                Div(
+                    Div(cls="loading loading-spinner loading-lg text-warning"),
+                    Div("Processing your insect images...", cls="text-white mt-4 text-lg"),
+                    id="loading-indicator",
+                    cls="htmx-indicator fixed top-0 left-0 w-full h-full bg-black bg-opacity-80 flex flex-col items-center justify-center z-50"
+                ),
+                
+                # Page header 
+                H1("Insect Classifier", cls="text-3xl font-bold mb-4 text-white"),
+                
+                # Header info
+                Div(
+                    P("Upload insect images for instant AI classification", 
+                      cls="text-white text-center mb-6"),
+                    cls="w-full max-w-2xl"
+                ),
+                
+                # Main content area - DIRECTLY SHOW BATCH FORM
+                Div(
+                    batch_upload_form(),
+                    id="main-content",
+                    cls="w-full max-w-2xl"
+                ),
+                
+                # Results area - will be populated by process-batch
+                Div(id="analysis-results", cls="w-full max-w-5xl mt-8"),
+                
+                cls="flex flex-col items-center min-h-screen bg-black p-4",
+            )
         )
+
+    # Add batch upload route
+    @rt("/batch-upload", methods=["GET"])
+    def get_batch_upload(session):
+        """Show the batch upload form"""
+        if 'session_id' not in session:
+            session['session_id'] = str(uuid.uuid4())
+            
+        logging.info(f"Showing batch upload form for session: {session['session_id']}")
+        return batch_upload_form()
 
     return fasthtml_app
 
