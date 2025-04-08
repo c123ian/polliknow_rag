@@ -210,6 +210,9 @@ def serve_vllm():
             gpu_memory_utilization=0.95,
             trust_remote_code=True,
             max_model_len=4096,
+            tokenizer_mode="mistral",
+            config_format="mistral",
+            load_format="mistral",
             dtype="float16"
         )
         logging.info("LLM initialized successfully!")
@@ -582,72 +585,48 @@ def serve_fasthtml():
 
     # Updated process_with_mistral function to handle multimodal API properly
     async def process_with_mistral(image, query, context_text="", analysis_id=""):
-        """Process the insect image with Mistral, using context image if available"""
+        """Process the insect image with Mistral, using context as text only"""
         logging.info(f"Processing image {analysis_id} with Mistral using query: {query}")
         
         try:
             # Retrieve relevant documents using ColPali
             retrieved_paragraphs, top_sources = await retrieve_relevant_documents(query)
             
-            # Get context image from retrieved documents
-            context_image = None
-            if top_sources:
-                context_image = get_context_image(top_sources)
-                if context_image:
-                    logging.info(f"Found context image from document: {top_sources[0].get('filename', 'unknown')}, page {top_sources[0].get('page', 'unknown')}")
-                else:
-                    logging.warning(f"No context image found for {top_sources[0].get('image_key', 'unknown')}")
-            
             # Convert main insect image to data URI
             insect_image_uri = format_image(image)
-            logging.info(f"Converted insect image to data URI (length: {len(insect_image_uri)})")
             
-            # Convert context image to data URI if available
-            context_image_uri = None
-            if context_image:
-                context_image_uri = format_image(context_image)
-                logging.info(f"Converted context image to data URI (length: {len(context_image_uri)})")
-            
-            # Create system prompt that focuses on the insect image
+            # Create system prompt that includes context information
             system_prompt = (
                 "You are an expert biologist. Classify the insect in the provided image into "
                 "ONE of these categories (bumblebee, honeybee, wasp, solitary bee, hoverfly, other flies, "
                 "butterfly & moths, other insect). Focus primarily on the visual characteristics "
-                "in the insect image. If a second reference image is provided, use it as secondary information only. "
-                "After analysis, provide the answer as a single word, for example 'Answer: honeybee'."
+                "in the insect image."
             )
             
-            # Create message content based on available images
+            # Create message content with ONLY the insect image
             message_content = []
             
-            # Always add the task description text first
+            # Add context as text - not as an image
             task_text = "Classify this insect shown in the image."
             if retrieved_paragraphs:
                 task_text += " Additional reference information: " + context_text
+                # Add source reference if available
+                if top_sources and len(top_sources) > 0:
+                    source = top_sources[0]
+                    task_text += f"\n\nThis information comes from {source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}."
             
             message_content.append({
                 "type": "text", 
                 "text": task_text
             })
             
-            # Add the main insect image
+            # Add ONLY the main insect image
             message_content.append({
                 "type": "image_url",
                 "image_url": {"url": insect_image_uri}
             })
             
-            # If we have a context image, add it with clear instructions
-            if context_image_uri:
-                message_content.append({
-                    "type": "text",
-                    "text": "Here is an additional reference image that may help with classification. Focus primarily on the insect in the first image."
-                })
-                message_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": context_image_uri}
-                })
-            
-            # Assemble the full message payload
+            # Assemble the payload with only one image
             payload = {
                 "model": DEFAULT_MISTRAL_NAME,
                 "messages": [
@@ -657,6 +636,7 @@ def serve_fasthtml():
                 "max_tokens": 2000,
                 "temperature": 0.7
             }
+        
             
             # Send to the multimodal endpoint
             multimodal_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/chat/completions"
@@ -1693,11 +1673,27 @@ def serve_fasthtml():
                 image_embeddings = colpali_model(**batch_images)
             
             # Get the number of image patches
-            n_patches = colpali_processor.get_n_patches(
-                image_size=image.size,
-                patch_size=colpali_model.patch_size,
-                spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
-            )
+            try:
+                # First try with the original params
+                n_patches = colpali_processor.get_n_patches(
+                    image_size=image.size,
+                    patch_size=colpali_model.patch_size,
+                    spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
+                )
+            except AttributeError:
+                # If 'factor' is missing, try the simpler version without mentioning factor
+                try:
+                    n_patches = colpali_processor.get_n_patches(
+                        image_size=image.size,
+                        patch_size=colpali_model.patch_size
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to get n_patches: {e}")
+                    # Fallback to a reasonable default based on image size
+                    width, height = image.size
+                    patch_size = getattr(colpali_model, 'patch_size', 16)
+                    n_patches = (height // patch_size, width // patch_size)
+                    logging.info(f"Using fallback n_patches: {n_patches}")
             
             # Get image mask
             image_mask = colpali_processor.get_image_mask(batch_images)
