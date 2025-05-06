@@ -43,7 +43,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "skxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -3032,43 +3032,43 @@ def serve():
         """Render the enhanced biodiversity monitoring dashboard with site comparison and exports"""
         stats = get_classification_stats()
         
-        # Site selector component
+        # Site selector component with vibrant colors
         site_selector = Div(
             Div(
                 Div(
                     Span("🦋", cls="text-2xl"),
-                    Span("BeeCount", cls="ml-2 text-xl font-semibold"),
+                    Span("BeeCount", cls="ml-2 text-xl font-semibold text-[#263b30]"),
                     cls="flex items-center"
                 ),
                 Div(
                     Button(
                         "Dunsany Nature Reserve",
                         id="site-selector",
-                        cls="btn btn-sm",
+                        cls="btn btn-sm bg-[#d4f5a6] text-[#263b30] hover:bg-[#263b30] hover:text-[#d4f5a6]",
                         data_dropdown_toggle="site-dropdown"
                     ),
                     Div(
                         Ul(
-                            Li(A("Dunsany Nature Reserve", href="#", cls="block px-4 py-2 hover:bg-gray-100")),
-                            Li(A("Site 2 (Placeholder)", href="#", cls="block px-4 py-2 hover:bg-gray-100")),
-                            cls="py-2 text-sm text-gray-700"
+                            Li(A("Dunsany Nature Reserve", href="#", cls="block px-4 py-2 hover:bg-[#d4f5a6]")),
+                            Li(A("Site 2 (Placeholder)", href="#", cls="block px-4 py-2 hover:bg-[#d4f5a6]")),
+                            cls="py-2 text-sm text-[#263b30]"
                         ),
                         id="site-dropdown",
-                        cls="hidden bg-white divide-y divide-gray-100 rounded-lg shadow w-44 absolute z-10"
+                        cls="hidden bg-white divide-y divide-[#d4f5a6] rounded-lg shadow w-44 absolute z-10"
                     ),
                     cls="relative"
                 ),
                 cls="flex justify-between items-center mb-6"
             ),
-            cls="w-full bg-white rounded-lg shadow-sm p-4 mb-6"
+            cls="w-full bg-white rounded-lg shadow-md p-4 mb-6 border-2 border-[#d4f5a6]"
         )
         
-        # Navigation bar
+        # Navigation bar with vibrant colors
         navbar = Div(
             Div(
                 A(
                     Span("🐝", cls="text-xl"),
-                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
+                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold text-[#263b30]"),
                     href="/",
                     cls="flex items-center"
                 ),
@@ -3076,26 +3076,26 @@ def serve():
                     A(
                         "Dashboard",
                         href="/dashboard",
-                        cls="btn btn-sm btn-ghost btn-active"
+                        cls="btn btn-sm bg-[#263b30] text-white"
                     ),
                     A(
                         "Classifier",
                         href="/",
-                        cls="btn btn-sm btn-ghost"
+                        cls="btn btn-sm btn-ghost text-[#263b30] hover:bg-[#d4f5a6]"
                     ),
                     A(
                         "Submit Observations",
                         href="/",
-                        cls="btn btn-sm btn-ghost"
+                        cls="btn btn-sm btn-ghost text-[#263b30] hover:bg-[#d4f5a6]"
                     ),
                     cls="flex-none"
                 ),
-                cls="navbar bg-[#fff1e2] rounded-lg mb-8 shadow-sm border border-[#d4f5a6]"
+                cls="navbar bg-[#fff1e2] rounded-lg mb-8 shadow-md border-2 border-[#d4f5a6]"
             ),
             cls="w-full"
         )
         
-        # Action buttons section
+        # Action buttons section with vibrant colors
         action_buttons = Div(
             Div(
                 Button(
@@ -3114,14 +3114,14 @@ def serve():
                 A(
                     "View Conservation Plan",
                     href="#",
-                    cls="btn btn-sm btn-outline border-[#263b30] text-[#263b30] hover:bg-[#d4f5a6] hover:text-[#263b30]"
+                    cls="btn btn-sm border-2 border-[#263b30] text-[#263b30] hover:bg-[#d4f5a6]"
                 ),
                 cls="flex justify-end space-x-2"
             ),
             cls="mb-6"
         )
         
-        # Stats summary cards section with new style
+        # Stats summary cards section with vibrant colors
         summary_cards = Div(
             Div(
                 Div(
@@ -3130,7 +3130,7 @@ def serve():
                         P(str(stats["total"]), cls="text-4xl font-semibold text-[#263b30]"),
                         cls="p-6"
                     ),
-                    cls="bg-[#fff1e2] rounded-lg shadow-md border border-[#d4f5a6]"
+                    cls="bg-[#fff1e2] rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
                 ),
                 Div(
                     Div(
@@ -3138,7 +3138,7 @@ def serve():
                         P(str(stats["total_single"]), cls="text-3xl font-semibold text-[#263b30]"),
                         cls="p-6"
                     ),
-                    cls="bg-[#fff1e2] rounded-lg shadow-md border border-[#d4f5a6]"
+                    cls="bg-[#fff1e2] rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
                 ),
                 Div(
                     Div(
@@ -3146,44 +3146,185 @@ def serve():
                         P(str(stats["total_batch"]), cls="text-3xl font-semibold text-[#263b30]"),
                         cls="p-6"
                     ),
-                    cls="bg-[#fff1e2] rounded-lg shadow-md border border-[#d4f5a6]"
+                    cls="bg-[#fff1e2] rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
                 ),
                 cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
             ),
             cls="mb-8"
         )
         
-        # Biodiversity metrics section (NEW)
-        biodiversity_metrics = Div(
+        # Context Sources Table (ADDED THIS BACK)
+        context_table = Div(
+            H2("Context References Used", cls="text-xl font-bold mb-4 text-[#263b30]"),
+            Div(
+                Div(
+                    Div(cls="overflow-x-auto shadow-md sm:rounded-lg"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Source Document", scope="col", cls="px-6 py-3 bg-[#d4f5a6]"),
+                                Th(
+                                    Div(
+                                        "Usage Count",
+                                        A(
+                                            Svg(
+                                                Path(d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"),
+                                                cls="w-3 h-3 ms-1.5",
+                                                aria_hidden="true",
+                                                xmlns="http://www.w3.org/2000/svg",
+                                                fill="currentColor",
+                                                viewBox="0 0 24 24",
+                                            ),
+                                            href="#",
+                                            cls="sort-link",
+                                            data_sort="count"
+                                        ),
+                                        cls="flex items-center",
+                                    ),
+                                    scope="col",
+                                    cls="px-6 py-3 bg-[#d4f5a6]",
+                                ),
+                                Th(
+                                    Div(
+                                        "Page",
+                                        A(
+                                            Svg(
+                                                Path(d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"),
+                                                cls="w-3 h-3 ms-1.5",
+                                                aria_hidden="true",
+                                                xmlns="http://www.w3.org/2000/svg",
+                                                fill="currentColor",
+                                                viewBox="0 0 24 24",
+                                            ),
+                                            href="#",
+                                            cls="sort-link",
+                                            data_sort="page"
+                                        ),
+                                        cls="flex items-center",
+                                    ),
+                                    scope="col",
+                                    cls="px-6 py-3 bg-[#d4f5a6]"
+                                ),
+                                Th(
+                                    "Details",
+                                    scope="col",
+                                    cls="px-6 py-3 bg-[#d4f5a6]",
+                                ),
+                            ),
+                            cls="text-xs text-[#263b30] uppercase",
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(source, cls="px-6 py-4 font-medium text-[#263b30] whitespace-nowrap"),
+                                    Td(str(count), cls="px-6 py-4"),
+                                    Td("Page " + str(source.split(", page ")[1]) if ", page " in source else "N/A", cls="px-6 py-4"),
+                                    Td(
+                                        A(
+                                            "View Details",
+                                            href="#",
+                                            cls="font-medium text-[#263b30] hover:text-[#3b2b26] hover:underline",
+                                            onclick=f"showContextDetails('{source.replace(' ', '_')}', 'Context from {source}')",
+                                        ),
+                                        cls="px-6 py-4 text-right",
+                                    ),
+                                    cls="bg-white border-b hover:bg-[#fff1e2] transition-all",
+                                )
+                                for source, count in stats["context_counts"]
+                            ] if stats["context_counts"] else [
+                                Tr(
+                                    Td("No context sources recorded yet", cls="px-6 py-4 text-center", colspan="4"),
+                                    cls="bg-white border-b",
+                                )
+                            ],
+                            id="context-table-body",
+                        ),
+                        cls="w-full text-sm text-left text-[#263b30]",
+                        id="context-table",
+                    ),
+                    cls="w-full bg-white p-6 rounded-lg shadow-md border-2 border-[#d4f5a6]"
+                ),
+                cls="mb-8",
+            ),
+            cls="mb-8",
+        )
+        
+        # Charts Section - REARRANGED AND ENLARGED
+        # First Row: Insect & Plant Diversity
+        biodiversity_charts = Div(
             H2("Biodiversity Metrics", cls="text-xl font-bold mb-4 text-[#263b30]"),
             Div(
-                # Insect diversity card
+                # Insect diversity card - BIGGER
                 Div(
                     Div(
                         H3("Insect Diversity", cls="font-semibold mb-3 text-[#263b30]"),
                         Div(
-                            Div(id="insect-diversity-chart", cls="h-64"),
+                            Div(id="insect-diversity-chart", cls="h-96"),
                             cls="mt-4"
                         ),
                         cls="p-6"
                     ),
-                    cls="bg-white rounded-lg shadow-md border border-[#d4f5a6]"
+                    cls="bg-white rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
                 ),
                 
-                # Plant diversity card with radial chart
+                # Plant diversity card with radial chart - BIGGER
                 Div(
                     Div(
                         H3("Plant Species Diversity", cls="font-semibold mb-3 text-[#263b30]"),
                         Div(
-                            Div(id="plant-diversity-chart", cls="h-64"),
+                            Div(id="plant-diversity-chart", cls="h-96"),
                             cls="mt-4"
                         ),
                         cls="p-6"
                     ),
-                    cls="bg-white rounded-lg shadow-md border border-[#d4f5a6]"
+                    cls="bg-white rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
                 ),
                 
-                # Sites comparison card
+                cls="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8"
+            ),
+            cls="mb-8"
+        )
+        
+        # Second Row: Classification Overview and Monthly Trend
+        classification_overview = Div(
+            H2("Classification Overview", cls="text-xl font-bold mb-4 text-[#263b30]"),
+            Div(
+                # Donut chart - BIGGER
+                Div(
+                    Div(
+                        H3("Insect Category Distribution", cls="font-semibold mb-4 text-center text-[#263b30] text-lg"),
+                        Div(
+                            id="donut-chart-container",
+                            cls="mx-auto h-96"
+                        ),
+                        cls="p-6"
+                    ),
+                    cls="bg-white rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
+                ),
+                
+                # Monthly trend - MOVED FROM SECOND SECTION
+                Div(
+                    Div(
+                        H3("Monthly Trend", cls="font-semibold mb-3 text-[#263b30]"),
+                        Div(
+                            Div(id="monthly-trend-chart", cls="h-96"),
+                            cls="mt-2"
+                        ),
+                        cls="p-6"
+                    ),
+                    cls="bg-white rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
+                ),
+                
+                cls="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8"
+            ),
+            cls="mb-8"
+        )
+        
+        # Third Row: Site Comparison and Year-on-Year
+        comparative_charts = Div(
+            H2("Comparative Analysis", cls="text-xl font-bold mb-4 text-[#263b30]"),
+            Div(
+                # Sites comparison card - BIGGER
                 Div(
                     Div(
                         Div(
@@ -3200,24 +3341,15 @@ def serve():
                             cls="flex justify-between items-center"
                         ),
                         Div(
-                            Div(id="sites-comparison-chart", cls="h-64"),
+                            Div(id="sites-comparison-chart", cls="h-96"),
                             cls="mt-2"
                         ),
                         cls="p-6"
                     ),
-                    cls="bg-white rounded-lg shadow-md border border-[#d4f5a6]"
+                    cls="bg-white rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
                 ),
                 
-                cls="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8"
-            ),
-            cls="mb-8"
-        )
-        
-        # Enhanced monitoring metrics section (NEW)
-        monitoring_metrics = Div(
-            H2("Monitoring Metrics", cls="text-xl font-bold mb-4 text-[#263b30]"),
-            Div(
-                # Year-on-year comparison
+                # Year-on-year comparison - BIGGER
                 Div(
                     Div(
                         H3("Year-on-Year Comparison", cls="font-semibold mb-3 text-[#263b30]"),
@@ -3232,7 +3364,7 @@ def serve():
                                     ),
                                     cls="mb-4"
                                 ),
-                                Div(id="year-comparison-chart", cls="h-64"),
+                                Div(id="year-comparison-chart", cls="h-96"),
                                 cls="w-full"
                             ),
                             cls="mt-2"
@@ -3257,20 +3389,7 @@ def serve():
                         ),
                         cls="p-6"
                     ),
-                    cls="bg-white rounded-lg shadow-md border border-[#d4f5a6]"
-                ),
-                
-                # Monthly trend
-                Div(
-                    Div(
-                        H3("Monthly Trend", cls="font-semibold mb-3 text-[#263b30]"),
-                        Div(
-                            Div(id="monthly-trend-chart", cls="h-64"),
-                            cls="mt-2"
-                        ),
-                        cls="p-6"
-                    ),
-                    cls="bg-white rounded-lg shadow-md border border-[#d4f5a6]"
+                    cls="bg-white rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
                 ),
                 
                 cls="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8"
@@ -3278,7 +3397,7 @@ def serve():
             cls="mb-8"
         )
         
-        # Map Section - Keep the existing map section
+        # Map Section
         map_section = Div(
             H2("Conservation Project Map", cls="text-xl font-bold mb-4 text-[#263b30]"),
             Div(
@@ -3287,325 +3406,16 @@ def serve():
                     cls="text-base mb-2 text-[#263b30]"),
                     # Map iframe with responsive styling
                     NotStr('<iframe src="https://restor.eco/embed/sites/ce616eed-268b-43a7-87cc-181c801709fa/" title="Bionua Project at Dunsany Nature Reserve" width="100%" height="500" style="border: none; border-radius: 0.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);" frameborder="0"></iframe>'),
-                    cls="w-full bg-white p-6 rounded-lg shadow-md border border-[#d4f5a6]"
+                    cls="w-full bg-white p-6 rounded-lg shadow-md border-2 border-[#d4f5a6]"
                 ),
                 cls="w-full mb-8"
             ),
             cls="mb-8"
         )
         
-        # Original charts section - Updated with new colors
-        charts_section = Div(
-            H2("Classification Overview", cls="text-xl font-bold mb-4 text-[#263b30]"),
-            Div(
-                Div(
-                    # Donut chart for classification distribution
-                    Div(
-                        H3("Insect Category Distribution", cls="font-semibold mb-4 text-center text-[#263b30] text-lg"),
-                        
-                        # Chart Container
-                        Div(
-                            id="donut-chart-container",
-                            cls="mx-auto"
-                        ),
-                        
-                        # HTMX-powered chart reload button
-                        Div(
-                            Button(
-                                "Refresh Chart Data",
-                                cls="btn btn-sm btn-outline border-[#263b30] text-[#263b30] hover:bg-[#d4f5a6] mt-4",
-                                hx_get="/api/chart-data",
-                                hx_target="#donut-chart-container",
-                                hx_trigger="click",
-                                hx_indicator="#chart-loading"
-                            ),
-                            Span(
-                                Span(cls="loading loading-spinner loading-xs ml-2"),
-                                cls="htmx-indicator",
-                                id="chart-loading"
-                            ),
-                            cls="text-center mt-4"
-                        ),
-                        
-                        # Updated ApexCharts script with new colors
-                        Script(f"""
-                        document.addEventListener('DOMContentLoaded', function() {{
-                            // Extract data from server-side rendering
-                            const categoryData = {json.dumps([{'category': cat, 'count': count} for cat, count in stats["combined_category_counts"]])};
-                            
-                            // Prepare data for ApexCharts
-                            const labels = categoryData.map(item => item.category);
-                            const counts = categoryData.map(item => item.count);
-                            
-                            // Custom bee-themed colors using branding
-                            const colors = [
-                                '#263b30', // Earthy Green
-                                '#d4f5a6', // Light Green
-                                '#3b2b26', // Earthy Brown
-                                '#e6d4b5', // Lighter Brown
-                                '#8bbd54', // Medium Green
-                                '#516448', // Medium Dark Green
-                                '#fff1e2', // Beige
-                                '#798c70', // Sage Green
-                                '#a4b494', // Light Sage
-                                '#dae5c3'  // Very Light Green
-                            ];
-                            
-                            // Initialize ApexCharts Donut Chart
-                            const donutChart = new ApexCharts(document.querySelector("#donut-chart-container"), {{
-                                series: counts,
-                                chart: {{
-                                    type: 'donut',
-                                    height: 320,
-                                    fontFamily: 'inherit',
-                                    foreColor: '#263b30',
-                                    animations: {{
-                                        enabled: true,
-                                        easing: 'easeinout',
-                                        speed: 800
-                                    }}
-                                }},
-                                labels: labels,
-                                colors: colors,
-                                legend: {{
-                                    position: 'bottom',
-                                    fontSize: '14px',
-                                    formatter: function(seriesName, opts) {{
-                                        // Show category name and percentage
-                                        return `${{seriesName}}: ${{Math.round(opts.w.globals.series[opts.seriesIndex]/opts.w.globals.seriesTotals[0]*100)}}%`;
-                                    }}
-                                }},
-                                tooltip: {{
-                                    y: {{
-                                        formatter: function(value) {{
-                                            return value + " classifications";
-                                        }}
-                                    }}
-                                }},
-                                dataLabels: {{
-                                    enabled: false
-                                }},
-                                responsive: [{{
-                                    breakpoint: 480,
-                                    options: {{
-                                        chart: {{
-                                            height: 260
-                                        }},
-                                        legend: {{
-                                            position: 'bottom'
-                                        }}
-                                    }}
-                                }}],
-                                plotOptions: {{
-                                    pie: {{
-                                        donut: {{
-                                            size: '50%',
-                                            labels: {{
-                                                show: true,
-                                                name: {{
-                                                    show: true
-                                                }},
-                                                value: {{
-                                                    show: true,
-                                                    formatter: function(val) {{
-                                                        return val;
-                                                    }}
-                                                }},
-                                                total: {{
-                                                    show: true,
-                                                    label: 'Total',
-                                                    formatter: function(w) {{
-                                                        return w.globals.seriesTotals.reduce((a, b) => a + b, 0);
-                                                    }}
-                                                }}
-                                            }}
-                                        }}
-                                    }}
-                                }}
-                            }});
-                            
-                            // Render the chart
-                            donutChart.render();
-                            
-                            // Set up HTMX event listener to update chart when new data is received
-                            document.body.addEventListener('htmx:afterSwap', function(evt) {{
-                                if (evt.detail.target.id === 'donut-chart-container') {{
-                                    // Parse the new data (assuming JSON response)
-                                    try {{
-                                        const newData = JSON.parse(evt.detail.xhr.response);
-                                        donutChart.updateSeries(newData.counts);
-                                        donutChart.updateOptions({{
-                                            labels: newData.labels
-                                        }});
-                                    }} catch(e) {{
-                                        console.error('Error updating chart:', e);
-                                    }}
-                                }}
-                            }});
-                        }});
-                        """),
-                        
-                        cls="w-full bg-white p-6 rounded-lg shadow-md border border-[#d4f5a6]"
-                    ),
-                    cls="w-full lg:w-1/2"
-                ),
-                Div(
-                    # Updated Line chart for activity with new colors
-                    Div(
-                        Div(
-                            H3("Daily Classification Activity", cls="font-semibold text-[#263b30] text-lg"),
-                            
-                            # HTMX-powered time range selector
-                            Div(
-                                Div(role="button", tabindex="0", cls="btn btn-sm border-[#263b30] text-[#263b30]"),
-                                Span("Last 7 days", id="current-range"),
-                                Svg(
-                                    Path(
-                                        stroke="currentColor",
-                                        stroke_linecap="round",
-                                        stroke_linejoin="round",
-                                        stroke_width="2",
-                                        d="m1 1 4 4 4-4"
-                                    ),
-                                    cls="w-2.5 h-2.5 ml-1.5",
-                                    aria_hidden="true",
-                                    xmlns="http://www.w3.org/2000/svg",
-                                    fill="none",
-                                    viewBox="0 0 10 6"
-                                ),
-                                cls="dropdown dropdown-end"
-                            ),
-                            
-                            cls="flex justify-between mb-4"
-                        ),
-                        
-                        # Chart Container with Loading Indicator
-                        Div(
-                            Div(id="line-chart-container", cls="w-full"),
-                            Div(
-                                Span(cls="loading loading-spinner loading-md text-[#263b30]"),
-                                id="line-loading",
-                                cls="htmx-indicator absolute inset-0 flex items-center justify-center bg-base-100 bg-opacity-60"
-                            ),
-                            cls="relative"
-                        ),
-                        
-                        # Updated line chart script with new colors
-                        Script(f"""
-                        document.addEventListener('DOMContentLoaded', function() {{
-                            // Extract data from server-side rendering
-                            const dailyData = {json.dumps([{'date': date, 'count': count} for date, count in stats["daily_counts"]])};
-                            
-                            // Prepare data for ApexCharts
-                            const dates = dailyData.map(item => item.date);
-                            const counts = dailyData.map(item => item.count);
-                            
-                            // Initialize the line chart with branded colors
-                            const lineChart = new ApexCharts(document.querySelector("#line-chart-container"), {{
-                                series: [{{
-                                    name: 'Classifications',
-                                    data: counts
-                                }}],
-                                chart: {{
-                                    height: 300,
-                                    type: 'line',
-                                    fontFamily: 'inherit',
-                                    foreColor: '#263b30',
-                                    toolbar: {{
-                                        show: false
-                                    }},
-                                    animations: {{
-                                        enabled: true,
-                                        easing: 'easeinout',
-                                        speed: 800
-                                    }}
-                                }},
-                                stroke: {{
-                                    width: 3,
-                                    curve: 'smooth'
-                                }},
-                                colors: ['#263b30'], // Earthy green as primary color
-                                markers: {{
-                                    size: 5,
-                                    strokeWidth: 0,
-                                    hover: {{
-                                        size: 7
-                                    }}
-                                }},
-                                xaxis: {{
-                                    categories: dates,
-                                    labels: {{
-                                        rotateAlways: false,
-                                        style: {{
-                                            fontSize: '12px'
-                                        }}
-                                    }}
-                                }},
-                                yaxis: {{
-                                    title: {{
-                                        text: 'Classifications'
-                                    }},
-                                    min: 0,
-                                    forceNiceScale: true
-                                }},
-                                tooltip: {{
-                                    shared: true,
-                                    intersect: false,
-                                    y: {{
-                                        formatter: function(value) {{
-                                            return value + " classifications";
-                                        }}
-                                    }}
-                                }},
-                                grid: {{
-                                    show: true,
-                                    borderColor: '#d4f5a6',
-                                    strokeDashArray: 5,
-                                    position: 'back'
-                                }},
-                                fill: {{
-                                    type: 'gradient',
-                                    gradient: {{
-                                        shade: 'light',
-                                        type: "vertical",
-                                        shadeIntensity: 0.3,
-                                        inverseColors: false,
-                                        opacityFrom: 0.7,
-                                        opacityTo: 0.2,
-                                        stops: [0, 100],
-                                        colorStops: [
-                                            {{
-                                                offset: 0,
-                                                color: '#263b30',
-                                                opacity: 0.6
-                                            }},
-                                            {{
-                                                offset: 100,
-                                                color: '#d4f5a6',
-                                                opacity: 0.2
-                                            }}
-                                        ]
-                                    }}
-                                }}
-                            }});
-                            
-                            // Render the line chart
-                            lineChart.render();
-                        }});
-                        """),
-                        
-                        cls="w-full bg-white p-6 rounded-lg shadow-md border border-[#d4f5a6]"
-                    ),
-                    cls="w-full lg:w-1/2"
-                ),
-                cls="flex flex-col lg:flex-row gap-6 w-full"
-            ),
-            cls="mb-8"
-        )
-        
-        # Keep your original confidence & feedback section and tables
-        # Confidence & Feedback Section with updated colors
+        # Feedback Section
         confidence_feedback_section = Div(
+            H2("Classification Metrics", cls="text-xl font-bold mb-4 text-[#263b30]"),
             Div(
                 Div(
                     H3("Confidence Levels", cls="font-semibold mb-3 text-[#263b30]"),
@@ -3622,7 +3432,7 @@ def serve():
                                     Td(
                                         Span(
                                             confidence,
-                                            cls=f"badge {'badge-success' if confidence == 'High' else 'badge-warning' if confidence == 'Medium' else 'badge-error'}"
+                                            cls=f"badge {'bg-green-500 text-white' if confidence == 'High' else 'bg-yellow-500 text-white' if confidence == 'Medium' else 'bg-red-500 text-white'}"
                                         )
                                     ),
                                     Td(str(count)),
@@ -3632,7 +3442,7 @@ def serve():
                         ),
                         cls="table w-full"
                     ),
-                    cls="bg-white p-6 rounded-lg shadow-md border border-[#d4f5a6]"
+                    cls="bg-white p-6 rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
                 ),
                 Div(
                     H3("User Feedback", cls="font-semibold mb-3 text-[#263b30]"),
@@ -3649,7 +3459,7 @@ def serve():
                                     Td(
                                         Span(
                                             feedback,
-                                            cls=f"badge {'badge-success' if feedback == 'positive' else 'badge-error'}"
+                                            cls=f"badge {'bg-green-500 text-white' if feedback == 'positive' else 'bg-red-500 text-white'}"
                                         )
                                     ),
                                     Td(str(count)),
@@ -3664,76 +3474,274 @@ def serve():
                         ),
                         cls="table w-full"
                     ),
-                    cls="bg-white p-6 rounded-lg shadow-md border border-[#d4f5a6]"
+                    cls="bg-white p-6 rounded-lg shadow-md border-2 border-[#d4f5a6] hover:border-[#263b30] transition-all"
                 ),
                 cls="grid grid-cols-1 md:grid-cols-2 gap-6"
             ),
             cls="mb-8"
         )
         
-        # Tables Section - Keeping your existing tables
-        tables_section = Div(
-            H2("Classification Results", cls="text-xl font-bold mb-4 text-[#263b30]"),
+        # Recent Classifications Table
+        recent_classifications = Div(
+            H2("Recent Classifications", cls="text-xl font-bold mb-4 text-[#263b30]"),
             Div(
-                # Tab navigation
                 Div(
                     Div(
-                        Div(role="tablist", cls="tabs tabs-boxed bg-[#fff1e2] p-1 mb-6"),
-                        
                         Button(
-                            "Recent Classifications", 
-                            cls="tab tab-active",
-                            id="tab-recent",
-                            onclick="showTab('recent')",
-                            role="tab",
-                            aria_selected="true"
+                            Svg(
+                                Path(
+                                    stroke_linecap="round",
+                                    stroke_linejoin="round",
+                                    stroke_width="2",
+                                    d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                                ),
+                                cls="h-4 w-4 mr-1",
+                                xmlns="http://www.w3.org/2000/svg",
+                                fill="none",
+                                viewBox="0 0 24 24",
+                                stroke="currentColor"
+                            ),
+                            "Refresh",
+                            cls="btn btn-sm bg-[#d4f5a6] text-[#263b30] hover:bg-[#263b30] hover:text-[#d4f5a6]",
+                            hx_get="/api/recent-classifications",
+                            hx_target="#classifications-table-container",
+                            hx_trigger="click",
+                            hx_indicator="#table-loading"
                         ),
-                        
-                        Button(
-                            "All Classifications", 
-                            cls="tab",
-                            id="tab-all",
-                            onclick="showTab('all')",
-                            role="tab",
-                            aria_selected="false"
+                        Span(
+                            Span(cls="loading loading-spinner loading-xs ml-2"),
+                            cls="htmx-indicator",
+                            id="table-loading"
                         ),
-                        
-                        cls="flex justify-center"
+                        cls="mb-4"
                     ),
                     
-                    # Tab content containers (keep the rest of your original table code)
-                    # ...
-                    
-                    # Simple tab switching script
-                    Script("""
-                    function showTab(tabName) {
-                        // Hide all tab contents
-                        document.getElementById('tab-content-recent').classList.add('hidden');
-                        document.getElementById('tab-content-all').classList.add('hidden');
-                        
-                        // Deactivate all tabs
-                        document.getElementById('tab-recent').classList.remove('tab-active');
-                        document.getElementById('tab-all').classList.remove('tab-active');
-                        
-                        // Show selected tab content
-                        document.getElementById('tab-content-' + tabName).classList.remove('hidden');
-                        
-                        // Activate selected tab
-                        document.getElementById('tab-' + tabName).classList.add('tab-active');
-                    }
-                    """),
-                    
-                    cls="w-full"
+                    # Table with sortable columns
+                    Div(
+                        Table(
+                            Thead(
+                                Tr(
+                                    Th(
+                                        "Image",
+                                        scope="col",
+                                        cls="px-6 py-3 bg-[#d4f5a6] text-[#263b30]"
+                                    ),
+                                    Th(
+                                        Div(
+                                            "ID",
+                                            A(
+                                                Svg(
+                                                    Path(d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"),
+                                                    cls="w-3 h-3 ms-1.5",
+                                                    aria_hidden="true",
+                                                    xmlns="http://www.w3.org/2000/svg",
+                                                    fill="currentColor",
+                                                    viewBox="0 0 24 24",
+                                                ),
+                                                href="#",
+                                                cls="sort-link",
+                                                data_sort="id"
+                                            ),
+                                            cls="flex items-center",
+                                        ),
+                                        scope="col",
+                                        cls="px-6 py-3 bg-[#d4f5a6] text-[#263b30]"
+                                    ),
+                                    Th(
+                                        Div(
+                                            "Category",
+                                            A(
+                                                Svg(
+                                                    Path(d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"),
+                                                    cls="w-3 h-3 ms-1.5",
+                                                    aria_hidden="true",
+                                                    xmlns="http://www.w3.org/2000/svg",
+                                                    fill="currentColor",
+                                                    viewBox="0 0 24 24",
+                                                ),
+                                                href="#",
+                                                cls="sort-link",
+                                                data_sort="category"
+                                            ),
+                                            cls="flex items-center",
+                                        ),
+                                        scope="col",
+                                        cls="px-6 py-3 bg-[#d4f5a6] text-[#263b30]"
+                                    ),
+                                    Th(
+                                        Div(
+                                            "Confidence",
+                                            A(
+                                                Svg(
+                                                    Path(d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"),
+                                                    cls="w-3 h-3 ms-1.5",
+                                                    aria_hidden="true",
+                                                    xmlns="http://www.w3.org/2000/svg",
+                                                    fill="currentColor",
+                                                    viewBox="0 0 24 24",
+                                                ),
+                                                href="#",
+                                                cls="sort-link",
+                                                data_sort="confidence"
+                                            ),
+                                            cls="flex items-center",
+                                        ),
+                                        scope="col",
+                                        cls="px-6 py-3 bg-[#d4f5a6] text-[#263b30]"
+                                    ),
+                                    Th(
+                                        "Feedback",
+                                        scope="col",
+                                        cls="px-6 py-3 bg-[#d4f5a6] text-[#263b30]"
+                                    ),
+                                    Th(
+                                        Div(
+                                            "Created",
+                                            A(
+                                                Svg(
+                                                    Path(d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"),
+                                                    cls="w-3 h-3 ms-1.5",
+                                                    aria_hidden="true",
+                                                    xmlns="http://www.w3.org/2000/svg",
+                                                    fill="currentColor",
+                                                    viewBox="0 0 24 24",
+                                                ),
+                                                href="#",
+                                                cls="sort-link",
+                                                data_sort="date"
+                                            ),
+                                            cls="flex items-center",
+                                        ),
+                                        scope="col",
+                                        cls="px-6 py-3 bg-[#d4f5a6] text-[#263b30]"
+                                    ),
+                                    Th(
+                                        "Details",
+                                        scope="col",
+                                        cls="px-6 py-3 bg-[#d4f5a6] text-[#263b30]"
+                                    ),
+                                ),
+                                cls="text-xs text-[#263b30] uppercase"
+                            ),
+                            Tbody(
+                                *[
+                                    Tr(
+                                        # Image Cell
+                                        Td(
+                                            NotStr(create_image_thumbnail(get_classification_image_path(id))),
+                                            cls="px-6 py-4"
+                                        ),
+                                        
+                                        # ID Cell
+                                        Td(f"{id[:8]}...", cls="px-6 py-4 font-medium text-[#263b30]"),
+                                        
+                                        # Category Cell
+                                        Td(category, cls="px-6 py-4"),
+                                        
+                                        # Confidence Cell 
+                                        Td(
+                                            Span(
+                                                confidence,
+                                                cls=f"badge {'bg-green-500 text-white' if confidence == 'High' else 'bg-yellow-500 text-white' if confidence == 'Medium' else 'bg-red-500 text-white'}"
+                                            ),
+                                            cls="px-6 py-4"
+                                        ),
+                                        
+                                        # Feedback Cell
+                                        Td(
+                                            NotStr(generate_feedback_badge(feedback) if feedback else generate_feedback_buttons(id)),
+                                            cls="px-6 py-4"
+                                        ),
+                                        
+                                        # Date Cell
+                                        Td(created_at, cls="px-6 py-4"),
+                                        
+                                        # Details Cell - changed from Edit
+                                        Td(
+                                            A(
+                                                "View Details",
+                                                href="#",
+                                                cls="font-medium text-[#263b30] hover:text-[#3b2b26] hover:underline",
+                                                onclick=f"showClassificationDetails('{id}')",
+                                            ),
+                                            cls="px-6 py-4 text-right",
+                                        ),
+                                        
+                                        cls="bg-white border-b hover:bg-[#fff1e2] transition-all",
+                                        id=f"classification-row-{id[:8]}"
+                                    )
+                                    for id, category, confidence, feedback, created_at, context_source in stats["recent_classifications"]
+                                ]
+                            ),
+                            cls="w-full text-sm text-left text-[#263b30]",
+                            id="classifications-table"
+                        ),
+                        id="classifications-table-container",
+                        cls="overflow-x-auto relative shadow-md sm:rounded-lg"
+                    ),
+                    cls="bg-white p-6 rounded-lg shadow-md border-2 border-[#d4f5a6]"
                 ),
-                cls="w-full"
+                cls="w-full mb-8"
             ),
             cls="mb-8"
         )
         
-        # Now add scripts for the new biodiversity charts
+        # Detail Modals (classification and context)
+        detail_modals = Div(
+            # Classification Details Modal
+            Div(
+                Div(
+                    Div(
+                        H3("Classification Details", cls="text-xl font-bold mb-4 text-[#263b30]"),
+                        Div(
+                            # Content will be populated dynamically via JavaScript
+                            cls="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4"
+                        ),
+                        Div(
+                            Button(
+                                "Close",
+                                cls="btn bg-[#263b30] text-white hover:bg-[#3b2b26]",
+                                onclick="closeModal('classification-detail-modal')"
+                            ),
+                            cls="flex justify-end"
+                        ),
+                        cls="bg-white rounded-lg p-6 max-w-4xl mx-auto"
+                    ),
+                    cls="fixed inset-0 flex items-center justify-center z-50 bg-black bg-opacity-50 hidden",
+                    id="classification-detail-modal"
+                ),
+                
+                # Context Details Modal
+                Div(
+                    Div(
+                        H3("Context Source Details", cls="text-xl font-bold mb-4 text-[#263b30]"),
+                        Div(
+                            # Content will be populated dynamically via JavaScript
+                            Div(id="context-detail-content", cls="mb-4"),
+                            Img(id="context-image", src="", alt="Context Image", cls="max-h-96 mx-auto hidden"),
+                            Div(id="context-pdf-container", cls="hidden"),
+                            cls="mb-4"
+                        ),
+                        Div(
+                            Button(
+                                "Close",
+                                cls="btn bg-[#263b30] text-white hover:bg-[#3b2b26]",
+                                onclick="closeModal('context-detail-modal')"
+                            ),
+                            cls="flex justify-end"
+                        ),
+                        cls="bg-white rounded-lg p-6 max-w-4xl mx-auto"
+                    ),
+                    cls="fixed inset-0 flex items-center justify-center z-50 bg-black bg-opacity-50 hidden",
+                    id="context-detail-modal"
+                ),
+            )
+        )
+        
+        # Add scripts for the charts with larger size settings
         biodiversity_scripts = Script("""
         document.addEventListener('DOMContentLoaded', function() {
-            // Create insect diversity chart
+            // Create insect diversity chart with larger dimensions
             const insectDiversityChart = new ApexCharts(document.getElementById('insect-diversity-chart'), {
                 series: [{
                     name: 'Species Count',
@@ -3741,7 +3749,8 @@ def serve():
                 }],
                 chart: {
                     type: 'bar',
-                    height: 250,
+                    height: 380,
+                    width: '100%',
                     fontFamily: 'inherit',
                     foreColor: '#263b30',
                     toolbar: {
@@ -3752,19 +3761,34 @@ def serve():
                     bar: {
                         horizontal: false,
                         columnWidth: '55%',
-                        borderRadius: 5
+                        borderRadius: 5,
+                        distributed: true
                     },
                 },
                 dataLabels: {
-                    enabled: false
+                    enabled: true,
+                    formatter: function(val) {
+                        return val
+                    }
                 },
-                colors: ['#263b30'],
+                colors: ['#d4f5a6', '#8bbd54', '#516448', '#d4f5a6', '#8bbd54', '#516448', '#d4f5a6', '#8bbd54'],
                 xaxis: {
                     categories: ['Bumblebees', 'Solitary bees', 'Honeybee', 'Wasps', 'Hoverflies', 'Butterflies', 'Beetles', 'Other'],
+                    labels: {
+                        style: {
+                            fontSize: '12px',
+                            fontWeight: 600,
+                            colors: Array(8).fill('#263b30')
+                        }
+                    }
                 },
                 yaxis: {
                     title: {
-                        text: 'Species Count'
+                        text: 'Species Count',
+                        style: {
+                            fontSize: '14px',
+                            fontWeight: 600
+                        }
                     }
                 },
                 fill: {
@@ -3780,11 +3804,12 @@ def serve():
             });
             insectDiversityChart.render();
             
-            // Create plant diversity radial chart
+            // Create plant diversity radial chart with larger dimensions
             const plantDiversityChart = new ApexCharts(document.getElementById('plant-diversity-chart'), {
                 series: [76, 45, 32, 18, 10],
                 chart: {
-                    height: 250,
+                    height: 380,
+                    width: '100%',
                     type: 'radialBar',
                 },
                 plotOptions: {
@@ -3805,6 +3830,9 @@ def serve():
                             value: {
                                 show: false,
                             }
+                        },
+                        track: {
+                            background: '#fff1e2'
                         }
                     }
                 },
@@ -3813,7 +3841,8 @@ def serve():
                 legend: {
                     show: true,
                     floating: true,
-                    fontSize: '12px',
+                    fontSize: '14px',
+                    fontWeight: 600,
                     position: 'right',
                     offsetX: 40,
                     offsetY: 15,
@@ -3830,7 +3859,85 @@ def serve():
             });
             plantDiversityChart.render();
             
-            // Create site comparison chart
+            // Create donut chart with larger dimensions
+            const donutChart = new ApexCharts(document.querySelector("#donut-chart-container"), {
+                series: [44, 55, 13, 33, 22, 11],
+                chart: {
+                    type: 'donut',
+                    height: 380,
+                    width: '100%',
+                    fontFamily: 'inherit',
+                    foreColor: '#263b30',
+                    animations: {
+                        enabled: true,
+                        easing: 'easeinout',
+                        speed: 800
+                    }
+                },
+                labels: ['Bumblebees', 'Solitary bees', 'Honeybee', 'Wasps', 'Hoverflies', 'Other'],
+                colors: [
+                    '#263b30', // Earthy Green
+                    '#d4f5a6', // Light Green
+                    '#3b2b26', // Earthy Brown
+                    '#e6d4b5', // Lighter Brown
+                    '#8bbd54', // Medium Green
+                    '#516448', // Medium Dark Green
+                ],
+                legend: {
+                    position: 'bottom',
+                    fontSize: '14px',
+                    fontWeight: 600,
+                    formatter: function(seriesName, opts) {
+                        // Show category name and percentage
+                        return `${seriesName}: ${Math.round(opts.w.globals.series[opts.seriesIndex]/opts.w.globals.seriesTotals[0]*100)}%`;
+                    }
+                },
+                tooltip: {
+                    y: {
+                        formatter: function(value) {
+                            return value + " classifications";
+                        }
+                    }
+                },
+                dataLabels: {
+                    enabled: false
+                },
+                plotOptions: {
+                    pie: {
+                        donut: {
+                            size: '50%',
+                            labels: {
+                                show: true,
+                                name: {
+                                    show: true,
+                                    fontSize: '16px',
+                                    fontWeight: 600
+                                },
+                                value: {
+                                    show: true,
+                                    fontSize: '20px',
+                                    fontWeight: 600,
+                                    formatter: function(val) {
+                                        return val;
+                                    }
+                                },
+                                total: {
+                                    show: true,
+                                    label: 'Total',
+                                    fontSize: '16px',
+                                    fontWeight: 600,
+                                    formatter: function(w) {
+                                        return w.globals.seriesTotals.reduce((a, b) => a + b, 0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            donutChart.render();
+            
+            // Create site comparison chart with larger dimensions
             const sitesComparisonChart = new ApexCharts(document.getElementById('sites-comparison-chart'), {
                 series: [{
                     name: 'Dunsany',
@@ -3841,8 +3948,8 @@ def serve():
                 }],
                 chart: {
                     type: 'bar',
-                    height: 250,
-                    stacked: false,
+                    height: 380,
+                    width: '100%',
                     fontFamily: 'inherit',
                     foreColor: '#263b30',
                     toolbar: {
@@ -3853,7 +3960,7 @@ def serve():
                     bar: {
                         horizontal: false,
                         columnWidth: '55%',
-                        borderRadius: 3,
+                        borderRadius: 5,
                     },
                 },
                 dataLabels: {
@@ -3867,10 +3974,20 @@ def serve():
                 colors: ['#263b30', '#d4f5a6'],
                 xaxis: {
                     categories: ['Bumblebees', 'Solitary bees', 'Honeybee', 'Wasps', 'Hoverflies', 'Butterflies', 'Beetles', 'Small insects', 'Other'],
+                    labels: {
+                        style: {
+                            fontSize: '12px',
+                            fontWeight: 600
+                        }
+                    }
                 },
                 yaxis: {
                     title: {
-                        text: 'Species Count'
+                        text: 'Species Count',
+                        style: {
+                            fontSize: '14px',
+                            fontWeight: 600
+                        }
                     }
                 },
                 fill: {
@@ -3886,12 +4003,14 @@ def serve():
                 legend: {
                     position: 'top',
                     horizontalAlign: 'left',
-                    offsetX: 40
+                    offsetX: 40,
+                    fontSize: '14px',
+                    fontWeight: 600
                 }
             });
             sitesComparisonChart.render();
             
-            // Create year comparison chart
+            // Create year comparison chart with larger dimensions
             const yearComparisonChart = new ApexCharts(document.getElementById('year-comparison-chart'), {
                 series: [{
                     name: 'Current Year',
@@ -3902,7 +4021,8 @@ def serve():
                 }],
                 chart: {
                     type: 'line',
-                    height: 250,
+                    height: 380,
+                    width: '100%',
                     fontFamily: 'inherit',
                     foreColor: '#263b30',
                     toolbar: {
@@ -3923,10 +4043,20 @@ def serve():
                 colors: ['#263b30', '#8bbd54'],
                 xaxis: {
                     categories: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug'],
+                    labels: {
+                        style: {
+                            fontSize: '12px',
+                            fontWeight: 600
+                        }
+                    }
                 },
                 yaxis: {
                     title: {
-                        text: 'Insect Count'
+                        text: 'Insect Count',
+                        style: {
+                            fontSize: '14px',
+                            fontWeight: 600
+                        }
                     }
                 },
                 tooltip: {
@@ -3941,7 +4071,9 @@ def serve():
                 legend: {
                     position: 'top',
                     horizontalAlign: 'right',
-                    offsetX: -10
+                    offsetX: -10,
+                    fontSize: '14px',
+                    fontWeight: 600
                 },
                 grid: {
                     borderColor: '#e7e7e7',
@@ -3953,14 +4085,15 @@ def serve():
             });
             yearComparisonChart.render();
             
-            // Create monthly trend chart
+            // Create monthly trend chart with larger dimensions
             const monthlyTrendChart = new ApexCharts(document.getElementById('monthly-trend-chart'), {
                 series: [{
                     name: 'Insect Count',
                     data: [31, 40, 65, 78, 91, 109, 125, 150, 132, 110, 60, 45]
                 }],
                 chart: {
-                    height: 250,
+                    height: 380,
+                    width: '100%',
                     type: 'area',
                     fontFamily: 'inherit',
                     foreColor: '#263b30',
@@ -3976,7 +4109,7 @@ def serve():
                 },
                 stroke: {
                     curve: 'smooth',
-                    width: 2
+                    width: 3
                 },
                 colors: ['#263b30'],
                 fill: {
@@ -4001,20 +4134,30 @@ def serve():
                     }
                 },
                 markers: {
-                    size: 4,
+                    size: 5,
                     colors: ['#fff'],
                     strokeColors: '#263b30',
                     strokeWidth: 2,
                     hover: {
-                        size: 7,
+                        size: 8,
                     }
                 },
                 xaxis: {
                     categories: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
+                    labels: {
+                        style: {
+                            fontSize: '12px',
+                            fontWeight: 600
+                        }
+                    }
                 },
                 yaxis: {
                     title: {
-                        text: 'Insect Count'
+                        text: 'Insect Count',
+                        style: {
+                            fontSize: '14px',
+                            fontWeight: 600
+                        }
                     },
                     min: 0
                 },
@@ -4032,10 +4175,153 @@ def serve():
         });
         """)
         
-        # Add Site Selector and PDF Export script
-        site_and_export_script = Script("""
-        // Site selector dropdown functionality
+        # Add script for table sorting, modals and PDF export
+        interactive_scripts = Script("""
         document.addEventListener('DOMContentLoaded', function() {
+            // Table sorting functionality
+            const sortLinks = document.querySelectorAll('.sort-link');
+            sortLinks.forEach(link => {
+                link.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    const sortField = this.getAttribute('data-sort');
+                    const tableId = this.closest('table').id;
+                    sortTable(tableId, sortField);
+                });
+            });
+            
+            // Initialize site selector
+            initSiteSelector();
+        });
+        
+        // Table sorting function
+        function sortTable(tableId, field) {
+            const table = document.getElementById(tableId);
+            if (!table) return;
+            
+            const tbody = table.querySelector('tbody');
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            
+            // Determine column index based on field
+            let columnIndex = 0;
+            if (tableId === 'context-table') {
+                switch(field) {
+                    case 'count': columnIndex = 1; break;
+                    case 'page': columnIndex = 2; break;
+                    default: columnIndex = 0;
+                }
+            } else if (tableId === 'classifications-table') {
+                switch(field) {
+                    case 'id': columnIndex = 1; break;
+                    case 'category': columnIndex = 2; break;
+                    case 'confidence': columnIndex = 3; break;
+                    case 'date': columnIndex = 5; break;
+                    default: columnIndex = 0;
+                }
+            }
+            
+            // Sort based on column content
+            let sortDirection = table.getAttribute('data-sort-dir') === 'asc' ? 'desc' : 'asc';
+            table.setAttribute('data-sort-dir', sortDirection);
+            
+            rows.sort((a, b) => {
+                const cellA = a.querySelectorAll('td')[columnIndex].textContent.trim();
+                const cellB = b.querySelectorAll('td')[columnIndex].textContent.trim();
+                
+                if (sortDirection === 'asc') {
+                    return cellA.localeCompare(cellB, undefined, {numeric: true});
+                } else {
+                    return cellB.localeCompare(cellA, undefined, {numeric: true});
+                }
+            });
+            
+            // Update table with sorted rows
+            rows.forEach(row => tbody.appendChild(row));
+            
+            // Show sorting indicator
+            showToast(`Sorted by ${field} (${sortDirection === 'asc' ? 'ascending' : 'descending'})`, 'info');
+        }
+        
+        // Modal functions
+        function showClassificationDetails(id) {
+            const modal = document.getElementById('classification-detail-modal');
+            const content = modal.querySelector('.grid');
+            
+            // In a real implementation, you would fetch the details from the server
+            // For now, we'll simulate with placeholder content
+            content.innerHTML = `
+                <div class="bg-[#fff1e2] p-4 rounded-lg">
+                    <h4 class="font-semibold text-[#263b30] mb-2">Classification Details</h4>
+                    <p><span class="font-semibold">ID:</span> ${id}</p>
+                    <p><span class="font-semibold">Category:</span> Bumblebees</p>
+                    <p><span class="font-semibold">Confidence:</span> <span class="badge bg-green-500 text-white">High</span></p>
+                    <p><span class="font-semibold">Description:</span> Large yellow and black insect with fuzzy body</p>
+                </div>
+                <div>
+                    <h4 class="font-semibold text-[#263b30] mb-2">Input Image</h4>
+                    <div class="bg-gray-200 h-48 rounded-lg flex items-center justify-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                        </svg>
+                    </div>
+                </div>
+                <div class="col-span-1 md:col-span-2">
+                    <h4 class="font-semibold text-[#263b30] mb-2">Context Used</h4>
+                    <div class="bg-gray-200 p-4 rounded-lg">
+                        <p>FIT-Counts-guide, page 5</p>
+                    </div>
+                </div>
+            `;
+            
+            // Show modal
+            modal.classList.remove('hidden');
+        }
+        
+        function showContextDetails(sourceId, title) {
+            const modal = document.getElementById('context-detail-modal');
+            const content = document.getElementById('context-detail-content');
+            const image = document.getElementById('context-image');
+            const pdfContainer = document.getElementById('context-pdf-container');
+            
+            // Update content
+            modal.querySelector('h3').textContent = title;
+            content.innerHTML = `
+                <p class="mb-2">This context source was used to enhance classification accuracy.</p>
+                <div class="bg-[#fff1e2] p-4 rounded-lg">
+                    <p><span class="font-semibold">Source:</span> ${sourceId.replace('_', ' ')}</p>
+                    <p><span class="font-semibold">Usage Count:</span> 15</p>
+                    <p><span class="font-semibold">Type:</span> Reference Document</p>
+                </div>
+            `;
+            
+            // For demonstration, show an image placeholder
+            // In a real implementation, you would fetch the actual image
+            image.src = ""; // Clear existing image
+            image.classList.add('hidden');
+            
+            // PDF would be shown here in a real implementation
+            pdfContainer.innerHTML = `
+                <div class="bg-gray-200 h-64 rounded-lg flex items-center justify-center">
+                    <div class="text-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 mx-auto text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                        </svg>
+                        <p class="text-gray-600 mt-2">Context Document Preview</p>
+                    </div>
+                </div>
+            `;
+            pdfContainer.classList.remove('hidden');
+            
+            // Show modal
+            modal.classList.remove('hidden');
+        }
+        
+        function closeModal(modalId) {
+            const modal = document.getElementById(modalId);
+            modal.classList.add('hidden');
+        }
+        
+        // Site selector initialization
+        function initSiteSelector() {
             const siteSelector = document.getElementById('site-selector');
             const siteDropdown = document.getElementById('site-dropdown');
             
@@ -4060,22 +4346,21 @@ def serve():
                         siteDropdown.classList.add('hidden');
                         
                         // Update charts based on selected site
-                        // This would be implemented with real data
                         if (option.textContent.includes('Site 2')) {
-                            // Show placeholder data message
-                            showToast('Displaying placeholder data for Site 2');
+                            showToast('Displaying placeholder data for Site 2', 'info');
+                        } else {
+                            showToast('Displaying data for Dunsany Nature Reserve', 'info');
                         }
                     });
                 });
             }
-        });
+        }
         
-        // PDF Export functionality
+        // PDF Export function
         function downloadPDF() {
-            showToast('Preparing PDF download...');
+            showToast('Preparing PDF download...', 'info');
             
-            // In a real implementation, this would use a library like html2pdf.js
-            // For now, we'll simulate the export with a timeout
+            // In a real implementation, this would use html2pdf.js or similar
             setTimeout(() => {
                 showToast('Dashboard exported as PDF!', 'success');
             }, 1500);
@@ -4085,7 +4370,7 @@ def serve():
         function showToast(message, type = 'info') {
             // Create toast element
             const toast = document.createElement('div');
-            toast.className = `fixed bottom-4 right-4 ${type === 'success' ? 'bg-green-500' : 'bg-blue-500'} text-white px-4 py-2 rounded-lg shadow-lg flex items-center z-50`;
+            toast.className = `fixed bottom-4 right-4 ${type === 'success' ? 'bg-[#263b30]' : 'bg-[#3b2b26]'} text-white px-4 py-2 rounded-lg shadow-lg flex items-center z-50`;
             
             // Add icon based on type
             const icon = document.createElement('span');
@@ -4118,9 +4403,10 @@ def serve():
         }
         """)
         
+        # Combine all components
         return Title("Biodiversity Dashboard - Insect Classifier"), Main(
-            site_and_export_script,
             biodiversity_scripts,
+            interactive_scripts,
             Div(
                 H1("Biodiversity Monitoring Dashboard", cls="text-3xl font-bold text-center mb-2 text-[#263b30]"),
                 P("Statistics and insights from the Insect Classification and Biodiversity Monitoring", cls="text-center mb-8 text-[#3b2b26]"),
@@ -4128,12 +4414,15 @@ def serve():
                 navbar,
                 action_buttons,
                 summary_cards,
-                biodiversity_metrics,
-                monitoring_metrics,
-                map_section,
-                charts_section,
-                confidence_feedback_section,
-                tables_section,
+                # Rearranged order of components
+                context_table,           # Context table added first
+                biodiversity_charts,     # Biodiversity charts
+                classification_overview, # Classification overview 
+                comparative_charts,      # Comparative charts
+                map_section,             # Map section
+                confidence_feedback_section, # Confidence and feedback stats
+                recent_classifications,  # Recent classifications table
+                detail_modals,           # Hidden modals for details
                 cls="container mx-auto px-4 py-8 max-w-7xl"
             ),
             cls="min-h-screen bg-[#fff1e2]",
