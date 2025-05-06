@@ -1,51 +1,26 @@
-from fasthtml.common import *
 import modal
-import fastapi
-import logging
-import uuid
-import asyncio
-import aiohttp
 import os
-import io
 import sqlite3
-import torch
-import base64
-import datetime
-from modal import Secret
-from fastlite import Database
-from starlette.middleware.sessions import SessionMiddleware
-from starlette.middleware import Middleware
-from starlette.requests import Request
-from starlette.responses import FileResponse, Response
-from fastapi import FastAPI, Request, Response as FastAPIResponse
-from fastapi.responses import FileResponse as FastAPIFileResponse
-from starlette.responses import Response as StarletteResponse
-from PIL import Image
-from colpali_engine.models import ColQwen2, ColQwen2Processor
-from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
-from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-import matplotlib.pyplot as plt
+import uuid
+import time
 import json
+import base64
+import torch
+import numpy as np
+import requests
+import logging
 import pickle
 import pandas as pd
-import numpy as np
-from nltk.tokenize import word_tokenize
-import nltk
-from rerankers import Reranker
+from typing import Optional, Dict, Any, List
+from collections import Counter
+from PIL import Image
 from io import BytesIO
+from nltk.tokenize import word_tokenize
+import matplotlib.pyplot as plt
+import traceback
 
-# Constants
-MISTRAL_MODELS_DIR = "/Mistral"  
-COLQWEN_MODELS_DIR = "/ColQwen"  # volume for ColQwen2 models
-DATA_DIR = "/bee_pdf"
-TEMP_UPLOAD_DIR = "/bee_pdf/temp_uploads"
-HEATMAP_DIR = "/bee_pdf/heatmaps"  # Directory for storing heatmaps
-DEFAULT_MISTRAL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
-DEFAULT_COLQWEN_NAME = "vidore/colqwen2-v1.0"
-USERNAME = "c123ian"
-APP_NAME = "polliknow-rag"
-DATABASE_DIR = "/db_rag_advan"
-PDF_IMAGES_DIR = "/bee_pdf/pdf_images"
+from fasthtml.common import *
+from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
 
 # Configure logging
 logging.basicConfig(
@@ -54,1917 +29,5190 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# Setup database
-db_path = os.path.join(DATABASE_DIR, 'image_analysis.db')
-os.makedirs(DATABASE_DIR, exist_ok=True)
-os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
-os.makedirs(HEATMAP_DIR, exist_ok=True)
+# Define app
+app = modal.App("bee_classifier_rag")
 
-conn = sqlite3.connect(db_path)
-cursor = conn.cursor()
-# Check if context_source column exists, add it if not
-cursor.execute("PRAGMA table_info(image_analyses)")
-columns = [column[1] for column in cursor.fetchall()]
-if 'image_analyses' not in columns:
-    # Create the table if it doesn't exist
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS image_analyses (
-            analysis_id TEXT PRIMARY KEY,
-            image_path TEXT NOT NULL,
-            analysis_type TEXT NOT NULL,
-            query TEXT NOT NULL,
-            response TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
+# Constants and directories
+DATA_DIR = "/data"
+RESULTS_FOLDER = "/data/classification_results"
+DB_PATH = "/data/bee_classifier.db"
+STATUS_DIR = "/data/status"
+TEMP_UPLOAD_DIR = "/data/temp_uploads"
+PDF_IMAGES_DIR = "/data/pdf_images"
+HEATMAP_DIR = "/data/heatmaps"
+TEMPLATES_DIR = "/data/templates"
 
-# Don't try to add context_source if it's already there
-if 'context_source' not in columns:
-    try:
-        cursor.execute('ALTER TABLE image_analyses ADD COLUMN context_source TEXT')
-        conn.commit()
-        logging.info("Added context_source column to image_analyses table")
-    except Exception as e:
-        logging.error(f"Error adding context_source column: {e}")
-conn.close()
+# Claude API constants
+CLAUDE_API_KEY = xxxxxxx
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
-# Set up volumes
-try:
-    mistral_volume = modal.Volume.lookup("Mistral", create_if_missing=False)
-except modal.exception.NotFoundError:
-    raise Exception("Download Mistral models first with the appropriate script")
+# Global variables for RAG - DECLARE ALL GLOBALS HERE
+colpali_embeddings = None
+df = None
+page_images = {}
+bm25_index = None
+tokenized_docs = None
+colqwen2_model = None
+colqwen2_processor = None
 
-try:
-    colqwen_volume = modal.Volume.lookup("ColQwen", create_if_missing=False)
-except modal.exception.NotFoundError:
-    raise Exception("Download ColQwen models first with the appropriate script")
+# Insect categories for classification
+INSECT_CATEGORIES = [
+    "Bumblebees", 
+    "Solitary bees",
+    "Honeybee", 
+    "Wasps",
+    "Hoverflies", 
+    "Butterflies & Moths",
+    "Beetles (>3mm)",
+    "Small insects (<3mm)",
+    "Other insects",
+    "Other flies"
+]
 
-try:
-    bee_volume = modal.Volume.from_name("bee_pdf", create_if_missing=True)
-except modal.exception.NotFoundError:
-    bee_volume = modal.Volume.persisted("bee_pdf")
+# Classification prompts
+CLASSIFICATION_PROMPT = """
+You are an expert entomologist specializing in insect identification. Your task is to analyze the 
+provided insect image and classify the insect(s) visible.
 
-try:
-    db_volume = modal.Volume.lookup("db_data", create_if_missing=True)
-except modal.exception.NotFoundError:
-    db_volume = modal.Volume.persisted("db_data")
+Please categorize the insect into one of these categories:
+{categories}
 
-# Image definition with environment variables
-image = modal.Image.debian_slim(python_version="3.10") \
-    .apt_install("libgl1-mesa-glx","libglib2.0-0","libsm6","libxrender1","libxext6","poppler-utils") \
+{image_context_instructions}
+
+{additional_instructions}
+
+Format your response as follows:
+- Main Category: [the most likely category from the list]
+- Confidence: [High, Medium, or Low]
+- Description: [brief description of what you see]
+{format_instructions}
+
+IMPORTANT: Just provide the formatted response above with no additional explanation or apology.
+"""
+
+BATCH_PROMPT = """
+You are an expert entomologist specializing in insect identification. Your task is to analyze {count} 
+images of insects and classify each one.
+
+For EACH image, categorize the insect into one of these categories:
+{categories}
+
+{image_context_instructions}
+
+{additional_instructions}
+
+Format your response as follows, with a separate analysis for each image:
+
+IMAGE 1:
+- Main Category: [the most likely category from the list]
+- Confidence: [High, Medium, or Low]
+- Description: [brief description of what you see]
+{format_instructions}
+
+IMAGE 2:
+- Main Category: [the most likely category from the list]
+- Confidence: [High, Medium, or Low]
+- Description: [brief description of what you see]
+{format_instructions}
+
+And so on for each image...
+
+IMPORTANT: Provide a separate, clearly labeled analysis for each image using the format above.
+"""
+
+# Create custom image with all dependencies - FIXED for NumPy issue
+image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("git", "libgl1-mesa-glx", "libglib2.0-0", "libsm6", "libxrender1", "libxext6")
     .pip_install(
-        "vllm==0.8.1",
-        "mistral_common>=1.5.4",
-        "python-fasthtml==0.4.3",
-        "aiohttp",
-        "faiss-cpu",
-        "sentence-transformers",
+        "requests",
+        "python-fasthtml==0.12.0",
+        "numpy==2.2.4",  
         "pandas",
-        "numpy",
-        "huggingface_hub",
-        "transformers>=4.48.3",
+        "Pillow",
+        "matplotlib",
         "rerankers",
-        "sqlite-minutils",
         "rank-bm25",
         "nltk",
-        "sqlalchemy",
-        "pdf2image",
-        "colpali-engine[interpretability]>=0.3.2",
-        "torch",
-        "matplotlib"
-    ) \
-    .env({"VLLM_USE_V1": "0"})  # Set VLLM_USE_V1=0 to fix Mistral compatibility
-
-app = modal.App(APP_NAME)
-
-# Helper function to convert image to data URI
-def format_image(image):
-    """Convert PIL Image to data URI for multimodal API"""
-    buffered = io.BytesIO()
-    # Convert to RGB if it has alpha channel
-    if image.mode == "RGBA":
-        image = image.convert("RGB")
-    image.save(buffered, format="JPEG", quality=90)
-    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    image_data_uri = f'data:image/jpeg;base64,{img_base64}'
-    return image_data_uri
-
-@app.function(
-    image=image,
-    gpu=modal.gpu.A100(count=1, size="80GB"),
-    container_idle_timeout=10 * 60,
-    timeout=24 * 60 * 60,
-    allow_concurrent_inputs=20,
-    volumes={
-        MISTRAL_MODELS_DIR: mistral_volume,
-        COLQWEN_MODELS_DIR: colqwen_volume,
-        DATA_DIR: bee_volume,
-        DATABASE_DIR: db_volume
-    }
-)
-@modal.asgi_app()
-def serve_vllm():
-    import os
-    import asyncio
-    import fastapi
-    import uuid
-    import datetime
-    import base64
-    import io
-    from fastapi.responses import StreamingResponse, JSONResponse
-    from typing import Optional, List, Dict, Any
-    from PIL import Image
-
-    from vllm import LLM
-    from vllm.sampling_params import SamplingParams
-
-    # Log environment configuration
-    logging.info(f"VLLM_USE_V1 environment variable: {os.environ.get('VLLM_USE_V1', 'not set')}")
-
-    web_app = fastapi.FastAPI(
-        title=f"OpenAI-compatible {DEFAULT_MISTRAL_NAME} server",
-        description="Multimodal LLM server for insect classification",
-        version="0.0.1",
-        docs_url="/docs",
+        "sentence-transformers",
+        "colpali-engine"
     )
+)
 
-    def find_model_path(base_dir):
-        for root, _, files in os.walk(base_dir):
-            if "config.json" in files:
-                return root
-        return None
+# Look up data volume for storing results
+try:
+    bee_volume = modal.Volume.lookup("bee_volume", create_if_missing=True)
+except modal.exception.NotFoundError:
+    bee_volume = modal.Volume.persisted("bee_volume")
 
-    model_path = find_model_path(MISTRAL_MODELS_DIR)
-    if not model_path:
-        raise Exception(f"Could not find model files in {MISTRAL_MODELS_DIR}")
+# Setup database for classification results with feedback support
+def setup_database(db_path: str):
+    """Initialize SQLite database for classification results"""
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    cursor = conn.cursor()
+    
+    # Enable WAL mode for better concurrency
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+    
+    # Create tables for both single and batch results
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS results (
+            id TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            description TEXT NOT NULL,
+            additional_details TEXT,
+            status TEXT DEFAULT 'generated',
+            feedback TEXT DEFAULT NULL, 
+            context_source TEXT DEFAULT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Add a table for batch results
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS batch_results (
+            batch_id TEXT PRIMARY KEY,
+            result_count INTEGER NOT NULL,
+            results TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    conn.commit()
+    return conn
 
-    # Initialize the LLM
-    logging.info(f"Initializing LLM with model path: {model_path}")
+# Function to save results to file
+def save_results_file(result_id, result_content):
+    """Save classification results to a file"""
+    os.makedirs(RESULTS_FOLDER, exist_ok=True)
+    result_file = os.path.join(RESULTS_FOLDER, f"{result_id}.json")
+    result_data = {
+        "id": result_id,
+        "result": result_content,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
     
     try:
-        # Initialize with multimodal support
-        llm = LLM(
-            model=model_path,
-            tensor_parallel_size=1,
-            gpu_memory_utilization=0.95,
-            trust_remote_code=True,
-            max_model_len=4096,
-            tokenizer_mode="mistral",
-            config_format="mistral",
-            load_format="mistral",
-            dtype="float16"
-        )
-        logging.info("LLM initialized successfully!")
-    except Exception as init_error:
-        logging.error(f"Error initializing LLM: {init_error}")
+        with open(result_file, "w") as f:
+            json.dump(result_data, f)
+        print(f"✅ Saved result file for ID: {result_id}")
+        return True
+    except Exception as e:
+        print(f"⚠️ Error saving result file: {e}")
+        return False
+
+# Get classification statistics for dashboard
+def get_classification_stats():
+    """Query the database to get statistics about insect classifications"""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        cursor = conn.cursor()
+        
+        # Get overall counts by category from single results
+        cursor.execute("""
+            SELECT category, COUNT(*) as count 
+            FROM results 
+            GROUP BY category 
+            ORDER BY count DESC
+        """)
+        category_counts = cursor.fetchall()
+        
+        # Get total classifications
+        cursor.execute("SELECT COUNT(*) FROM results")
+        total_single = cursor.fetchone()[0] or 0
+        
+        # Get batch results count
+        cursor.execute("SELECT SUM(result_count) FROM batch_results")
+        total_batch_result = cursor.fetchone()[0]
+        total_batch = total_batch_result if total_batch_result is not None else 0
+        
+        # Get confidence levels distribution
+        cursor.execute("""
+            SELECT confidence, COUNT(*) as count 
+            FROM results 
+            GROUP BY confidence 
+            ORDER BY count DESC
+        """)
+        confidence_counts = cursor.fetchall()
+        
+        # Get feedback statistics
+        cursor.execute("""
+            SELECT feedback, COUNT(*) as count 
+            FROM results 
+            WHERE feedback IS NOT NULL
+            GROUP BY feedback
+        """)
+        feedback_counts = cursor.fetchall()
+        
+        # Get recent classifications (last 10)
+        cursor.execute("""
+            SELECT id, category, confidence, feedback, created_at, context_source 
+            FROM results 
+            ORDER BY created_at DESC 
+            LIMIT 10
+        """)
+        recent_classifications = cursor.fetchall()
+        
+        # Get statistics from batch results
+        batch_categories = Counter()
+        batch_feedback = Counter()
+        
+        cursor.execute("SELECT results FROM batch_results ORDER BY created_at DESC LIMIT 50")
+        batch_results = cursor.fetchall()
+        
+        for batch in batch_results:
+            if batch[0]:
+                try:
+                    results_data = json.loads(batch[0])
+                    for item in results_data:
+                        category = item.get('category', 'Unknown')
+                        batch_categories[category] += 1
+                        
+                        # Count feedback from batch results
+                        feedback = item.get('feedback')
+                        if feedback:
+                            batch_feedback[feedback] += 1
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    continue
+        
+        # Combine single and batch category statistics
+        combined_categories = {}
+        for category, count in category_counts:
+            combined_categories[category] = count
+        
+        for category, count in batch_categories.items():
+            if category in combined_categories:
+                combined_categories[category] += count
+            else:
+                combined_categories[category] = count
+                
+        # Create combined category counts list
+        combined_category_counts = [(category, count) for category, count in combined_categories.items()]
+        combined_category_counts.sort(key=lambda x: x[1], reverse=True)
+        
+        # Combine feedback statistics
+        combined_feedback = {}
+        for feedback, count in feedback_counts:
+            combined_feedback[feedback] = count
+            
+        for feedback, count in batch_feedback.items():
+            if feedback in combined_feedback:
+                combined_feedback[feedback] += count
+            else:
+                combined_feedback[feedback] = count
+                
+        combined_feedback_counts = [(feedback, count) for feedback, count in combined_feedback.items()]
+        
+        # Get count of classifications by date
+        cursor.execute("""
+            SELECT DATE(created_at) as date, COUNT(*) as count 
+            FROM results 
+            GROUP BY DATE(created_at) 
+            ORDER BY date DESC 
+            LIMIT 14
+        """)
+        daily_counts = cursor.fetchall()
+        
+        # Get most commonly referenced context sources
+        cursor.execute("""
+            SELECT context_source, COUNT(*) as count 
+            FROM results 
+            WHERE context_source IS NOT NULL
+            GROUP BY context_source 
+            ORDER BY count DESC 
+            LIMIT 10
+        """)
+        context_counts = cursor.fetchall() 
+        
+        conn.close()
+        
+        return {
+            "category_counts": category_counts,
+            "combined_category_counts": combined_category_counts,
+            "confidence_counts": confidence_counts,
+            "feedback_counts": combined_feedback_counts,
+            "recent_classifications": recent_classifications,
+            "daily_counts": daily_counts,
+            "context_counts": context_counts,
+            "total_single": total_single,
+            "total_batch": total_batch,
+            "total": total_single + total_batch
+        }
+        
+    except Exception as e:
+        print(f"Error getting classification stats: {e}")
+        traceback.print_exc()
+        return {
+            "category_counts": [],
+            "combined_category_counts": [],
+            "confidence_counts": [],
+            "feedback_counts": [],
+            "recent_classifications": [],
+            "daily_counts": [],
+            "context_counts": [],
+            "total_single": 0,
+            "total_batch": 0,
+            "total": 0
+        }
+
+# Print RAG diagnostics for debugging
+def print_rag_diagnostics():
+    """Print diagnostic information about RAG components"""
+    global colpali_embeddings, df, page_images
+    
+    logging.info("=== RAG DIAGNOSTICS ===")
+    logging.info(f"colpali_embeddings: {'Available' if colpali_embeddings is not None else 'None'}")
+    if colpali_embeddings is not None:
+        logging.info(f"  Type: {type(colpali_embeddings)}")
+        logging.info(f"  Length: {len(colpali_embeddings)}")
+        if len(colpali_embeddings) > 0:
+            logging.info(f"  First item type: {type(colpali_embeddings[0])}")
+            if hasattr(colpali_embeddings[0], 'shape'):
+                logging.info(f"  First item shape: {colpali_embeddings[0].shape}")
+    
+    logging.info(f"DataFrame: {'Available' if df is not None else 'None'}")
+    if df is not None:
+        logging.info(f"  Shape: {df.shape}")
+        logging.info(f"  Columns: {df.columns.tolist()}")
+        if len(df) > 0:
+            logging.info(f"  Sample row: {df.iloc[0].to_dict()}")
+    
+    logging.info(f"page_images: {'Available' if page_images is not None else 'None'}")
+    if page_images is not None:
+        logging.info(f"  Length: {len(page_images)}")
+        if len(page_images) > 0:
+            sample_keys = list(page_images.keys())[:3]
+            for key in sample_keys:
+                path = page_images[key]
+                logging.info(f"  {key}: {path} (Exists: {os.path.exists(path)})")
+
+# Initialize from image directory
+def initialize_from_image_directory():
+    """Initialize RAG data directly from existing images in PDF_IMAGES_DIR"""
+    global colpali_embeddings, df, page_images
+    
+    logging.info(f"Initializing RAG data from images in {PDF_IMAGES_DIR}...")
+    
+    # Scan for images
+    all_images = []
+    image_paths = {}
+    metadata_rows = []
+    page_contents = []
+    
+    # Check if PDF_IMAGES_DIR exists
+    if not os.path.exists(PDF_IMAGES_DIR):
+        logging.error(f"Image directory does not exist: {PDF_IMAGES_DIR}")
+        return False
+    
+    # Look for subdirectories, especially FIT-Counts-guide
+    subdirs = [d for d in os.listdir(PDF_IMAGES_DIR) if os.path.isdir(os.path.join(PDF_IMAGES_DIR, d))]
+    
+    if not subdirs:
+        logging.warning(f"No subdirectories found in {PDF_IMAGES_DIR}")
+        # Look for images directly in PDF_IMAGES_DIR
+        image_files = [f for f in os.listdir(PDF_IMAGES_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        if image_files:
+            subdirs = ['']  # Process the root directory
+    
+    for subdir in subdirs:
+        dir_path = os.path.join(PDF_IMAGES_DIR, subdir)
+        if subdir == '':  # Handle case where images are in PDF_IMAGES_DIR directly
+            dir_path = PDF_IMAGES_DIR
+        
+        # Find all image files in this directory
+        image_files = [f for f in os.listdir(dir_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        
+        if not image_files:
+            continue
+            
+        logging.info(f"Found {len(image_files)} images in {dir_path}")
+        
+        # Process each image
+        for filename in image_files:
+            try:
+                # Try to get page number from filename
+                page_num = int(os.path.splitext(filename)[0])
+            except ValueError:
+                # If filename is not a number, use a counter
+                page_num = len(all_images)
+            
+            # Full path to the image
+            image_path = os.path.join(dir_path, filename)
+            
+            # Create image key
+            image_key = f"{subdir}_{page_num}" if subdir else f"doc_{page_num}"
+            
+            try:
+                # Load the image
+                img = Image.open(image_path)
+                all_images.append(img)
+                
+                # Store image path
+                image_paths[image_key] = image_path
+                
+                # Create metadata
+                metadata_rows.append({
+                    "filename": subdir if subdir else "document",
+                    "page": page_num,
+                    "paragraph_size": 0,
+                    "text": f"[Image content from page {page_num} of {subdir if subdir else 'document'}]",
+                    "image_key": image_key,
+                    "full_path": image_path
+                })
+                
+                # Add placeholder text
+                page_contents.append(f"[Image content from page {page_num} of {subdir if subdir else 'document'}]")
+                
+                logging.info(f"Processed image: {image_key} from {image_path}")
+            except Exception as e:
+                logging.error(f"Error processing image {image_path}: {e}")
+    
+    if not all_images:
+        logging.error("No images were found or processed")
+        return False
+    
+    # Create DataFrame
+    df = pd.DataFrame({
+        "filename": [m["filename"] for m in metadata_rows],
+        "page": [m["page"] for m in metadata_rows],
+        "paragraph_size": [m["paragraph_size"] for m in metadata_rows],
+        "text": page_contents,
+        "image_key": [m["image_key"] for m in metadata_rows],
+        "full_path": [m["full_path"] for m in metadata_rows]
+    })
+    
+    # Save DataFrame
+    data_path = os.path.join(DATA_DIR, "data.pkl")
+    df.to_pickle(data_path)
+    logging.info(f"Created and saved DataFrame with {len(df)} entries to {data_path}")
+    
+    # Save image paths
+    images_path = os.path.join(DATA_DIR, "pdf_page_image_paths.pkl")
+    with open(images_path, "wb") as f:
+        pickle.dump(image_paths, f)
+    logging.info(f"Saved {len(image_paths)} image paths to {images_path}")
+    
+    # Generate embeddings
+    try:
+        from colpali_engine.models import ColQwen2, ColQwen2Processor
+        
+        # Load model
+        logging.info("Loading ColQwen2 model for embedding generation...")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = ColQwen2.from_pretrained(
+            "vidore/colqwen2-v1.0",
+            torch_dtype=torch.bfloat16, 
+            device_map=device
+        ).eval()
+        processor = ColQwen2Processor.from_pretrained("vidore/colqwen2-v1.0")
+        
+        # Process images in small batches
+        batch_size = 2  # Keep small to avoid OOM
+        all_embeddings = []
+        
+        for i in range(0, len(all_images), batch_size):
+            batch = all_images[i:i+batch_size]
+            logging.info(f"Processing batch {i//batch_size + 1} of {(len(all_images)-1)//batch_size + 1}")
+            
+            # Process batch
+            processed = processor.process_images(batch).to(model.device)
+            
+            # Generate embeddings
+            with torch.no_grad():
+                batch_embeddings = model(**processed)
+            
+            # Store embeddings
+            for emb in batch_embeddings:
+                all_embeddings.append(emb.detach().cpu().numpy())
+        
+        # Save embeddings
+        embeddings_path = os.path.join(DATA_DIR, "colpali_embeddings.pkl")
+        with open(embeddings_path, "wb") as f:
+            pickle.dump(all_embeddings, f)
+        logging.info(f"Generated and saved {len(all_embeddings)} embeddings to {embeddings_path}")
+        
+        # Update global variable
+        colpali_embeddings = all_embeddings
+        page_images = image_paths
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error generating embeddings: {e}")
         import traceback
         traceback.print_exc()
-        raise
+        return False
 
-    @web_app.post("/v1/chat/completions")
-    async def chat_completions(request: fastapi.Request) -> JSONResponse:
-        """Handle multimodal chat completions"""
+# Load RAG data
+def load_rag_data():
+    """Load all data needed for document retrieval with fallback to image directory initialization"""
+    global colpali_embeddings, df, page_images, bm25_index, tokenized_docs
+    
+    # Path definitions for RAG data
+    COLPALI_EMBEDDINGS_PATH = os.path.join(DATA_DIR, "colpali_embeddings.pkl")
+    DATA_PICKLE_PATH = os.path.join(DATA_DIR, "data.pkl")
+    PDF_PAGE_IMAGES_PATH = os.path.join(DATA_DIR, "pdf_page_image_paths.pkl")
+    BM25_INDEX_PATH = os.path.join(DATA_DIR, "bm25_index.pkl")
+    TOKENIZED_PARAGRAPHS_PATH = os.path.join(DATA_DIR, "tokenized_paragraphs.pkl")
+    
+    # Check if the data directory exists
+    if not os.path.exists(DATA_DIR):
+        logging.warning(f"Data directory does not exist: {DATA_DIR}")
         try:
-            body = await request.json()
-            messages = body.get("messages", [])
-            model = body.get("model", DEFAULT_MISTRAL_NAME)
-            max_tokens = body.get("max_tokens", 500)
-            temperature = body.get("temperature", 0.7)
-            request_id = str(uuid.uuid4())
-            
-            # Process multimodal messages without stripping images
-            logging.info(f"Received chat completion request with {len(messages)} messages")
-            
-            # Debug log the first message content structure
-            if messages and len(messages) > 0:
-                first_msg = messages[0]
-                if isinstance(first_msg.get("content"), list):
-                    content_types = [part.get("type") for part in first_msg["content"] if "type" in part]
-                    logging.info(f"First message contains content types: {content_types}")
-            
-            # Use the LLM's chat method for multimodal support
-            sampling_params = SamplingParams(
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stop=["User:", "System:"]
-            )
-            
-            outputs = llm.chat(messages=messages, sampling_params=sampling_params)
-            
-            if outputs and len(outputs) > 0 and len(outputs[0].outputs) > 0:
-                response_text = outputs[0].outputs[0].text
-                
-                return JSONResponse(content={
-                    "id": request_id,
-                    "object": "chat.completion",
-                    "created": int(datetime.datetime.now().timestamp()),
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": response_text
-                            },
-                            "finish_reason": "stop"
-                        }
-                    ]
-                })
-            else:
-                logging.error("No output generated from LLM.chat()")
-                return JSONResponse(status_code=500, content={"error": "No output generated"})
+            os.makedirs(DATA_DIR, exist_ok=True)
+            logging.info(f"Created data directory: {DATA_DIR}")
         except Exception as e:
-            logging.error(f"Error in chat_completions: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse(status_code=500, content={"error": str(e)})
-
-    # Add completions endpoint for text-only requests
-    @web_app.post("/v1/completions")
-    async def completions(request: fastapi.Request) -> JSONResponse:
-        """Handle basic completions - useful for text-only requests"""
+            logging.error(f"Failed to create data directory: {e}")
+    
+    # Track whether we've loaded all necessary data
+    data_loaded = True
+    
+    # Load data frame with metadata
+    if os.path.exists(DATA_PICKLE_PATH):
         try:
-            body = await request.json()
-            prompt = body.get("prompt", "")
-            max_tokens = body.get("max_tokens", 500)
-            temperature = body.get("temperature", 0.7)
-            request_id = str(uuid.uuid4())
-            
-            sampling_params = SamplingParams(
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
-            
-            outputs = llm.generate(prompt, sampling_params)
-            
-            if outputs and len(outputs) > 0 and len(outputs[0].outputs) > 0:
-                response_text = outputs[0].outputs[0].text
-                
-                return JSONResponse(content={
-                    "id": request_id,
-                    "choices": [
-                        {
-                            "text": response_text,
-                            "finish_reason": "stop"
-                        }
-                    ]
-                })
-            else:
-                return JSONResponse(status_code=500, content={"error": "No output generated"})
+            df = pd.read_pickle(DATA_PICKLE_PATH)
+            logging.info(f"✅ Loaded DataFrame with {len(df)} documents")
         except Exception as e:
-            logging.error(f"Error in completions: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse(status_code=500, content={"error": str(e)})
-
-    # Health check endpoint
-    @web_app.get("/health")
-    async def health_check():
-        """Check if the server is running and the model is loaded"""
-        return JSONResponse(content={
-            "status": "healthy", 
-            "model": DEFAULT_MISTRAL_NAME,
-            "supports_multimodal": True,
-            "max_tokens": 4096
-        })
-
-    return web_app
-
-@app.function(
-    image=image,
-    gpu=modal.gpu.A100(count=1, size="80GB"),
-    container_idle_timeout=10 * 60,
-    timeout=24 * 60 * 60,
-    volumes={
-        DATA_DIR: bee_volume,
-        DATABASE_DIR: db_volume,
-        COLQWEN_MODELS_DIR: colqwen_volume
-    },
-    secrets=[modal.Secret.from_name("my-custom-secret-3")]
-)
-@modal.asgi_app()
-def serve_fasthtml():
-    import os
-    import pickle
-    import pandas as pd
-    import logging
-    from starlette.middleware import Middleware
-    from starlette.websockets import WebSocket
-    import uuid
-    import datetime
-    from sqlalchemy import create_engine, Column, String, DateTime, Float
-    from sqlalchemy.ext.declarative import declarative_base
-    from sqlalchemy.orm import sessionmaker
-    from fastapi.responses import FileResponse, Response, HTMLResponse
-    from io import BytesIO
-    from PIL import Image
-    from colpali_engine.models import ColQwen2, ColQwen2Processor
-    from colpali_engine.interpretability import get_similarity_maps_from_embeddings, plot_similarity_map
-    import nltk
-    from nltk.tokenize import word_tokenize
-    import numpy as np
-    from rank_bm25 import BM25Okapi
-    from pdf2image import convert_from_path
+            logging.error(f"Error loading DataFrame: {e}")
+            df = None
+            data_loaded = False
+    else:
+        logging.warning(f"DataFrame not found at {DATA_PICKLE_PATH}")
+        df = None
+        data_loaded = False
     
-    # Setup NLTK
-    NLTK_DATA_DIR = "/tmp/nltk_data"
-    os.makedirs(NLTK_DATA_DIR, exist_ok=True)
-    nltk.data.path.append(NLTK_DATA_DIR)
-    nltk.download("punkt", download_dir=NLTK_DATA_DIR)
-    
-    # Global variables
-    colpali_model = None
-    colpali_processor = None
-    colpali_embeddings = None
-    df = None
-    page_images = {}
-    bm25_index = None
-    tokenized_docs = None
-    
-    # Load ColPali model and data functions
-    def ensure_colpali_model_loaded():
-        """Ensure the ColQwen2 model is properly loaded from volume if possible"""
-        global colpali_model, colpali_processor
-        
-        # Verify CUDA is available
-        if torch.cuda.is_available():
-            logging.info(f"CUDA is available: {torch.cuda.get_device_name(0)}")
-        else:
-            logging.warning("WARNING: CUDA is NOT available, ColQwen will run on CPU which is slower")
-        
-        # Check if we need to load the model
-        if 'colpali_model' not in globals() or colpali_model is None:
-            logging.info(f"Loading ColQwen2 model...")
-            try:
-                # First check if files exist directly in the volume root
-                model_files_in_root = False
-                volume_root = COLQWEN_MODELS_DIR
-                required_files = ["tokenizer.json", "adapter_model.safetensors", "special_tokens_map.json"]
-                
-                if os.path.exists(volume_root):
-                    root_files = os.listdir(volume_root)
-                    if all(file in root_files for file in required_files):
-                        model_files_in_root = True
-                        logging.info(f"Found model files directly in volume root: {volume_root}")
-                
-                if model_files_in_root:
-                    # Use volume root directly as model path
-                    logging.info(f"Using local model from volume root: {volume_root}")
-                    colpali_model = ColQwen2.from_pretrained(
-                        volume_root,
-                        torch_dtype=torch.bfloat16,
-                        device_map="cuda" if torch.cuda.is_available() else "cpu"
-                    ).eval()
-                    colpali_processor = ColQwen2Processor.from_pretrained(volume_root)
-                else:
-                    # Check for subdirectory structure
-                    model_path = os.path.join(COLQWEN_MODELS_DIR, os.path.basename(DEFAULT_COLQWEN_NAME))
-                    if os.path.exists(model_path) and os.path.isdir(model_path):
-                        logging.info(f"Using local model from volume subdirectory: {model_path}")
-                        colpali_model = ColQwen2.from_pretrained(
-                            model_path,
-                            torch_dtype=torch.bfloat16,
-                            device_map="cuda" if torch.cuda.is_available() else "cpu"
-                        ).eval()
-                        colpali_processor = ColQwen2Processor.from_pretrained(model_path)
-                    else:
-                        # Fall back to HuggingFace download
-                        logging.info(f"Model not found in volume, downloading from HuggingFace: {DEFAULT_COLQWEN_NAME}")
-                        colpali_model = ColQwen2.from_pretrained(
-                            DEFAULT_COLQWEN_NAME,
-                            torch_dtype=torch.bfloat16,
-                            device_map="cuda" if torch.cuda.is_available() else "cpu"
-                        ).eval()
-                        colpali_processor = ColQwen2Processor.from_pretrained(DEFAULT_COLQWEN_NAME)
-                
-                logging.info(f"ColQwen2 model loaded successfully on device: {colpali_model.device}")
-                return True
-            except Exception as e:
-                logging.error(f"Error loading ColQwen2 model: {e}")
-                import traceback
-                traceback.print_exc()
-                return False
-        return True
-
-    def load_data():
-        """Load all data needed for document retrieval"""
-        global colpali_embeddings, df, page_images, bm25_index, tokenized_docs
-        
-        # Path definitions
-        COLPALI_EMBEDDINGS_PATH = os.path.join(DATA_DIR, "colpali_embeddings.pkl")
-        DATA_PICKLE_PATH = os.path.join(DATA_DIR, "data.pkl")
-        PDF_PAGE_IMAGES_PATH = os.path.join(DATA_DIR, "pdf_page_image_paths.pkl")
-        BM25_INDEX_PATH = os.path.join(DATA_DIR, "bm25_index.pkl")
-        TOKENIZED_PARAGRAPHS_PATH = os.path.join(DATA_DIR, "tokenized_paragraphs.pkl")
-        
-        # Load data frame with metadata
-        if os.path.exists(DATA_PICKLE_PATH):
-            try:
-                df = pd.read_pickle(DATA_PICKLE_PATH)
-                logging.info(f"Loaded DataFrame with {len(df)} documents")
-            except Exception as e:
-                logging.error(f"Error loading DataFrame: {e}")
-                df = pd.DataFrame(columns=["filename", "page", "paragraph_size", "text", "image_key", "full_path"])
-        else:
-            logging.error(f"DataFrame not found at {DATA_PICKLE_PATH}")
-            df = pd.DataFrame(columns=["filename", "page", "paragraph_size", "text", "image_key", "full_path"])
-        
-        # Load image paths
-        if os.path.exists(PDF_PAGE_IMAGES_PATH):
-            try:
-                with open(PDF_PAGE_IMAGES_PATH, "rb") as f:
-                    page_images = pickle.load(f)
-                logging.info(f"Loaded {len(page_images)} image paths")
-            except Exception as e:
-                logging.error(f"Error loading image paths: {e}")
-                page_images = {}
-        else:
-            logging.error(f"Image paths file not found at {PDF_PAGE_IMAGES_PATH}")
+    # Load image paths
+    if os.path.exists(PDF_PAGE_IMAGES_PATH):
+        try:
+            with open(PDF_PAGE_IMAGES_PATH, "rb") as f:
+                page_images = pickle.load(f)
+            logging.info(f"✅ Loaded {len(page_images)} image paths")
+        except Exception as e:
+            logging.error(f"Error loading image paths: {e}")
             page_images = {}
-        
-        # Load ColPali embeddings
-        if os.path.exists(COLPALI_EMBEDDINGS_PATH):
-            try:
-                with open(COLPALI_EMBEDDINGS_PATH, "rb") as f:
-                    colpali_embeddings = pickle.load(f)
-                logging.info(f"Loaded {len(colpali_embeddings)} ColPali embeddings")
-            except Exception as e:
-                logging.error(f"Error loading ColPali embeddings: {e}")
-                colpali_embeddings = None
-        else:
-            logging.error(f"ColPali embeddings not found at {COLPALI_EMBEDDINGS_PATH}")
-            colpali_embeddings = None
-        
-        # Load BM25 index
+            data_loaded = False
+    else:
+        logging.warning(f"Image paths file not found at {PDF_PAGE_IMAGES_PATH}")
+        page_images = {}
+        data_loaded = False
+    
+    # Load ColPali embeddings
+    if os.path.exists(COLPALI_EMBEDDINGS_PATH):
         try:
+            with open(COLPALI_EMBEDDINGS_PATH, "rb") as f:
+                colpali_embeddings = pickle.load(f)
+            
+            if isinstance(colpali_embeddings, list) and len(colpali_embeddings) > 0:
+                logging.info(f"✅ Loaded {len(colpali_embeddings)} ColPali embeddings")
+            else:
+                logging.warning(f"ColPali embeddings file exists but has unexpected format")
+                colpali_embeddings = None
+                data_loaded = False
+        except Exception as e:
+            logging.error(f"Error loading ColPali embeddings: {e}")
+            colpali_embeddings = None
+            data_loaded = False
+    else:
+        logging.warning(f"ColPali embeddings not found at {COLPALI_EMBEDDINGS_PATH}")
+        colpali_embeddings = None
+        data_loaded = False
+    
+    # Initialize from image directory if data is missing
+    if not data_loaded or colpali_embeddings is None or df is None or not page_images:
+        logging.info("Some RAG data is missing. Initializing from image directory...")
+        if initialize_from_image_directory():
+            logging.info("✅ Successfully initialized RAG data from image directory")
+        else:
+            logging.error("❌ Failed to initialize RAG data from image directory")
+    
+    # Create BM25 index for backward compatibility
+    try:
+        if df is not None and 'text' in df.columns:
             if os.path.exists(BM25_INDEX_PATH) and os.path.exists(TOKENIZED_PARAGRAPHS_PATH):
                 with open(BM25_INDEX_PATH, "rb") as f:
                     bm25_index = pickle.load(f)
                 with open(TOKENIZED_PARAGRAPHS_PATH, "rb") as f:
                     tokenized_docs = pickle.load(f)
-                logging.info("Loaded BM25 index successfully")
+                logging.info("✅ Loaded BM25 index")
             else:
-                logging.warning("BM25 index not found, will create if needed")
-        except Exception as e:
-            logging.error(f"Error loading BM25 index: {e}")
-            bm25_index = None
-            tokenized_docs = None
-
-    # Load models and data at startup
-    ensure_colpali_model_loaded()
-    load_data()
-
-    # Make temporary directories
+                # Create BM25 index
+                logging.info("Creating BM25 index...")
+                from rank_bm25 import BM25Okapi
+                import nltk
+                from nltk.tokenize import word_tokenize
+                
+                # Ensure NLTK data is available
+                try:
+                    nltk.data.find('tokenizers/punkt')
+                except LookupError:
+                    nltk.download('punkt')
+                
+                # Tokenize documents
+                tokenized_docs = []
+                for _, row in df.iterrows():
+                    if row['text']:
+                        tokenized_docs.append(word_tokenize(row['text'].lower()))
+                    else:
+                        tokenized_docs.append([])
+                
+                # Create index
+                bm25_index = BM25Okapi(tokenized_docs)
+                
+                # Save for future use
+                with open(BM25_INDEX_PATH, "wb") as f:
+                    pickle.dump(bm25_index, f)
+                with open(TOKENIZED_PARAGRAPHS_PATH, "wb") as f:
+                    pickle.dump(tokenized_docs, f)
+                logging.info("✅ Created and saved BM25 index")
+    except Exception as e:
+        logging.error(f"Error with BM25 index: {e}")
+        bm25_index = None
+        tokenized_docs = None
+    
+    # Create necessary directories
     os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
     os.makedirs(HEATMAP_DIR, exist_ok=True)
+    os.makedirs(PDF_IMAGES_DIR, exist_ok=True)
+    os.makedirs(TEMPLATES_DIR, exist_ok=True)
+    
+    # Log final status
+    logging.info("=== RAG Data Status ===")
+    logging.info(f"DataFrame: {'✅ Available' if df is not None and len(df) > 0 else '❌ Missing'}")
+    logging.info(f"Page Images: {'✅ Available' if page_images and len(page_images) > 0 else '❌ Missing'}")
+    logging.info(f"ColPali Embeddings: {'✅ Available' if colpali_embeddings is not None else '❌ Missing'}")
 
-    # Setup database connection
-    db_engine = create_engine(f'sqlite:///{db_path}')
-    Base = declarative_base()
-    Session = sessionmaker(bind=db_engine)
-    sqlalchemy_session = Session()
-
-    # Define the database model - matching the actual table schema
-    class ImageAnalysis(Base):
-        __tablename__ = 'image_analyses'
-        analysis_id = Column(String, primary_key=True)
-        image_path = Column(String, nullable=False)
-        analysis_type = Column(String, nullable=False)
-        query = Column(String, nullable=False)
-        response = Column(String)
-        created_at = Column(DateTime, default=datetime.datetime.utcnow)
-        # Only include context_source if we verified it exists
-        context_source = Column(String, nullable=True)
-
-    # Helper function to get context image from PDF pages
-    def get_context_image(top_sources):
-        """Get the context image from retrieved PDF pages"""
-        global page_images
+# Retrieve visually similar documents
+def retrieve_visually_similar_documents(query_image_data: str, top_k=3):
+    """Retrieve visually similar document pages using the ColQwen2 embeddings"""
+    global colpali_embeddings, df, page_images
+    
+    if colpali_embeddings is None or df is None or len(df) == 0 or not page_images:
+        logging.error("No document embeddings or images available for retrieval")
+        return []
+    
+    retrieved_sources = []
+    
+    try:
+        # Convert base64 query image to proper format for embedding
+        query_image_bytes = base64.b64decode(query_image_data)
+        query_image = Image.open(BytesIO(query_image_bytes))
         
-        if not top_sources or len(top_sources) == 0:
-            return None
-            
-        # Get the top source document
-        top_source = top_sources[0]
-        image_key = top_source.get('image_key')
+        # Use ColQwen2 to generate embedding for query image
+        query_embedding = generate_image_embedding(query_image)
         
-        if not image_key or image_key not in page_images:
-            logging.warning(f"Context image not found for key: {image_key}")
-            
-            # Try to find the image by reconstructing path patterns
-            parts = image_key.split('_')
-            if len(parts) >= 2:
-                filename = '_'.join(parts[:-1])
-                page_num = parts[-1]
-                
-                # Check different potential locations
-                potential_paths = [
-                    os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
-                    os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
-                    os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
-                ]
-                
-                for potential_path in potential_paths:
-                    if os.path.exists(potential_path):
-                        logging.info(f"Found context image at: {potential_path}")
-                        return Image.open(potential_path)
-                
-            return None
-            
-        try:
-            image_path = page_images[image_key]
-            if os.path.exists(image_path):
-                context_image = Image.open(image_path)
-                return context_image
-            else:
-                logging.error(f"Context image file not found: {image_path}")
-        except Exception as e:
-            logging.error(f"Error loading context image: {e}")
-        
-        return None
-
-    # Updated process_with_mistral function to handle multimodal API properly
-    async def process_with_mistral(image, query, context_text="", analysis_id=""):
-        """Process the insect image with Mistral, using context as text only"""
-        logging.info(f"Processing image {analysis_id} with Mistral using query: {query}")
-        
-        try:
-            # Retrieve relevant documents using ColPali
-            retrieved_paragraphs, top_sources = await retrieve_relevant_documents(query)
-            
-            # Convert main insect image to data URI
-            insect_image_uri = format_image(image)
-            
-            # Create system prompt that includes context information
-            system_prompt = (
-                "You are an expert biologist. Classify the insect in the provided image into "
-                "ONE of these categories (bumblebee, honeybee, wasp, solitary bee, hoverfly, other flies, "
-                "butterfly & moths, other insect). Focus primarily on the visual characteristics "
-                "in the insect image."
-            )
-            
-            # Create message content with ONLY the insect image
-            message_content = []
-            
-            # Add context as text - not as an image
-            task_text = "Classify this insect shown in the image."
-            if retrieved_paragraphs:
-                task_text += " Additional reference information: " + context_text
-                # Add source reference if available
-                if top_sources and len(top_sources) > 0:
-                    source = top_sources[0]
-                    task_text += f"\n\nThis information comes from {source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}."
-            
-            message_content.append({
-                "type": "text", 
-                "text": task_text
-            })
-            
-            # Add ONLY the main insect image
-            message_content.append({
-                "type": "image_url",
-                "image_url": {"url": insect_image_uri}
-            })
-            
-            # Assemble the payload with only one image
-            payload = {
-                "model": DEFAULT_MISTRAL_NAME,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": message_content}
-                ],
-                "max_tokens": 2000,
-                "temperature": 0.7
-            }
-        
-            
-            # Send to the multimodal endpoint
-            multimodal_url = f"https://{USERNAME}--{APP_NAME}-serve-vllm.modal.run/v1/chat/completions"
-            
-            async with aiohttp.ClientSession() as client_session:
-                logging.info(f"Sending multimodal request to {multimodal_url}")
-                async with client_session.post(multimodal_url, json=payload, timeout=320) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        
-                        # Add this line to log the full JSON response
-                        logging.info(f"Raw API response for analysis {analysis_id}:\n{json.dumps(result, indent=2)}")
-                        
-                        if "choices" in result and len(result["choices"]) > 0:
-                            model_response = result["choices"][0]["message"]["content"]
-                            
-                            # Log the full response content
-                            logging.info(f"Full LLM response for analysis {analysis_id}:\n{'='*50}\n{model_response}\n{'='*50}")
-                            
-                            return model_response.strip()
-                        else:
-                            return "Error: No response choices returned from model"
-                    else:
-                        error_text = await response.text()
-                        logging.error(f"Error response from multimodal API: {error_text}")
-                        return f"Error processing image: {error_text}"
-        
-        except Exception as e:
-            logging.error(f"Exception in process_with_mistral: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return f"Error: {str(e)}"
-
-    # Retrieve relevant documents
-    async def retrieve_relevant_documents(query, top_k=5):
-        """Retrieve most relevant documents using ColPali embeddings and BM25"""
-        global colpali_model, colpali_processor, colpali_embeddings, df, bm25_index, tokenized_docs
-        
-        # Ensure models and data are loaded
-        ensure_colpali_model_loaded()
-        
-        if colpali_embeddings is None or df is None or len(df) == 0:
-            logging.error("No documents or embeddings available for retrieval")
-            return [], []
-            
-        retrieved_paragraphs = []
-        top_sources_data = []
-        
-        # ColPali retrieval (vector search)
-        try:
-            # Process query with ColPali
-            processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
-            with torch.no_grad():
-                query_embeddings = colpali_model(**processed_query)
-            
-            # Calculate similarities with all pages
-            similarities = []
-            for idx, page_emb in enumerate(colpali_embeddings):
-                # Convert page embedding to tensor with matching dtype
-                page_tensor = torch.tensor(page_emb, device=colpali_model.device, dtype=query_embeddings.dtype)
-                
-                # Score using ColPali's scoring method
-                score = float(colpali_processor.score_multi_vector(
-                    query_embeddings,
-                    page_tensor.unsqueeze(0)  # Add batch dimension
-                )[0])
-                
-                similarities.append((idx, score))
-            
-            # Sort by similarity score
-            similarities.sort(key=lambda x: x[1], reverse=True)
-            vector_top_indices = [idx for idx, _ in similarities[:top_k]]
-            
-            # Try BM25 keyword search if available
-            keyword_top_indices = []
-            bm25_scores = None
-            if bm25_index is not None and tokenized_docs is not None:
+        # Calculate similarities
+        similarities = []
+        for idx, doc_emb in enumerate(colpali_embeddings):
+            if idx < len(df):
                 try:
-                    # Tokenize query and get BM25 scores
-                    tokenized_query = word_tokenize(query.lower())
-                    bm25_scores = bm25_index.get_scores(tokenized_query)
-                    keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
-                except Exception as e:
-                    logging.error(f"Error in BM25 scoring: {e}")
-            
-            # Combine results (hybrid retrieval)
-            all_indices = list(set(vector_top_indices + keyword_top_indices))
-            
-            # Get data for reranking
-            docs_for_reranking = []
-            doc_indices = []
-            
-            for idx in all_indices:
-                if idx < len(df):
+                    # Calculate visual similarity
+                    similarity = calculate_visual_similarity(query_embedding, doc_emb)
+                    
                     # Get document info
                     filename = df.iloc[idx]['filename']
                     page_num = df.iloc[idx]['page']
                     image_key = df.iloc[idx]['image_key']
-                    text = df.iloc[idx]['text']
                     
-                    # Get vector score
-                    vector_score = 0.0
-                    for v_idx, score in similarities:
-                        if v_idx == idx:
-                            vector_score = score
-                            break
-                    
-                    # Get keyword score (if available)
-                    keyword_score = 0.0
-                    if bm25_scores is not None and len(bm25_scores) > idx:
-                        keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
-                    
-                    # Combine scores (weighted)
-                    alpha = 0.7  # Weight for vector search
-                    combined_score = alpha * vector_score + (1 - alpha) * keyword_score
-                    
-                    # Store for reranking
-                    docs_for_reranking.append(text)
-                    doc_indices.append(idx)
-                    
-                    # Add to results
-                    retrieved_paragraphs.append(text)
-                    top_sources_data.append({
+                    # Store for ranking
+                    similarities.append({
+                        'idx': idx,
+                        'score': similarity,
                         'filename': filename,
                         'page': page_num,
-                        'score': combined_score,
-                        'vector_score': vector_score,
-                        'keyword_score': keyword_score,
-                        'image_key': image_key,
-                        'idx': idx
+                        'image_key': image_key
                     })
-            
-            # Rerank results if we have documents
-            if docs_for_reranking:
-                try:
-                    # Use a cross-encoder reranker
-                    from rerankers import Reranker
-                    ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
-                    ranked_results = ranker.rank(query=query, docs=docs_for_reranking)
-                    top_ranked = ranked_results.top_k(min(3, len(docs_for_reranking)))
-                    
-                    # Get the final top documents after reranking
-                    final_retrieved_paragraphs = []
-                    final_top_sources = []
-                    
-                    for ranked_doc in top_ranked:
-                        ranked_idx = docs_for_reranking.index(ranked_doc.text)
-                        doc_idx = doc_indices[ranked_idx]
-                        source_info = next((s for s in top_sources_data if s['idx'] == doc_idx), None)
-                        if source_info:
-                            source_info['reranker_score'] = ranked_doc.score
-                            final_top_sources.append(source_info)
-                            final_retrieved_paragraphs.append(ranked_doc.text)
-                    
-                    return final_retrieved_paragraphs, final_top_sources
-                    
                 except Exception as e:
-                    logging.error(f"Error in reranking: {e}")
+                    logging.error(f"Error calculating similarity for document {idx}: {e}")
+        
+        # Sort by similarity score
+        similarities.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Return top_k results
+        return similarities[:top_k]
+        
+    except Exception as e:
+        logging.error(f"Error in visual document retrieval: {str(e)}")
+        traceback.print_exc()
+        return []
+
+# Generate image embedding
+def generate_image_embedding(image):
+    """Generate an embedding for an image using the ColQwen2 model"""
+    global colqwen2_model, colqwen2_processor
+    
+    try:
+        # Import necessary components
+        from colpali_engine.models import ColQwen2, ColQwen2Processor
+        
+        # Use the same model as in embedding.py
+        model_name = "vidore/colqwen2-v1.0"
+        
+        # Load model if not already loaded
+        if 'colqwen2_model' not in globals() or colqwen2_model is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            colqwen2_model = ColQwen2.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map=device
+            ).eval()
+            colqwen2_processor = ColQwen2Processor.from_pretrained(model_name)
+        
+        # Process the image
+        processed = colqwen2_processor.process_images([image]).to(colqwen2_model.device)
+        
+        # Generate embedding
+        with torch.no_grad():
+            embedding = colqwen2_model(**processed)
+        
+        return embedding
+        
+    except Exception as e:
+        logging.error(f"Error generating image embedding: {e}")
+        return None
+
+# Calculate visual similarity
+def calculate_visual_similarity(query_embedding, doc_embedding):
+    """Calculate visual similarity between two embeddings with dimension compatibility handling"""
+    try:
+        # Check if dimensions match
+        if isinstance(query_embedding, torch.Tensor) and isinstance(doc_embedding, np.ndarray):
+            doc_embedding = torch.tensor(doc_embedding, device=query_embedding.device)
+        elif isinstance(query_embedding, np.ndarray) and isinstance(doc_embedding, torch.Tensor):
+            query_embedding = torch.tensor(query_embedding, device=doc_embedding.device)
+        
+        # Get the shapes for debugging
+        query_shape = query_embedding.shape if hasattr(query_embedding, 'shape') else "unknown"
+        doc_shape = doc_embedding.shape if hasattr(doc_embedding, 'shape') else "unknown"
+        logging.info(f"Query embedding shape: {query_shape}, Doc embedding shape: {doc_shape}")
+        
+        # Handle dimension mismatch - use mean across the first dimension if shapes don't match
+        if isinstance(query_embedding, torch.Tensor) and isinstance(doc_embedding, torch.Tensor):
+            # If dimensions don't match, take mean across sequence length dimension
+            if query_embedding.shape != doc_embedding.shape:
+                if len(query_embedding.shape) > 1 and len(doc_embedding.shape) > 1:
+                    # Average across sequence length if it's the mismatch
+                    query_mean = torch.mean(query_embedding, dim=0, keepdim=True)
+                    doc_mean = torch.mean(doc_embedding, dim=0, keepdim=True)
+                    
+                    # Now normalize the means and calculate similarity
+                    query_norm = torch.nn.functional.normalize(query_mean, p=2, dim=-1)
+                    doc_norm = torch.nn.functional.normalize(doc_mean, p=2, dim=-1)
+                    similarity = torch.sum(query_norm * doc_norm).item()
+                else:
+                    # Fall back to a simple approach if shapes are fundamentally different
+                    similarity = 0.5  # Default similarity
+            else:
+                # Same dimensions - proceed normally
+                query_norm = torch.nn.functional.normalize(query_embedding, p=2, dim=-1)
+                doc_norm = torch.nn.functional.normalize(doc_embedding, p=2, dim=-1)
+                similarity = torch.sum(query_norm * doc_norm).item()
+        else:
+            # Numpy fallback with dimension handling
+            from sklearn.metrics.pairwise import cosine_similarity
             
-            # If reranking fails, sort by combined score
-            sorted_indices = sorted(range(len(top_sources_data)), 
-                                   key=lambda i: top_sources_data[i]['score'], 
-                                   reverse=True)
-            sorted_paragraphs = [retrieved_paragraphs[i] for i in sorted_indices[:3]]
-            sorted_sources = [top_sources_data[i] for i in sorted_indices[:3]]
+            # Get mean representations if multi-dimensional
+            if hasattr(query_embedding, 'shape') and len(query_embedding.shape) > 1:
+                query_flat = np.mean(query_embedding, axis=0).reshape(1, -1)
+            else:
+                query_flat = query_embedding.reshape(1, -1)
+                
+            if hasattr(doc_embedding, 'shape') and len(doc_embedding.shape) > 1:
+                doc_flat = np.mean(doc_embedding, axis=0).reshape(1, -1)
+            else:
+                doc_flat = doc_embedding.reshape(1, -1)
             
-            return sorted_paragraphs, sorted_sources
+            # Ensure both have the same feature dimension
+            min_dim = min(query_flat.shape[1], doc_flat.shape[1])
+            query_flat = query_flat[:, :min_dim]
+            doc_flat = doc_flat[:, :min_dim]
             
+            similarity = cosine_similarity(query_flat, doc_flat)[0][0]
+        
+        return similarity
+        
+    except Exception as e:
+        logging.error(f"Error calculating visual similarity: {e}")
+        # Return a default similarity rather than failing
+        return 0.1
+
+# Retrieve relevant documents for RAG
+async def retrieve_relevant_documents(query, top_k=5):
+    """Retrieve most relevant documents using visual embeddings similarity"""
+    global colpali_embeddings, df, page_images
+    
+    if colpali_embeddings is None or df is None or len(df) == 0:
+        logging.error("No documents or embeddings available for retrieval")
+        return [], []
+        
+    retrieved_images = []
+    top_sources_data = []
+    
+    try:
+        # Initialize sentence-transformer model for query embedding
+        from sentence_transformers import SentenceTransformer, util
+        
+        # Create a query embedding using the text encoder
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        query_embedding = model.encode(query, convert_to_tensor=True)
+        
+        # Convert colpali embeddings to tensors for similarity comparison
+        document_embeddings = []
+        for emb in colpali_embeddings:
+            if isinstance(emb, np.ndarray):
+                document_embeddings.append(torch.tensor(emb))
+            elif isinstance(emb, torch.Tensor):
+                document_embeddings.append(emb)
+            else:
+                logging.warning(f"Unexpected embedding type: {type(emb)}, trying to convert to tensor")
+                try:
+                    document_embeddings.append(torch.tensor(np.array(emb)))
+                except:
+                    logging.error(f"Could not convert embedding to tensor")
+                    continue
+        
+        # Calculate similarities between query embedding and document visual embeddings
+        similarities = []
+        for idx, doc_emb in enumerate(document_embeddings):
+            try:
+                # Ensure embeddings have compatible dimensions for comparison
+                if len(doc_emb.shape) > 1 and doc_emb.shape[0] > 1:
+                    # If document has multiple vectors, take max similarity
+                    # Reshape to match dimensions for comparison
+                    doc_emb_reshaped = doc_emb.reshape(-1, doc_emb.shape[-1])
+                    sim = util.pytorch_cos_sim(query_embedding, doc_emb_reshaped).max().item()
+                else:
+                    # Single vector case
+                    sim = util.pytorch_cos_sim(query_embedding, doc_emb).item()
+                
+                similarities.append((idx, sim))
+            except Exception as e:
+                logging.error(f"Error calculating similarity for document {idx}: {e}")
+                similarities.append((idx, 0.0))
+        
+        # Sort by similarity score
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        
+        # Get top K most similar documents
+        top_indices = [idx for idx, _ in similarities[:top_k]]
+        
+        # Collect the data for the top documents
+        for idx in top_indices:
+            if idx < len(df):
+                try:
+                    # Get document info
+                    filename = df.iloc[idx]['filename']
+                    page_num = df.iloc[idx]['page']
+                    image_key = df.iloc[idx]['image_key']
+                    
+                    # Get the similarity score
+                    score = 0.0
+                    for sim_idx, sim_score in similarities:
+                        if sim_idx == idx:
+                            score = sim_score
+                            break
+                    
+                    # Get the image path
+                    image_path = None
+                    if image_key in page_images:
+                        image_path = page_images[image_key]
+                    
+                    # Add to results
+                    if image_path and os.path.exists(image_path):
+                        try:
+                            # Load the image for context
+                            image = Image.open(image_path)
+                            retrieved_images.append(image)
+                            
+                            # Add metadata to sources
+                            top_sources_data.append({
+                                'filename': filename,
+                                'page': page_num,
+                                'score': score,
+                                'image_key': image_key,
+                                'image_path': image_path,
+                                'idx': idx
+                            })
+                        except Exception as e:
+                            logging.error(f"Error loading image from {image_path}: {e}")
+                except Exception as e:
+                    logging.error(f"Error processing document at index {idx}: {e}")
+        
+        logging.info(f"Retrieved {len(retrieved_images)} images as context")
+        return retrieved_images, top_sources_data
+        
+    except Exception as e:
+        logging.error(f"Error in visual document retrieval: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return [], []
+
+# Format image for API calls
+def format_image(image):
+    """Convert PIL Image to base64 for API"""
+    buffered = BytesIO()
+    # Convert to RGB if it has alpha channel
+    if image.mode == "RGBA":
+        image = image.convert("RGB")
+    image.save(buffered, format="JPEG", quality=90)
+    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    return img_base64
+
+# Get context image from PDF pages
+def get_context_image(top_sources):
+    """Get the context image from retrieved PDF pages with robust path resolution"""
+    global page_images
+    
+    if not top_sources or len(top_sources) == 0:
+        logging.info("No top sources available for context image retrieval")
+        return None
+        
+    # Get the top source document
+    top_source = top_sources[0]
+    image_key = top_source.get('image_key')
+    filename = top_source.get('filename', '')
+    page_num = top_source.get('page', 0)
+    
+    logging.info(f"Looking for context image with key: {image_key}, filename: {filename}, page: {page_num}")
+    
+    # Try the direct path from page_images dictionary first
+    if image_key and image_key in page_images:
+        image_path = page_images[image_key]
+        logging.info(f"Found image key in page_images dictionary: {image_path}")
+        if os.path.exists(image_path):
+            try:
+                context_image = Image.open(image_path)
+                logging.info(f"Successfully loaded context image from: {image_path}")
+                return context_image
+            except Exception as e:
+                logging.error(f"Error opening image {image_path}: {e}")
+    else:
+        logging.warning(f"Image key {image_key} not found in page_images dictionary")
+    
+    # If we couldn't find the image using the key, try different path patterns
+    potential_paths = []
+    
+    # Try pattern 1: Using image_key parts
+    if image_key:
+        parts = image_key.split('_')
+        if len(parts) >= 2:
+            key_filename = '_'.join(parts[:-1])
+            key_page = parts[-1]
+            
+            potential_paths.extend([
+                os.path.join(PDF_IMAGES_DIR, key_filename, f"{key_page}.png"),
+                os.path.join(PDF_IMAGES_DIR, key_filename, f"page_{key_page}.png"),
+                os.path.join(PDF_IMAGES_DIR, f"{key_filename}_{key_page}.png")
+            ])
+    
+    # Try pattern 2: Using filename and page directly
+    if filename:
+        # Remove file extension if present
+        base_filename = os.path.splitext(filename)[0]
+        
+        potential_paths.extend([
+            os.path.join(PDF_IMAGES_DIR, base_filename, f"{page_num}.png"),
+            os.path.join(PDF_IMAGES_DIR, base_filename, f"{page_num-1}.png"),  # Sometimes pages are 0-indexed
+            os.path.join(PDF_IMAGES_DIR, base_filename, f"page_{page_num}.png"),
+            os.path.join(PDF_IMAGES_DIR, f"{base_filename}_{page_num}.png"),
+            os.path.join(PDF_IMAGES_DIR, f"{base_filename}/page_{page_num}.png")
+        ])
+    
+    # Try all potential paths
+    for path in potential_paths:
+        logging.info(f"Trying potential path: {path}")
+        if os.path.exists(path):
+            try:
+                context_image = Image.open(path)
+                logging.info(f"Successfully loaded context image from alternative path: {path}")
+                return context_image
+            except Exception as e:
+                logging.error(f"Error opening image {path}: {e}")
+    
+    logging.warning(f"Could not find context image for {filename} page {page_num}")
+    return None
+
+def convert_numpy_to_python(obj):
+    """Recursively convert NumPy types to Python types in a dictionary or list"""
+    import numpy as np
+    
+    if isinstance(obj, dict):
+        return {key: convert_numpy_to_python(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_to_python(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_numpy_to_python(item) for item in obj)
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
+
+# Helper function to get context image path
+def get_context_image_path(top_sources):
+    """Get the file path for the context image"""
+    global page_images
+    
+    if not top_sources or len(top_sources) == 0:
+        return None
+        
+    # Get the top source document
+    top_source = top_sources[0]
+    image_key = top_source.get('image_key')
+    
+    if not image_key or image_key not in page_images:
+        # Try to find the image by reconstructing path patterns
+        parts = image_key.split('_')
+        if len(parts) >= 2:
+            filename = '_'.join(parts[:-1])
+            page_num = parts[-1]
+            
+            # Check different potential locations
+            potential_paths = [
+                os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
+                os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
+            ]
+            
+            for potential_path in potential_paths:
+                if os.path.exists(potential_path):
+                    return potential_path
+            
+        return None
+    
+    return page_images[image_key] if image_key in page_images else None
+
+# Get template path based on environment
+def get_template_path(filename):
+    """Get the correct template path based on environment"""
+    # For Modal deployment
+    if os.path.exists(TEMPLATES_DIR):
+        return os.path.join(TEMPLATES_DIR, filename)
+    
+    # For local development
+    local_template_dir = os.path.join(os.path.dirname(__file__), "templates")
+    if os.path.exists(local_template_dir):
+        return os.path.join(local_template_dir, filename)
+    
+    # Fallback - current directory
+    return filename
+
+# Helper functions for generating HTML components
+def generate_confidence_badge(confidence):
+    """Generate HTML for confidence badge with appropriate color"""
+    confidence_class = 'badge-warning'
+    if confidence == 'High':
+        confidence_class = 'badge-success'
+    elif confidence == 'Low':
+        confidence_class = 'badge-error'
+    
+    return f'<span class="badge {confidence_class}">{confidence}</span>'
+
+def generate_feedback_buttons(result_id):
+    """Generate HTML for feedback buttons with HTMX attributes"""
+    return f"""
+    <div class="flex space-x-1">
+        <button 
+            class="btn btn-xs btn-circle btn-outline" 
+            hx-post="/api/feedback"
+            hx-vals='{{"id": "{result_id}", "feedback": "positive"}}'
+            hx-swap="outerHTML"
+            title="Positive Feedback">
+            👍
+        </button>
+        <button 
+            class="btn btn-xs btn-circle btn-outline" 
+            hx-post="/api/feedback"
+            hx-vals='{{"id": "{result_id}", "feedback": "negative"}}'
+            hx-swap="outerHTML"
+            title="Negative Feedback">
+            👎
+        </button>
+    </div>
+    """
+
+def generate_feedback_badge(feedback):
+    """Generate HTML for feedback badge based on type"""
+    if not feedback:
+        return ""
+    
+    feedback_class = "badge-success" if feedback == "positive" else "badge-error"
+    return f'<span class="badge {feedback_class}">{feedback}</span>'
+
+def create_image_thumbnail(image_path=None):
+    """Create HTML for an image thumbnail, with placeholder if no image is available"""
+    if image_path and os.path.exists(image_path):
+        # Use actual image if available
+        return f"""
+        <div class="avatar">
+            <div class="mask mask-squircle w-12 h-12">
+                <img src="/image-thumbnail?path={image_path}" alt="Classification Image">
+            </div>
+        </div>
+        """
+    else:
+        # Use placeholder if no image available
+        return """
+        <div class="avatar">
+            <div class="mask mask-squircle w-12 h-12 bg-base-300 flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-base-content/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                    d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+            </div>
+        </div>
+        """
+
+# Helper function to get image path for a classification
+def get_classification_image_path(result_id):
+    """Retrieve the image path for a classification result from database and filesystem"""
+    try:
+        # Connect to the database
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        cursor = conn.cursor()
+        
+        # First, check the single results table for this ID
+        cursor.execute("""
+            SELECT additional_details FROM results 
+            WHERE id = ?
+        """, (result_id,))
+        
+        result = cursor.fetchone()
+        
+        if result and result[0]:
+            # Parse the additional details JSON to find image info
+            try:
+                details = json.loads(result[0])
+                
+                # Look for top sources first (these would be from RAG context)
+                top_sources = details.get('top_sources', [])
+                if top_sources and len(top_sources) > 0:
+                    source = top_sources[0]
+                    image_key = source.get('image_key')
+                    
+                    if image_key and image_key in page_images:
+                        path = page_images[image_key]
+                        if os.path.exists(path):
+                            return path
+                            
+                    # Try alternate paths if the image_key doesn't work
+                    if image_key:
+                        parts = image_key.split('_')
+                        if len(parts) >= 2:
+                            key_filename = '_'.join(parts[:-1])
+                            key_page = parts[-1]
+                            
+                            # Check different possible paths
+                            potential_paths = [
+                                os.path.join(PDF_IMAGES_DIR, key_filename, f"{key_page}.png"),
+                                os.path.join(PDF_IMAGES_DIR, key_filename, f"page_{key_page}.png"),
+                                os.path.join(PDF_IMAGES_DIR, f"{key_filename}_{key_page}.png"),
+                                os.path.join(PDF_IMAGES_DIR, "FIT-Counts-guide", f"{key_page}.png")
+                            ]
+                            
+                            for path in potential_paths:
+                                if os.path.exists(path):
+                                    return path
+            except (json.JSONDecodeError, TypeError):
+                pass
+        
+        # If we couldn't find it in the results table, check batch_results
+        batch_id = result_id
+        if '_' in result_id:
+            # This could be a batch result with format like "batch_id_index"
+            batch_id = result_id.split('_')[0]
+        
+        cursor.execute("""
+            SELECT results FROM batch_results 
+            WHERE batch_id = ?
+        """, (batch_id,))
+        
+        batch_result = cursor.fetchone()
+        
+        if batch_result and batch_result[0]:
+            try:
+                results_data = json.loads(batch_result[0])
+                
+                # Find the specific result in the batch
+                for result in results_data:
+                    if result.get("id") == result_id:
+                        # Save the image data to a temporary file
+                        temp_dir = os.path.join(TEMP_UPLOAD_DIR, "classification_images")
+                        os.makedirs(temp_dir, exist_ok=True)
+                        
+                        # Create temporary image file
+                        temp_path = os.path.join(temp_dir, f"{result_id}.jpg")
+                        
+                        # Check if we already have the image
+                        if os.path.exists(temp_path):
+                            return temp_path
+                        
+                        # For batch results, we would need to store temporary images since
+                        # we don't have the original files. This is just a placeholder -
+                        # in a real implementation this would utilize the image data from batch_results
+                        return None
+            except (json.JSONDecodeError, TypeError):
+                pass
+        
+        conn.close()
+        
+        # Check for results saved in the file system
+        result_file = os.path.join(RESULTS_FOLDER, f"{result_id}.json")
+        if os.path.exists(result_file):
+            try:
+                with open(result_file, "r") as f:
+                    result_data = json.load(f)
+                    
+                # Process similar to above
+                # This would need custom implementation based on your file structure
+                pass
+            except (json.JSONDecodeError, IOError):
+                pass
+        
+        # If nothing works, try the FIT-Counts-guide as a fallback for demo purposes
+        # This is just a demo - in production you'd want more robust matching
+        fit_guide_dir = os.path.join(PDF_IMAGES_DIR, "FIT-Counts-guide")
+        if os.path.exists(fit_guide_dir):
+            sample_images = [os.path.join(fit_guide_dir, f) for f in os.listdir(fit_guide_dir) 
+                            if f.endswith(('.png', '.jpg', '.jpeg'))]
+            if sample_images:
+                # Just return the first image as a sample
+                return sample_images[0]
+    
+    except Exception as e:
+        logging.error(f"Error getting classification image path: {e}")
+        traceback.print_exc()
+    
+    # If all else fails, return None to use a placeholder
+    return None
+
+def get_trend_indicator(stats):
+    """Calculate a trend indicator for daily classifications"""
+    daily_counts = stats.get("daily_counts", [])
+    
+    if len(daily_counts) < 2:
+        return {
+            "value": 0,
+            "trend": "neutral",
+            "html": '<span class="text-base-content">-</span>'
+        }
+    
+    # Get counts only
+    counts = [count for _, count in daily_counts]
+    
+    # Calculate trend - compare first half to second half
+    mid_point = len(counts) // 2
+    first_half = sum(counts[:mid_point])
+    second_half = sum(counts[mid_point:])
+    
+    if first_half > 0:
+        trend_value = ((second_half - first_half) / first_half) * 100
+        trend_value = round(trend_value, 1)
+    else:
+        trend_value = 0
+    
+    # Determine trend direction
+    trend_direction = "positive" if trend_value > 0 else "negative" if trend_value < 0 else "neutral"
+    
+    # Create HTML
+    if trend_direction == "positive":
+        html = f"""
+        <span class="inline-flex items-center text-success">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 10l7-7m0 0l7 7m-7-7v18" />
+            </svg>
+            {abs(trend_value)}%
+        </span>
+        """
+    elif trend_direction == "negative":
+        html = f"""
+        <span class="inline-flex items-center text-error">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+            </svg>
+            {abs(trend_value)}%
+        </span>
+        """
+    else:
+        html = '<span class="text-base-content">0%</span>'
+    
+    return {
+        "value": trend_value,
+        "trend": trend_direction,
+        "html": html
+    }
+
+def generate_flowbite_table_rows(results):
+    """Generate HTML for Flowbite table rows"""
+    if not results:
+        return """
+        <tr>
+            <td colspan="6" class="px-6 py-4 text-center">
+                No classification results found.
+            </td>
+        </tr>
+        """
+    
+    html = ""
+    for id, category, confidence, feedback, created_at, context_source in results:
+        # Determine confidence class for Flowbite styling
+        confidence_class = 'bg-yellow-100 text-yellow-800'
+        if confidence == 'High':
+            confidence_class = 'bg-green-100 text-green-800'
+        elif confidence == 'Low':
+            confidence_class = 'bg-red-100 text-red-800'
+        
+        # Build the table row
+        html += f"""
+        <tr class="bg-white border-b dark:bg-gray-800 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600">
+            <!-- Image column -->
+            <td class="px-6 py-4">
+                <div class="relative w-10 h-10 overflow-hidden bg-gray-100 rounded-full dark:bg-gray-600 cursor-pointer"
+                     onclick="showImageModal('{id}', '{category}', '{confidence}')">
+                    <svg class="absolute w-12 h-12 text-gray-400 -left-1" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+                        <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd"></path>
+                    </svg>
+                </div>
+            </td>
+            
+            <!-- Category column -->
+            <td class="px-6 py-4 font-medium text-gray-900 whitespace-nowrap dark:text-white">
+                {category}
+            </td>
+            
+            <!-- Confidence column -->
+            <td class="px-6 py-4">
+                <span class="px-2 py-1 rounded-full text-xs font-semibold {confidence_class}">
+                    {confidence}
+                </span>
+            </td>
+        """
+        
+        # Feedback column with HTMX support
+        if feedback:
+            feedback_class = 'bg-green-100 text-green-800' if feedback == 'positive' else 'bg-red-100 text-red-800'
+            html += f"""
+            <td class="px-6 py-4">
+                <span class="px-2 py-1 rounded-full text-xs font-semibold {feedback_class}">
+                    {feedback}
+                </span>
+            </td>
+            """
+        else:
+            html += f"""
+            <td class="px-6 py-4">
+                <div class="flex space-x-1" hx-target="this" hx-swap="outerHTML">
+                    <button 
+                        class="text-gray-500 hover:text-green-500 focus:outline-none" 
+                        hx-post="/api/feedback"
+                        hx-vals='{{"id": "{id}", "feedback": "positive"}}'>
+                        👍
+                    </button>
+                    <button 
+                        class="text-gray-500 hover:text-red-500 focus:outline-none" 
+                        hx-post="/api/feedback"
+                        hx-vals='{{"id": "{id}", "feedback": "negative"}}'>
+                        👎
+                    </button>
+                </div>
+            </td>
+            """
+        
+        # Date and actions columns
+        html += f"""
+            <td class="px-6 py-4">
+                {created_at}
+            </td>
+            
+            <td class="px-6 py-4 text-right">
+                <button 
+                    class="font-medium text-blue-600 dark:text-blue-500 hover:underline"
+                    onclick="showImageModal('{id}', '{category}', '{confidence}')">
+                    View
+                </button>
+            </td>
+        </tr>
+        """
+    
+    return html
+
+# Generate classification using Claude's API for a single image
+
+@app.function(
+    image=image,
+    cpu=1.0,
+    timeout=600,  # Increased timeout
+    volumes={DATA_DIR: bee_volume}
+)
+def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
+    """
+    Classify insect in image using Claude's API with RAG context
+    
+    Args:
+        image_data: Base64 encoded image
+        options: Dictionary of toggle options
+    
+    Returns:
+        Dictionary with classification results
+    """
+    # IMPORTANT: Load RAG data at the start of this function
+    # This ensures the data is available in this function's container
+    global colpali_embeddings, df, page_images
+    
+    load_rag_data()
+    
+    # Print diagnostics about loaded data
+    print_rag_diagnostics()
+    
+    result_id = uuid.uuid4().hex
+    
+    # Build additional instructions based on options
+    additional_instructions = []
+    format_instructions = []
+    
+    if options.get("detailed_description", False):
+        additional_instructions.append("Provide a detailed description of the insect, focusing on shapes and colors visible in the image.")
+        format_instructions.append("- Detailed Description: [shapes, colors, and distinctive features]")
+        
+    if options.get("plant_classification", False):
+        additional_instructions.append("If there are any plants visible in the image, identify them to the best of your ability.")
+        format_instructions.append("- Plant Identification: [names of visible plants, if any]")
+        
+    if options.get("taxonomy", False):
+        additional_instructions.append("Provide taxonomic classification of the insect to the most specific level possible (Order, Family, Genus, Species).")
+        format_instructions.append("- Taxonomy: [Order, Family, Genus, Species where possible]")
+    
+    # Get relevant context using visual similarity
+    context_source = None
+    context_image_data = None
+    top_sources = []
+    
+    # Check if RAG is available and enabled
+    rag_enabled = options.get("use_rag", True)
+    
+    # Verify RAG data is actually available
+    if rag_enabled:
+        rag_available = (colpali_embeddings is not None and 
+                         df is not None and len(df) > 0 and 
+                         page_images is not None and len(page_images) > 0)
+                         
+        if not rag_available:
+            logging.warning("RAG requested but data not available. Proceeding without context")
+    else:
+        rag_available = False
+        
+    if rag_enabled and rag_available:
+        try:
+            # Print debugging info
+            logging.info(f"RAG available: pages={len(page_images)}, embeddings={len(colpali_embeddings)}, df rows={len(df)}")
+            
+            # Get visually similar document pages
+            top_sources = retrieve_visually_similar_documents(image_data, top_k=3)
+            
+            if top_sources and len(top_sources) > 0:
+                for source in top_sources:
+                    # Add the image path to each source
+                    image_key = source.get('image_key')
+                    if image_key and image_key in page_images:
+                        image_path = page_images[image_key]
+                        if os.path.exists(image_path):
+                            source['image_path'] = image_path
+                        else:
+                            # Try alternate formats
+                            parts = image_key.split('_')
+                            if len(parts) >= 2:
+                                filename = '_'.join(parts[:-1])
+                                page_num = parts[-1]
+                                
+                                alt_paths = [
+                                    os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                                    os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
+                                    os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
+                                ]
+                                
+                                for alt_path in alt_paths:
+                                    if os.path.exists(alt_path):
+                                        source['image_path'] = alt_path
+                                        break
+                
+                # Continue processing the first source for Claude API
+                source = top_sources[0]
+                context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                logging.info(f"Using context source: {context_source}")
+                
+                # Get the context image
+                context_image_path = get_context_image_path([source])
+                if context_image_path and os.path.exists(context_image_path):
+                    # Load and convert context image to JPEG format
+                    try:
+                        # Open the image and convert to JPEG format
+                        with Image.open(context_image_path) as img:
+                            # Convert to RGB if needed
+                            if img.mode != 'RGB':
+                                img = img.convert('RGB')
+                                
+                            # Save as JPEG to a BytesIO buffer
+                            buffer = BytesIO()
+                            img.save(buffer, format="JPEG", quality=90)
+                            context_image_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                            logging.info(f"Successfully processed context image from: {context_image_path}")
+                    except Exception as e:
+                        logging.error(f"Error processing context image {context_image_path}: {e}")
+                        context_image_data = None  # Ensure it's None if there was an error
+                else:
+                    logging.warning(f"Could not find context image for {context_source}")
+            else:
+                logging.warning("No similar documents found")
         except Exception as e:
-            logging.error(f"Error in document retrieval: {str(e)}")
+            logging.error(f"Error retrieving context: {e}")
             import traceback
             traceback.print_exc()
-            return [], []
 
-    # Initialize the FastHTML app
-    fasthtml_app, rt = fast_app(
-        hdrs=(
-            # Explicit HTMX loading and other scripts
-            Script(src="https://unpkg.com/htmx.org@1.9.6"),
-            Script(src="https://cdn.tailwindcss.com"),
-            Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/daisyui@4.11.1/dist/full.min.css"),
-            # Add custom CSS for better interactive elements
-            Style("""
-                button, .btn, a[href] {
-                    cursor: pointer !important;
-                }
-                
-                button:hover, .btn:hover, a[href]:hover {
-                    opacity: 0.9;
-                }
-                
-                .file-input {
-                    cursor: pointer !important;
-                }
-                
-                /* Ensure nothing blocks interaction */
-                #main-content, #analysis-results {
-                    position: relative;
-                    z-index: 1;
-                }
-                
-                /* Only show loading indicator when active */
-                #loading-indicator:not(.htmx-request) {
-                    display: none !important;
-                }
-                
-                /* Custom styles for token maps */
-                .token-tab.active {
-                    background-color: #4CAF50;
-                    color: white;
-                }
-                
-                /* Custom animations */
-                .fade-in {
-                    animation: fadeIn 0.5s;
-                }
-                
-                @keyframes fadeIn {
-                    from { opacity: 0; }
-                    to { opacity: 1; }
-                }
-                
-                /* Custom styling for token map display */
-                .token-map {
-                    max-height: 350px;
-                    object-fit: contain;
-                }
-                
-                .context-container {
-                    background-color: #2a2a2a;
-                    border: 1px solid #3a3a3a;
-                    border-radius: 8px;
-                    padding: 10px;
-                    margin-bottom: 12px;
-                }
-                
-                .context-header {
-                    color: #aaa;
-                    font-size: 14px;
-                    margin-bottom: 8px;
-                }
-                
-                /* Carousel styles */
-                .carousel-item {
-                    scroll-snap-align: start;
-                }
-                
-                .carousel {
-                    scroll-behavior: smooth;
-                    scroll-snap-type: x mandatory;
-                }
-            """),
-        ),
-        middleware=[
-            Middleware(
-                SessionMiddleware,
-                secret_key=os.environ.get('YOUR_KEY', 'default-secret-key'),
-                session_cookie="secure_session",
-                max_age=86400,
-                same_site="strict",
-                https_only=True
-            )
-        ]
+    # Create context instructions based on whether we have a context image
+    image_context_instructions = ""
+    if context_image_data:
+        image_context_instructions = """
+I am also providing a SECOND IMAGE that contains reference information about insects.
+This second image is a document page that may help with your classification of the insect.
+Please examine both images, using the document image to inform your analysis of the insect.
+"""
+    
+    # Format the prompt - Make sure to clearly state this is for INSECT classification
+    prompt = """
+    You are an expert entomologist specializing in INSECT identification. Your task is to analyze the 
+    provided insect image and classify the insect(s) visible.
+    
+    Please categorize the insect into one of these categories:
+    {categories}
+    
+    {image_context_instructions}
+    
+    {additional_instructions}
+    
+    Format your response as follows:
+    - Main Category: [the most likely category from the list]
+    - Confidence: [High, Medium, or Low]
+    - Description: [brief description of what you see]
+    {format_instructions}
+    
+    IMPORTANT: Just provide the formatted response above with no additional explanation or apology.
+    IMPORTANT: This is an INSECT image for classification, not a document.
+    """.format(
+        categories="\n".join([f"- {category}" for category in INSECT_CATEGORIES]),
+        image_context_instructions=image_context_instructions,
+        additional_instructions="\n".join(additional_instructions) if additional_instructions else "",
+        format_instructions="\n".join(format_instructions) if format_instructions else ""
     )
-
-    # Helper function to extract the one-word classification from LLM response
-    def extract_classification(response_text):
-        """Extract the one-word classification from the LLM response"""
-        # Try to extract the classification after "Answer:" if present
-        if "Answer:" in response_text:
-            parts = response_text.split("Answer:")
-            if len(parts) > 1:
-                answer = parts[1].strip().lower()
-                # Take only the first word
-                classification = answer.split()[0] if answer.split() else "unknown"
-                return classification
+    
+    print("🔍 Sending insect image to Claude for classification...")
+    
+    try:
+        # Ensure input image is in proper JPEG format
+        try:
+            # Decode base64 image
+            img_bytes = base64.b64decode(image_data)
+            img = Image.open(BytesIO(img_bytes))
+            
+            # Convert to RGB if needed
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+                
+            # Re-encode as JPEG
+            buffer = BytesIO()
+            img.save(buffer, format="JPEG", quality=90)
+            image_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        except Exception as e:
+            logging.error(f"Error processing input image: {e}")
+            # Continue with original image_data if there's an error
         
-        # If no "Answer:" pattern, look for specific categories in the response
-        categories = ["bumblebee", "honeybee", "wasp", "solitary bee", "hoverfly", "other flies", "butterfly", "moth", "other"]
-        
-        # Check for each category in the text
-        response_lower = response_text.lower()
-        for category in categories:
-            if category in response_lower:
-                if category == "flies":
-                    return "other flies"
-                elif category in ["butterfly", "moth"]:
-                    return "butterfly & moths"
-                return category
-        
-        # Default if no category found
-        return "other insect"
-
-    # Helper function to get badge color based on classification
-    def get_badge_color(classification):
-        """Return the appropriate badge color for a classification"""
-        colors = {
-            "bumblebee": "badge-primary",      # Blue
-            "honeybee": "badge-warning",       # Yellow
-            "wasp": "badge-accent",            # Dark yellow/orange
-            "hoverfly": "badge-success",       # Green
-            "other flies": "badge-info",       # Light blue
-            "butterfly & moths": "badge-secondary", # Purple
-            "other insect": "badge-neutral",   # Gray
-            "error": "badge-error"             # Red
+        # Prepare the request for Claude API
+        headers = {
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
         }
         
-        # Normalize the classification
-        classification = classification.lower()
+        # Build content array for the message
+        content = []
         
-        # Check for partial matches - simplified for accurate matching
-        for key, color in colors.items():
-            if key == classification:
-                return color
+        # Add the input image
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": image_data
+            }
+        })
         
-        # Default to neutral if no match
-        return "badge-neutral"
+        # Add the context image if available
+        if context_image_data:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": context_image_data
+                }
+            })
         
-    # Helper functions for saving to database
-    async def save_to_database(analysis_id, image_path, analysis_type, query, response, top_sources):
-        """Save analysis results to the database"""
+        # Add the text prompt
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        payload = {
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ]
+        }
+        
+        # Log what's being sent to the API
+        logging.info(f"Sending request to Claude API with {len(content)} content items")
+        if context_image_data:
+            logging.info("Including context image in request")
+        
+        # Make the API call
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        # Extract the response content
+        result = response.json()
+        classification_text = result["content"][0]["text"]
+        
+        # Parse the classification result
+        # Simple parsing based on the expected format
+        lines = classification_text.strip().split("\n")
+        parsed_result = {}
+        
+        for line in lines:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip().replace("- ", "")
+                value = value.strip()
+                parsed_result[key] = value
+        
+        # Store essential information
+        category = parsed_result.get("Main Category", "Unclassified")
+        confidence = parsed_result.get("Confidence", "Low")
+        description = parsed_result.get("Description", "No description provided")
+        
+        # Check for missing fields in parsed result
+        if "Main Category" not in parsed_result:
+            logging.warning("Main Category not found in response, raw text: " + classification_text)
+        
+        # Store the full result in the database
         try:
-            conn = sqlite3.connect(db_path)
+            conn = setup_database(DB_PATH)
             cursor = conn.cursor()
             
-            # Insert basic info
+            # Include context_source in the insert
             cursor.execute(
-                "INSERT INTO image_analyses (analysis_id, image_path, analysis_type, query, response) VALUES (?, ?, ?, ?, ?)",
-                (analysis_id, image_path, analysis_type, query, response)
+                "INSERT INTO results (id, category, confidence, description, additional_details, context_source) VALUES (?, ?, ?, ?, ?, ?)",
+                (result_id, category, confidence, description, json.dumps(parsed_result), context_source)
             )
             
-            # Add context source if available
-            if top_sources:
-                top_source = top_sources[0]
-                context_source = f"{top_source['filename']} (page {top_source['page']})"
+            conn.commit()
+            conn.close()
+            
+            return {
+                "id": result_id,
+                "category": category,
+                "confidence": confidence,
+                "description": description,
+                "details": parsed_result,
+                "context_source": context_source,
+                "top_sources": top_sources,
+                "rag_available": rag_available if rag_enabled else False,
+                "rag_enabled": rag_enabled,
+                "context_image_used": context_image_data is not None,
+                "raw_response": classification_text
+            }
+            
+        except Exception as db_error:
+            print(f"⚠️ Error saving to database: {db_error}")
+            # Still return the result even if database save fails
+            return {
+                "id": result_id,
+                "category": category,
+                "confidence": confidence,
+                "description": description,
+                "details": parsed_result,
+                "context_source": context_source,
+                "top_sources": top_sources,
+                "rag_available": rag_available if rag_enabled else False,  
+                "rag_enabled": rag_enabled,
+                "context_image_used": context_image_data is not None,
+                "raw_response": classification_text,
+                "db_error": str(db_error)
+            }
+            
+    except requests.exceptions.HTTPError as http_err:
+        error_detail = "Unknown error"
+        try:
+            error_json = response.json()
+            error_detail = error_json.get('error', {}).get('message', str(http_err))
+        except:
+            error_detail = response.text if response.text else str(http_err)
+        
+        logging.error(f"HTTP error occurred: {error_detail}")
+        return {
+            "error": f"API Error: {error_detail}",
+            "id": result_id
+        }
+    except Exception as e:
+        print(f"⚠️ Error in classification: {e}")
+        return {
+            "error": str(e),
+            "id": result_id
+        }
+
+
+@app.function(
+    image=image,
+    cpu=1.0,
+    timeout=300,
+    volumes={DATA_DIR: bee_volume}
+)
+async def classify_document_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
+    """
+    Classify document using Claude's Vision capabilities, treating it purely as an image
+    
+    Args:
+        image_data: Base64 encoded image of the document
+        options: Dictionary of toggle options
+    
+    Returns:
+        Dictionary with classification and analysis results
+    """
+    global colpali_embeddings, df, page_images
+    
+    result_id = uuid.uuid4().hex
+    
+    # Build additional instructions based on options
+    additional_instructions = []
+    format_instructions = []
+    
+    if options.get("detailed_analysis", False):
+        additional_instructions.append("Provide a detailed analysis of the document, focusing on its visual structure, layout, and any visible elements.")
+        format_instructions.append("- Detailed Analysis: [description of document structure and layout]")
+        
+    if options.get("extract_key_points", False):
+        additional_instructions.append("Extract key points visible in the document without using OCR or text extraction.")
+        format_instructions.append("- Key Points: [list of main points visible in the document]")
+        
+    if options.get("identify_document_type", False):
+        additional_instructions.append("Identify the document type based on its visual appearance.")
+        format_instructions.append("- Document Type: [invoice, report, form, etc.]")
+    
+    # Get relevant context documents using RAG retrieval
+    context_text = ""
+    context_source = None
+    context_images = []
+    top_sources = []
+    
+    # Check if RAG is available and enabled
+    rag_enabled = options.get("use_rag", True)
+    rag_available = colpali_embeddings is not None and df is not None and len(df) > 0
+    
+    if rag_enabled:
+        if rag_available:
+            query = "document analysis" # General query for document context
+            try:
+                # Use the vision retrieval function to get similar document images
+                context_images, top_sources = await retrieve_relevant_documents(query, top_k=3)
+                logging.info(f"Retrieved {len(context_images)} context images and {len(top_sources)} top sources")
+
+                if context_images and top_sources and len(top_sources) > 0:
+                    source = top_sources[0]
+                    context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                    logging.info(f"Using context source: {context_source}")
+            except Exception as e:
+                logging.error(f"Error retrieving context: {e}")
+                import traceback
+                traceback.print_exc()
+                # Continue without context if retrieval fails
+        else:
+            logging.warning("RAG requested but data not available. Proceeding without context")
+    
+    # Build the prompt for document analysis - treating the document as a pure image
+    document_analysis_prompt = """
+    You are an expert document analyst. Your task is to analyze the provided document image and provide detailed insights.
+    
+    Please analyze the document based on its visual appearance without performing explicit OCR or text extraction.
+    Focus on what you can observe directly in the image - layout, structure, visual elements, and general content.
+    
+    {additional_instructions}
+    
+    Format your response as follows:
+    - Document Overview: [brief description of what you see]
+    - Visual Structure: [description of layout and visual organization]
+    - Content Type: [what kind of content appears to be in the document]
+    {format_instructions}
+    
+    IMPORTANT: Just provide the formatted response above with no additional explanation or apology.
+    """
+    
+    # Prepare the prompt
+    additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
+    format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
+    
+    prompt = document_analysis_prompt.format(
+        additional_instructions=additional_instructions_text,
+        format_instructions=format_instructions_text
+    )
+    
+    print("🔍 Sending document image to Claude for visual analysis...")
+    
+    try:
+        # Prepare the request for Claude API
+        headers = {
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        # Build content array for the message
+        content = []
+        
+        # Add the input document image
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": image_data
+            }
+        })
+        
+        # Add context images if available
+        for i, context_image in enumerate(context_images):
+            if i >= 2:  # Limit to 2 context images to avoid token limits
+                break
                 
-                # Check if the column exists
-                cursor.execute("PRAGMA table_info(image_analyses)")
-                columns = [column[1] for column in cursor.fetchall()]
-                if 'context_source' in columns:
+            # Convert PIL Image to base64
+            buffered = BytesIO()
+            context_image.save(buffered, format="JPEG", quality=85)
+            context_image_data = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": context_image_data
+                }
+            })
+        
+        # Add the text prompt
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        payload = {
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ]
+        }
+        
+        # Log what's being sent to the API
+        logging.info(f"Sending request to Claude API with {len(content)} content items")
+        if context_images:
+            logging.info(f"Including {len(context_images)} context images in request")
+        
+        # Make the API call
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        # Extract the response content
+        result = response.json()
+        analysis_text = result["content"][0]["text"]
+        
+        # Parse the analysis result
+        lines = analysis_text.strip().split("\n")
+        parsed_result = {}
+        
+        for line in lines:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip().replace("- ", "")
+                value = value.strip()
+                parsed_result[key] = value
+        
+        # Store essential information
+        document_overview = parsed_result.get("Document Overview", "No overview provided")
+        visual_structure = parsed_result.get("Visual Structure", "Structure not analyzed")
+        content_type = parsed_result.get("Content Type", "Unknown")
+        
+        # Store the full result in the database
+        try:
+            conn = setup_database(DB_PATH)
+            cursor = conn.cursor()
+            
+            # Include context_source in the insert
+            cursor.execute(
+                "INSERT INTO results (id, category, confidence, description, additional_details, context_source) VALUES (?, ?, ?, ?, ?, ?)",
+                (result_id, content_type, "Medium", document_overview, json.dumps(parsed_result), context_source)
+            )
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "id": result_id,
+                "document_type": content_type,
+                "overview": document_overview,
+                "visual_structure": visual_structure,
+                "details": parsed_result,
+                "context_source": context_source,
+                "top_sources": top_sources,
+                "rag_available": rag_available,
+                "rag_enabled": rag_enabled,
+                "context_images_used": len(context_images),
+                "raw_response": analysis_text
+            }
+            
+        except Exception as db_error:
+            print(f"⚠️ Error saving to database: {db_error}")
+            # Still return the result even if database save fails
+            return {
+                "id": result_id,
+                "document_type": content_type,
+                "overview": document_overview,
+                "visual_structure": visual_structure,
+                "details": parsed_result,
+                "context_source": context_source,
+                "top_sources": top_sources,
+                "rag_available": rag_available,
+                "rag_enabled": rag_enabled,
+                "context_images_used": len(context_images),
+                "raw_response": analysis_text,
+                "db_error": str(db_error)
+            }
+            
+    except requests.exceptions.HTTPError as http_err:
+        error_detail = "Unknown error"
+        try:
+            error_json = response.json()
+            error_detail = error_json.get('error', {}).get('message', str(http_err))
+        except:
+            error_detail = response.text if response.text else str(http_err)
+        
+        logging.error(f"HTTP error occurred: {error_detail}")
+        return {
+            "error": f"API Error: {error_detail}",
+            "id": result_id
+        }
+    except Exception as e:
+        logging.error(f"Error in document classification: {e}")
+        return {
+            "error": str(e),
+            "id": result_id
+        }
+    
+# Batch classification function
+@app.function(
+    image=image,
+    cpu=1.0,
+    timeout=500,  # Longer timeout for batch processing
+    volumes={DATA_DIR: bee_volume}
+)
+def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> Dict[str, Any]:
+    """
+    Classify multiple insect images in batch using Claude's API
+    
+    Args:
+        images_data: List of base64 encoded images (max 5)
+        options: Dictionary of toggle options
+    
+    Returns:
+        Dictionary with batch classification results
+    """
+    global colpali_embeddings, df, page_images
+    
+    batch_id = uuid.uuid4().hex
+    
+    # Limit to max 5 images per batch for cost/performance
+    max_images = 5
+    if len(images_data) > max_images:
+        images_data = images_data[:max_images]
+    
+    # Build additional instructions based on options
+    additional_instructions = []
+    format_instructions = []
+    
+    if options.get("detailed_description", False):
+        additional_instructions.append("Provide a detailed description of the insect, focusing on shapes and colors visible in the image.")
+        format_instructions.append("- Detailed Description: [shapes, colors, and distinctive features]")
+        
+    if options.get("plant_classification", False):
+        additional_instructions.append("If there are any plants visible in the image, identify them to the best of your ability.")
+        format_instructions.append("- Plant Identification: [names of visible plants, if any]")
+        
+    if options.get("taxonomy", False):
+        additional_instructions.append("Provide taxonomic classification of the insect to the most specific level possible (Order, Family, Genus, Species).")
+        format_instructions.append("- Taxonomy: [Order, Family, Genus, Species where possible]")
+    
+    # Get relevant context using visual similarity with first image
+    # This is a simplification - in a more advanced implementation, you might
+    # want to get context relevant to all images, but for simplicity we'll use the first
+    context_source = None
+    context_image_data = None
+    top_sources = []
+    
+    if options.get("use_rag", True) and images_data and len(images_data) > 0:  # Default to using RAG
+        try:
+            # Use the first image in the batch to find relevant documents
+            query_image_data = images_data[0]
+            top_sources = retrieve_visually_similar_documents(query_image_data, top_k=1)
+            
+            if top_sources and len(top_sources) > 0:
+                source = top_sources[0]
+                context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                
+                # Get the context image
+                context_image_path = get_context_image_path([source])
+                if context_image_path and os.path.exists(context_image_path):
+                    with open(context_image_path, "rb") as f:
+                        context_image_data = base64.b64encode(f.read()).decode('utf-8')
+                    logging.info(f"Found batch context image: {context_image_path}")
+        except Exception as e:
+            logging.error(f"Error retrieving batch context: {e}")
+            traceback.print_exc()
+    
+    # Prepare the batch prompt
+    categories_list = "\n".join([f"- {category}" for category in INSECT_CATEGORIES])
+    additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
+    format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
+    
+    # Create context instructions based on whether we have a context image
+    image_context_instructions = ""
+    if context_image_data:
+        image_context_instructions = f"""
+I am also providing an additional image at the end (after all {len(images_data)} insect images) that contains reference information about insects.
+This final image is a document page that may help with your classification.
+Please examine all images, using the document image to inform your analysis of the insects.
+"""
+    
+    # Format the prompt
+    prompt = """
+    You are an expert entomologist specializing in insect identification. Your task is to analyze {count} 
+    images of insects and classify each one.
+    
+    For EACH image, categorize the insect into one of these categories:
+    {categories}
+    
+    {image_context_instructions}
+    
+    {additional_instructions}
+    
+    Format your response as follows, with a separate analysis for each image:
+    
+    IMAGE 1:
+    - Main Category: [the most likely category from the list]
+    - Confidence: [High, Medium, or Low]
+    - Description: [brief description of what you see]
+    {format_instructions}
+    
+    IMAGE 2:
+    - Main Category: [the most likely category from the list]
+    - Confidence: [High, Medium, or Low]
+    - Description: [brief description of what you see]
+    {format_instructions}
+    
+    And so on for each image...
+    
+    IMPORTANT: Provide a separate, clearly labeled analysis for each image using the format above.
+    """.format(
+        count=len(images_data),
+        categories=categories_list,
+        image_context_instructions=image_context_instructions,
+        additional_instructions=additional_instructions_text,
+        format_instructions=format_instructions_text
+    )
+    
+    print(f"🔍 Sending batch of {len(images_data)} images to Claude for classification...")
+    
+    try:
+        # Prepare the request for Claude API
+        headers = {
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        # Build content array with all insect images first
+        content = []
+        for img_data in images_data:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": img_data
+                }
+            })
+        
+        # Add the context image AFTER all insect images if available
+        if context_image_data:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": context_image_data
+                }
+            })
+        
+        # Add the text prompt at the end
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        payload = {
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 1500,  # Increased for multi-image response
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ]
+        }
+        
+        # Make the API call
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        # Extract the response content
+        result = response.json()
+        batch_text = result["content"][0]["text"]
+        
+        # Parse the batch results (split by "IMAGE X:")
+        image_results = []
+        
+        # Split by "IMAGE" keyword
+        raw_sections = batch_text.split("IMAGE ")
+        
+        # Remove any empty initial section
+        if raw_sections and not raw_sections[0].strip():
+            raw_sections = raw_sections[1:]
+        elif raw_sections and not raw_sections[0].strip().startswith("1:"):
+            # If first section doesn't start with a number, it's probably preamble
+            raw_sections = raw_sections[1:]
+        
+        # Process each image section
+        for i, section in enumerate(raw_sections):
+            if i >= len(images_data):  # Safety check
+                break
+                
+            # Clean up the section
+            if section.strip().startswith(f"{i+1}:"):
+                # Remove the image number prefix
+                section = section.strip()[2:].strip()
+            
+            # Parse this section
+            lines = section.strip().split("\n")
+            parsed_result = {}
+            
+            for line in lines:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    key = key.strip().replace("- ", "")
+                    value = value.strip()
+                    parsed_result[key] = value
+            
+            # Get essential fields
+            result_id = f"{batch_id}_{i}"
+            category = parsed_result.get("Main Category", "Unclassified")
+            confidence = parsed_result.get("Confidence", "Low")
+            description = parsed_result.get("Description", "No description provided")
+            
+            # Add to results
+            image_results.append({
+                "id": result_id,
+                "index": i,
+                "category": category,
+                "confidence": confidence,
+                "description": description,
+                "details": parsed_result
+            })
+        
+        # Store batch results in database
+        try:
+            conn = setup_database(DB_PATH)
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                "INSERT INTO batch_results (batch_id, result_count, results) VALUES (?, ?, ?)",
+                (batch_id, len(image_results), json.dumps(image_results))
+            )
+            
+            conn.commit()
+            conn.close()
+            
+            # Save results to file
+            save_results_file(batch_id, {
+                "batch": True,
+                "results": image_results,
+                "raw_response": batch_text
+            })
+            
+        except Exception as e:
+            print(f"⚠️ Error saving batch results to database: {e}")
+        
+        return {
+            "batch_id": batch_id,
+            "count": len(image_results),
+            "results": image_results,
+            "context_source": context_source,
+            "top_sources": top_sources,
+            "context_image_used": context_image_data is not None,
+            "raw_response": batch_text
+        }
+        
+    except requests.exceptions.HTTPError as http_err:
+        error_detail = "Unknown error"
+        try:
+            error_json = response.json()
+            error_detail = error_json.get('error', {}).get('message', str(http_err))
+        except:
+            error_detail = response.text if response.text else str(http_err)
+        
+        logging.error(f"HTTP error occurred: {error_detail}")
+        return {
+            "error": f"API Error: {error_detail}",
+            "batch_id": batch_id
+        }
+    except Exception as e:
+        logging.error(f"Error in batch classification: {e}")
+        traceback.print_exc()
+        return {
+            "error": str(e),
+            "batch_id": batch_id
+        }
+
+# Main FastHTML Server with defined routes
+@app.function(
+    image=image,
+    volumes={DATA_DIR: bee_volume},
+    cpu=1.0,
+    timeout=3600
+)
+@modal.asgi_app()
+def serve():
+    """Main FastHTML Server for Bee Classifier Dashboard with RAG"""
+    # Load RAG data at startup
+    load_rag_data()
+    
+    # Set up the FastHTML app with required headers
+    fasthtml_app, rt = fast_app(
+        hdrs=(
+            Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/daisyui@3.9.2/dist/full.css"),
+            Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css"),
+            # Add Flowbite CSS
+            Link(rel="stylesheet", href="https://cdnjs.cloudflare.com/ajax/libs/flowbite/2.2.0/flowbite.min.css"),
+            Script(src="https://unpkg.com/htmx.org@1.9.10"),
+            # Add Flowbite JavaScript
+            Script(src="https://cdnjs.cloudflare.com/ajax/libs/flowbite/2.2.0/flowbite.min.js"),
+            # Add ApexCharts for better charts
+            Script(src="https://cdn.jsdelivr.net/npm/apexcharts"),
+            # Add custom theme styles
+            Style("""
+                :root {
+                --color-base-100: oklch(98% 0.002 247.839);
+                --color-base-200: oklch(96% 0.003 264.542);
+                --color-base-300: oklch(92% 0.006 264.531);
+                --color-base-content: oklch(21% 0.034 264.665);
+                --color-primary: oklch(47% 0.266 120.957);  /* Green for bees */
+                --color-primary-content: oklch(97% 0.014 254.604);
+                --color-secondary: oklch(74% 0.234 93.635);  /* Yellow for bees */
+                --color-secondary-content: oklch(13% 0.028 261.692);
+                --color-accent: oklch(41% 0.234 41.252);     /* Brown accent */
+                --color-accent-content: oklch(97% 0.014 254.604);
+                --color-neutral: oklch(13% 0.028 261.692);
+                --color-neutral-content: oklch(98% 0.002 247.839);
+                --color-info: oklch(58% 0.158 241.966);
+                --color-info-content: oklch(97% 0.013 236.62);
+                --color-success: oklch(62% 0.194 149.214);
+                --color-success-content: oklch(98% 0.018 155.826);
+                --color-warning: oklch(66% 0.179 58.318);
+                --color-warning-content: oklch(98% 0.022 95.277);
+                --color-error: oklch(59% 0.249 0.584);
+                --color-error-content: oklch(97% 0.014 343.198);
+                }
+
+                /* Original styling remains */
+                
+                /* Custom styling */
+                .text-bee-green {
+                    color: oklch(47% 0.266 120.957);
+                }
+                
+                .bg-bee-yellow {
+                    background-color: oklch(74% 0.234 93.635);
+                }
+                
+                .custom-border {
+                    border-color: var(--color-base-300);
+                }
+
+                /* Confidence level colors */
+                .confidence-high {
+                    color: var(--color-success);
+                }
+                
+                .confidence-medium {
+                    color: var(--color-warning);
+                }
+                
+                .confidence-low {
+                    color: var(--color-error);
+                }
+                
+                /* Batch specific styles */
+                .batch-previews {
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 10px;
+                    margin: 15px 0;
+                }
+                
+                .preview-item {
+                    position: relative;
+                    width: 80px;
+                    height: 80px;
+                }
+                
+                .preview-img {
+                    width: 100%;
+                    height: 100%;
+                    object-fit: cover;
+                    border-radius: 0.5rem;
+                    border: 2px solid var(--color-base-300);
+                }
+                
+                .remove-btn {
+                    position: absolute;
+                    top: -8px;
+                    right: -8px;
+                    background: var(--color-error);
+                    color: white;
+                    border-radius: 50%;
+                    width: 20px;
+                    height: 20px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 14px;
+                    cursor: pointer;
+                }
+                
+                /* Add Flowbite compatibility styles */
+                .flowbite-card {
+                    background-color: var(--color-base-100);
+                    border: 1px solid var(--color-base-300);
+                    border-radius: 0.5rem;
+                }
+                
+                .flowbite-table th, .flowbite-table td {
+                    padding: 0.75rem 1rem;
+                }
+                
+                /* Custom styles for the donut chart */
+                #donut-chart-container {
+                    height: 320px;
+                }
+                
+                /* Custom styles for the line chart */
+                #line-chart-container {
+                    height: 300px;
+                }
+                
+                /* Table image thumbnails */
+                .bee-thumbnail {
+                    width: 60px;
+                    height: 60px;
+                    object-fit: cover;
+                    border-radius: 0.25rem;
+                }
+                
+                /* HTMX loading indicator */
+                .htmx-indicator {
+                    opacity: 0;
+                    transition: opacity 200ms ease-in;
+                }
+                .htmx-request .htmx-indicator {
+                    opacity: 1;
+                }
+                .htmx-request.htmx-indicator {
+                    opacity: 1;
+                }
+                
+                /* Pie chart colors */
+                [style*="--color-1"] {
+                    background-color: var(--color-primary);
+                }
+                [style*="--color-2"] {
+                    background-color: var(--color-secondary);
+                }
+                [style*="--color-3"] {
+                    background-color: var(--color-accent);
+                }
+                [style*="--color-4"] {
+                    background-color: #1e88e5;
+                }
+                [style*="--color-5"] {
+                    background-color: #43a047;
+                }
+                [style*="--color-6"] {
+                    background-color: #ffb300;
+                }
+                [style*="--color-7"] {
+                    background-color: #e53935;
+                }
+                [style*="--color-8"] {
+                    background-color: #8e24aa;
+                }
+                [style*="--color-9"] {
+                    background-color: #00acc1;
+                }
+                [style*="--color-10"] {
+                    background-color: #f4511e;
+                }
+            """),
+        )
+    )
+    
+    # Ensure database exists
+    setup_database(DB_PATH)
+    
+    #################################################
+    # API routes and page handlers go here
+    #################################################
+    @rt("/context-image")
+    async def serve_context_image(request):
+        """Serve a context image from a PDF page based on filename and page number"""
+        try:
+            # Get parameters
+            filename = request.query_params.get("filename", "")
+            page = request.query_params.get("page", "0")
+            full_size = request.query_params.get("full", "false").lower() == "true"
+            
+            if not filename:
+                return Response(
+                    content="Missing filename parameter",
+                    media_type="text/plain",
+                    status_code=400
+                )
+            
+            try:
+                page_num = int(page)
+            except ValueError:
+                page_num = 0
+            
+            # Try to find the image in different path formats
+            potential_paths = [
+                # Standard path format
+                os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                # Alternative format with "page_" prefix
+                os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
+                # Flattened path
+                os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png"),
+                # Try with file extension removed if present
+                os.path.join(PDF_IMAGES_DIR, os.path.splitext(filename)[0], f"{page_num}.png"),
+                # Path for FIT-Counts-guide specifically
+                os.path.join(PDF_IMAGES_DIR, "FIT-Counts-guide", f"{page_num}.png")
+            ]
+            
+            # Try each potential path
+            image_path = None
+            for path in potential_paths:
+                if os.path.exists(path):
+                    image_path = path
+                    break
+            
+            if not image_path:
+                # Return a placeholder SVG if no image is found
+                placeholder_svg = """
+                <svg xmlns="http://www.w3.org/2000/svg" width="300" height="200" viewBox="0 0 300 200">
+                    <rect width="300" height="200" fill="#f5f5f5"/>
+                    <text x="150" y="100" font-family="Arial" font-size="16" text-anchor="middle">Image not found</text>
+                </svg>
+                """
+                return Response(
+                    content=placeholder_svg.encode("utf-8"),
+                    media_type="image/svg+xml"
+                )
+            
+            # Read the image file
+            with open(image_path, "rb") as f:
+                image_data = f.read()
+            
+            # If not full size, resize the image
+            if not full_size:
+                try:
+                    from PIL import Image
+                    from io import BytesIO
+                    
+                    img = Image.open(BytesIO(image_data))
+                    
+                    # Calculate proportional resize
+                    max_width = 800
+                    max_height = 600
+                    
+                    width, height = img.size
+                    if width > max_width or height > max_height:
+                        ratio = min(max_width / width, max_height / height)
+                        new_width = int(width * ratio)
+                        new_height = int(height * ratio)
+                        img = img.resize((new_width, new_height), Image.LANCZOS)
+                    
+                    # Save to BytesIO
+                    output = BytesIO()
+                    img.save(output, format=img.format if img.format else "PNG")
+                    image_data = output.getvalue()
+                except Exception as e:
+                    logging.warning(f"Error resizing image: {e}")
+                    # Continue with original image data if resize fails
+            
+            # Determine content type based on file extension
+            if image_path.lower().endswith(".jpg") or image_path.lower().endswith(".jpeg"):
+                content_type = "image/jpeg"
+            elif image_path.lower().endswith(".png"):
+                content_type = "image/png"
+            else:
+                content_type = "application/octet-stream"
+            
+            # Return the image
+            return Response(
+                content=image_data,
+                media_type=content_type
+            )
+        
+        except Exception as e:
+            logging.error(f"Error serving context image: {e}")
+            traceback.print_exc()
+            
+            # Return an error placeholder SVG
+            placeholder_svg = """
+            <svg xmlns="http://www.w3.org/2000/svg" width="300" height="200" viewBox="0 0 300 200">
+                <rect width="300" height="200" fill="#fff0f0"/>
+                <text x="150" y="100" font-family="Arial" font-size="16" text-anchor="middle" fill="#ff0000">Error loading image</text>
+            </svg>
+            """
+            return Response(
+                content=placeholder_svg.encode("utf-8"),
+                media_type="image/svg+xml"
+            )
+        
+    @rt("/api/classify", methods=["POST"])
+    async def api_classify_image(request):
+        """API endpoint to classify insect image using Claude with RAG"""
+        try:
+            # Get image data and options from request JSON
+            data = await request.json()
+            image_data = data.get("image_data", "")
+            options = data.get("options", {})
+            
+            if not image_data:
+                return JSONResponse({"error": "No image data provided"}, status_code=400)
+            
+            # Make sure to use classify_image_claude here
+            result = classify_image_claude.remote(image_data, options)
+            
+            # Convert NumPy types to Python native types before JSON serialization
+            result = convert_numpy_to_python(result)
+            
+            return JSONResponse(result)
+                    
+        except Exception as e:
+            print(f"Error classifying image: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @rt("/analyze-document", methods=["POST"])
+    async def api_analyze_document(request):
+        """API endpoint to analyze document as a pure image using Claude's Vision API"""
+        try:
+            # Get image data and options from request JSON
+            data = await request.json()
+            image_data = data.get("image_data", "")
+            options = data.get("options", {})
+            
+            if not image_data:
+                return JSONResponse({"error": "No document image data provided"}, status_code=400)
+            
+            # Add document-specific options if not present
+            if "detailed_analysis" not in options:
+                options["detailed_analysis"] = True
+            if "extract_key_points" not in options:
+                options["extract_key_points"] = True
+            if "identify_document_type" not in options:
+                options["identify_document_type"] = True
+            
+            # Call the document classification function
+            result = classify_document_claude.remote(image_data, options)
+            
+            return JSONResponse(result)
+                
+        except Exception as e:
+            print(f"Error analyzing document: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @rt("/classify-batch", methods=["POST"])
+    async def api_classify_batch(request):
+        """API endpoint to classify multiple insect images in batch mode with RAG"""
+        try:
+            # Get form data with files
+            form = await request.form()
+            options_json = form.get("options", "{}")
+            options = json.loads(options_json)
+            
+            # Extract image files
+            image_files = []
+            for key in form.keys():
+                if key.startswith("image_"):
+                    image_files.append(form.get(key))
+                    
+            if not image_files:
+                return JSONResponse({"error": "No images provided"}, status_code=400)
+                
+            # Limit to 5 images
+            if len(image_files) > 5:
+                image_files = image_files[:5]
+                
+            # Process each image
+            base64_images = []
+            for file in image_files:
+                # Read file content
+                content = await file.read()
+                
+                # Convert to base64
+                base64_data = base64.b64encode(content).decode("utf-8")
+                base64_images.append(base64_data)
+                
+            if not base64_images:
+                return JSONResponse({"error": "Failed to process images"}, status_code=400)
+                
+            result = classify_batch_claude.remote(base64_images, options)
+            
+            # Return the result
+            return JSONResponse(result)
+                
+        except Exception as e:
+            print(f"Error in batch classification: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    # Additional API routes for feedback, charts, etc.
+    @rt("/api/feedback", methods=["POST"])
+    async def api_submit_feedback(request):
+        """API endpoint to submit feedback for a classification"""
+        try:
+            # Get form data
+            form_data = await request.form()
+            result_id = form_data.get("id")
+            feedback = form_data.get("feedback")
+            
+            if not result_id or not feedback:
+                return HTMLResponse("""
+                <div class="text-error">Error: Missing parameters</div>
+                """, status_code=400)
+            
+            # Validate feedback type
+            if feedback not in ["positive", "negative"]:
+                return HTMLResponse("""
+                <div class="text-error">Error: Invalid feedback type</div>
+                """, status_code=400)
+            
+            # Update the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Update the record
+            cursor.execute(
+                "UPDATE results SET feedback = ? WHERE id = ?",
+                (feedback, result_id)
+            )
+            
+            # Check if any row was affected
+            if cursor.rowcount == 0:
+                # Try batch results table
+                cursor.execute(
+                    "SELECT batch_id, results FROM batch_results WHERE batch_id = ? OR batch_id = SUBSTR(?, 1, INSTR(?, '_') - 1)",
+                    (result_id, result_id, result_id)
+                )
+                batch_result = cursor.fetchone()
+                
+                if batch_result:
+                    batch_id, results_json = batch_result
+                    
+                    # Parse the results JSON
+                    results_data = json.loads(results_json)
+                    
+                    # Find the specific result in the batch
+                    for result in results_data:
+                        if result.get("id") == result_id:
+                            # Update the feedback
+                            result["feedback"] = feedback
+                            break
+                    
+                    # Save the updated results back to the database
                     cursor.execute(
-                        "UPDATE image_analyses SET context_source = ? WHERE analysis_id = ?",
-                        (context_source, analysis_id)
+                        "UPDATE batch_results SET results = ? WHERE batch_id = ?",
+                        (json.dumps(results_data), batch_id)
                     )
             
             conn.commit()
             conn.close()
-            logging.info(f"Saved analysis {analysis_id} to database")
-            return True
-        except Exception as db_error:
-            logging.error(f"Database error: {db_error}")
-            import traceback
+            
+            # Return updated feedback pill/badge
+            feedback_class = "badge-success" if feedback == "positive" else "badge-error"
+            return HTMLResponse(f"""
+            <span class="badge {feedback_class}">{feedback}</span>
+            """)
+            
+        except Exception as e:
+            print(f"Error submitting feedback: {e}")
             traceback.print_exc()
-            return False
-
-    # Add this helper function to directly embed images in the UI
-    def try_read_image(image_path):
-        """Attempt to read an image and return it as an embedded element"""
+            return HTMLResponse(f"""
+            <div class="text-error">Error: {str(e)}</div>
+            """, status_code=500)
+            
+    @rt("/api/chart-data", methods=["GET"])
+    async def api_chart_data(request):
+        """API endpoint to get chart data for the donut chart"""
         try:
-            if os.path.exists(image_path):
-                with open(image_path, "rb") as f:
-                    img_data = f.read()
-                    base64_img = base64.b64encode(img_data).decode('utf-8')
+            # Get stats
+            stats = get_classification_stats()
+            
+            # Process the top categories
+            categories_to_display = stats["combined_category_counts"][:10]
+            
+            # Format the data for ApexCharts
+            labels = [category for category, _ in categories_to_display]
+            counts = [count for _, count in categories_to_display]
+            
+            # Return JSON data
+            return JSONResponse({
+                "labels": labels,
+                "counts": counts
+            })
+            
+        except Exception as e:
+            print(f"Error getting chart data: {e}")
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @rt("/api/recent-classifications", methods=["GET"])
+    async def api_recent_classifications(request):
+        """API endpoint to get recent classification data for the table"""
+        try:
+            # Get limit parameter with default of 10
+            limit = int(request.query_params.get("limit", 10))
+            
+            # Connect to the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Get recent classifications
+            cursor.execute("""
+                SELECT id, category, confidence, feedback, created_at, context_source 
+                FROM results 
+                ORDER BY created_at DESC 
+                LIMIT ?
+            """, (limit,))
+            
+            recent_classifications = cursor.fetchall()
+            conn.close()
+            
+            # Generate HTML for the table body
+            html = ""
+            for id, category, confidence, feedback, created_at, context_source in recent_classifications:
+                # Determine confidence class
+                confidence_class = 'badge-warning'
+                if confidence == 'High':
+                    confidence_class = 'badge-success'
+                elif confidence == 'Low':
+                    confidence_class = 'badge-error'
                 
-                # Determine image type from extension
-                ext = os.path.splitext(image_path)[1].lower()
-                if ext in ['.jpg', '.jpeg']:
-                    media_type = "image/jpeg"
-                elif ext == '.png':
-                    media_type = "image/png"
-                elif ext == '.gif':
-                    media_type = "image/gif"
+                # Build the table row
+                html += f"""
+                <tr class="hover">
+                    <td>
+                        <div class="avatar cursor-pointer" onclick="document.getElementById('modal-{id[:8]}').showModal()">
+                            <div class="mask mask-squircle w-12 h-12 bg-base-300 flex items-center justify-center">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-base-content/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                    d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                </svg>
+                            </div>
+                        </div>
+                        
+                        <dialog id="modal-{id[:8]}" class="modal">
+                            <div class="modal-box">
+                                <h3 class="font-bold text-lg mb-2">Classification: {category}</h3>
+                                <!-- Modal content -->
+                                <div class="modal-action">
+                                    <form method="dialog">
+                                        <button class="btn">Close</button>
+                                    </form>
+                                </div>
+                            </div>
+                            <form method="dialog" class="modal-backdrop">
+                                <button>close</button>
+                            </form>
+                        </dialog>
+                    </td>
+                    <td class="font-mono text-xs">{id[:8]}...</td>
+                    <td>{category}</td>
+                    <td>
+                        <span class="badge {confidence_class}">{confidence}</span>
+                    </td>
+                """
+                
+                # Feedback cell
+                if feedback:
+                    feedback_class = "badge-success" if feedback == "positive" else "badge-error"
+                    html += f"""
+                    <td>
+                        <span class="badge {feedback_class}">{feedback}</span>
+                    </td>
+                    """
                 else:
-                    media_type = "image/jpeg"  # Default to JPEG
+                    html += f"""
+                    <td>
+                        <div class="flex space-x-1">
+                            <button 
+                                class="btn btn-xs btn-circle btn-outline" 
+                                hx-post="/api/feedback"
+                                hx-vals='{{"id": "{id}", "feedback": "positive"}}'
+                                hx-swap="outerHTML"
+                                title="Positive Feedback">
+                                👍
+                            </button>
+                            <button 
+                                class="btn btn-xs btn-circle btn-outline" 
+                                hx-post="/api/feedback"
+                                hx-vals='{{"id": "{id}", "feedback": "negative"}}'
+                                hx-swap="outerHTML"
+                                title="Negative Feedback">
+                                👎
+                            </button>
+                        </div>
+                    </td>
+                    """
                 
-                # Display as embedded base64 image
-                return Img(
-                    src=f"data:{media_type};base64,{base64_img}",
-                    cls="mx-auto max-h-96 w-full object-contain rounded-lg border border-zinc-700"
-                )
-            else:
-                # Try to find any image with the same analysis ID prefix
-                analysis_id = os.path.basename(image_path).split('_')[0]
-                directory = os.path.dirname(image_path)
-                
-                if os.path.exists(directory):
-                    files = os.listdir(directory)
-                    matching_files = [f for f in files if f.startswith(analysis_id)]
-                    
-                    if matching_files:
-                        alt_path = os.path.join(directory, matching_files[0])
-                        if os.path.exists(alt_path):
-                            with open(alt_path, "rb") as f:
-                                img_data = f.read()
-                                base64_img = base64.b64encode(img_data).decode('utf-8')
-                            
-                            # Determine image type from extension
-                            alt_ext = os.path.splitext(matching_files[0])[1].lower()
-                            if alt_ext in ['.jpg', '.jpeg']:
-                                media_type = "image/jpeg"
-                            elif alt_ext == '.png':
-                                media_type = "image/png"
-                            elif alt_ext == '.gif':
-                                media_type = "image/gif"
-                            else:
-                                media_type = "image/jpeg"  # Default to JPEG
-                            
-                            return Img(
-                                src=f"data:{media_type};base64,{base64_img}",
-                                cls="mx-auto max-h-96 w-full object-contain rounded-lg border border-zinc-700"
-                            )
-                
-                # If all fails, show placeholder
-                return Div(
-                    P("Image not found", cls="text-red-500 text-center"),
-                    cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
-                )
+                # Context source and time
+                source_display = context_source if context_source else "None"
+                html += f"""
+                    <td class="max-w-xs truncate" title="{source_display}">{source_display}</td>
+                    <td>{created_at}</td>
+                    <td>
+                        <div class="dropdown dropdown-end">
+                            <label tabindex="0" class="btn btn-xs btn-ghost m-1">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h.01M12 12h.01M19 12h.01M6 12a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0z" />
+                                </svg>
+                            </label>
+                            <ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52">
+                                <li><a onclick="document.getElementById('modal-{id[:8]}').showModal()">View Details</a></li>
+                                <li><a hx-get="/export-result?id={id}" hx-trigger="click" hx-swap="none">Export Result</a></li>
+                            </ul>
+                        </div>
+                    </td>
+                </tr>
+                """
+            
+            # Return the HTML directly for HTMX to swap
+            return HTMLResponse(html)
+            
         except Exception as e:
-            logging.error(f"Error embedding image {image_path}: {e}")
-            import traceback
+            print(f"Error getting recent classifications: {e}")
             traceback.print_exc()
-            return Div(
-                P(f"Error displaying image: {str(e)}", cls="text-red-500 text-center"),
-                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
-            )
-
-    # Helper function to read PDF images directly
-    def try_read_pdf_image(image_key):
-        """Attempt to read a PDF image and return it as an embedded element"""
-        global page_images
-        
+            return HTMLResponse(f"""
+            <tr>
+                <td colspan="8" class="text-center text-error">
+                    Error loading data: {str(e)}
+                </td>
+            </tr>
+            """)
+    
+    @rt("/image-thumbnail", methods=["GET"])
+    async def serve_image_thumbnail(request):
+        """Serve a thumbnail image for classifications"""
         try:
-            if image_key in page_images:
-                image_path = page_images[image_key]
-                if os.path.exists(image_path):
-                    with open(image_path, "rb") as f:
-                        img_data = f.read()
-                        base64_img = base64.b64encode(img_data).decode('utf-8')
-                    
-                    # Display as embedded base64 image
-                    return Img(
-                        src=f"data:image/png;base64,{base64_img}",
-                        cls="w-full rounded-lg border border-zinc-700 max-h-80 object-contain mx-auto"
-                    )
+            # Get the image path from query parameters
+            image_path = request.query_params.get("path", "")
             
-            # If path not found, try alternative paths
-            parts = image_key.split('_')
-            if len(parts) >= 2:
-                filename = '_'.join(parts[:-1])
-                page_num = int(parts[-1]) if parts[-1].isdigit() else 0
-                potential_paths = [
-                    os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
-                    os.path.join(PDF_IMAGES_DIR, f"{filename}", f"page_{page_num}.png"),
-                    os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
-                ]
-                
-                for path in potential_paths:
-                    if os.path.exists(path):
-                        with open(path, "rb") as f:
-                            img_data = f.read()
-                            base64_img = base64.b64encode(img_data).decode('utf-8')
-                        
-                        # Display as embedded base64 image
-                        return Img(
-                            src=f"data:image/png;base64,{base64_img}",
-                            cls="w-full rounded-lg border border-zinc-700 max-h-80 object-contain mx-auto"
-                        )
+            if not image_path or not os.path.exists(image_path):
+                # Return a placeholder SVG if no image is found
+                placeholder_svg = """
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                    <polyline points="21 15 16 10 5 21"></polyline>
+                </svg>
+                """
+                return Response(
+                    content=placeholder_svg.encode("utf-8"),
+                    media_type="image/svg+xml"
+                )
             
-            # If all fails, show a placeholder
-            return Div(
-                P("Context document image not found", cls="text-red-500 text-center"),
-                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
+            # Get the file extension to determine content type
+            _, ext = os.path.splitext(image_path.lower())
+            
+            # Set content type based on extension
+            if ext in ['.jpg', '.jpeg']:
+                content_type = "image/jpeg"
+            elif ext == '.png':
+                content_type = "image/png"
+            elif ext == '.gif':
+                content_type = "image/gif"
+            elif ext == '.svg':
+                content_type = "image/svg+xml"
+            else:
+                content_type = "application/octet-stream"
+            
+            # Read the file
+            with open(image_path, "rb") as f:
+                content = f.read()
+            
+            # Return the image
+            return Response(
+                content=content,
+                media_type=content_type
             )
+            
         except Exception as e:
-            logging.error(f"Error embedding PDF image {image_key}: {e}")
-            import traceback
+            print(f"Error serving image: {e}")
             traceback.print_exc()
-            return Div(
-                P(f"Error displaying context document: {str(e)}", cls="text-red-500 text-center"),
-                cls="w-full h-64 bg-zinc-800 rounded-lg border border-zinc-700 flex items-center justify-center"
+            
+            # Return a placeholder SVG if there's an error
+            placeholder_svg = """
+            <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="12" y1="8" x2="12" y2="12"></line>
+                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            """
+            return Response(
+                content=placeholder_svg.encode("utf-8"),
+                media_type="image/svg+xml"
             )
-
-    def batch_upload_form():
-        """Render form for uploading multiple images for batch insect classification"""
+    
+    # Include homepage and dashboard routes
+    @rt("/dashboard")
+    def dashboard():
+        """Render the enhanced insect classification dashboard with Flowbite components and HTMX"""
+        stats = get_classification_stats()
         
-        return Form(
+        # Create navigation bar
+        navbar = Div(
             Div(
-                H2("Batch Insect Classification", cls="text-xl font-semibold text-white mb-4"),
-                
-                P("Upload multiple insect images (up to 10) for AI classification.", 
-                  cls="text-zinc-300 text-center mb-6"),
-                
-                # Image upload card
+                A(
+                    Span("🐝", cls="text-xl"),
+                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
+                    href="/",
+                    cls="flex items-center"
+                ),
                 Div(
-                    Div(
-                        Label("Upload Insect Images:", cls="text-white font-medium mb-2"),
-                        Input(
-                            type="file",
-                            name="image_files",
-                            accept=".jpg,.jpeg,.png",
-                            required=True,
-                            multiple=True,
-                            cls="file-input file-input-bordered file-input-warning w-full",
-                            onchange="handleMultipleFiles(this)"
-                        ),
-                        P(id="file-count", cls="text-sm text-zinc-400 mt-2"),
-                        # Hidden container for individual file inputs
-                        Div(id="file-inputs-container", cls="hidden"),
-                        cls="grid place-items-center p-4"
+                    A(
+                        "Dashboard",
+                        href="/dashboard",
+                        cls="btn btn-sm btn-ghost btn-active"
                     ),
-                    cls="card bg-zinc-800 border border-zinc-700 rounded-box w-full mb-4"
-                ),
-                
-                # Context sharing option
-                Div(
-                    Label(
-                        Input(type="checkbox", name="share_context", value="true", cls="checkbox checkbox-warning mr-2"),
-                        "Share context across all images (faster)",
-                        cls="flex items-center cursor-pointer text-white"
+                    A(
+                        "Classifier",
+                        href="/",
+                        cls="btn btn-sm btn-ghost"
                     ),
-                    P("Uses the same reference document for all insects instead of finding unique matches.",
-                      cls="text-zinc-400 text-sm mt-1 ml-6"),
-                    cls="mb-6"
+                    cls="flex-none"
                 ),
-                
-                # Process button
-                Button(
-                    Div(
-                        "Classify Insects",
-                        cls="flex items-center justify-center"
-                    ),
-                    id="batch-button",
-                    type="submit",
-                    cls="btn btn-warning w-full"
-                ),
-                
-                # JavaScript for handling multiple files
-                Script("""
-                function handleMultipleFiles(input) {
-                    const maxFiles = 10;
-                    if (input.files.length > maxFiles) {
-                        alert(`Please select a maximum of ${maxFiles} files.`);
-                        input.value = '';
-                        document.getElementById('file-count').textContent = '';
-                        return;
-                    }
-                    
-                    // Clear previous file inputs
-                    const container = document.getElementById('file-inputs-container');
-                    container.innerHTML = '';
-                    
-                    // Create hidden inputs for each file
-                    for (let i = 0; i < input.files.length; i++) {
-                        const fileInput = document.createElement('input');
-                        fileInput.type = 'file';
-                        fileInput.name = `image_${i}`;
-                        fileInput.style.display = 'none';
-                        container.appendChild(fileInput);
-                        
-                        // Use FileList API to set the file
-                        const dataTransfer = new DataTransfer();
-                        dataTransfer.items.add(input.files[i]);
-                        fileInput.files = dataTransfer.files;
-                    }
-                    
-                    // Update count display
-                    document.getElementById('file-count').textContent = 
-                        `${input.files.length} file${input.files.length !== 1 ? 's' : ''} selected`;
-                }
-                """),
-                
-                cls="bg-zinc-900 rounded-md p-6 w-full max-w-lg border border-zinc-700"
+                cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
             ),
-            action="/process-batch",
-            method="post",
-            enctype="multipart/form-data",
-            id="batch-upload-form",
-            hx_post="/process-batch",
-            hx_target="#main-content",
-            hx_indicator="#loading-indicator",
+            cls="w-full"
+        )
+        
+        # Stats summary cards section
+        summary_cards = Div(
+            Div(
+                Div(
+                    Div(
+                        H3("Total Classifications", cls="font-bold text-lg"),
+                        P(str(stats["total"]), cls="text-4xl font-semibold text-primary"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                Div(
+                    Div(
+                        H3("Single Images", cls="font-bold text-lg"),
+                        P(str(stats["total_single"]), cls="text-3xl font-semibold"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                Div(
+                    Div(
+                        H3("Batch Images", cls="font-bold text-lg"),
+                        P(str(stats["total_batch"]), cls="text-3xl font-semibold"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
+            ),
+            cls="mb-8"
+        )
+        
+        # Calculate data for the donut chart
+        total_insects = sum(count for _, count in stats["combined_category_counts"])
+        pie_data = []
+        start_value = 0.0
+        
+        # Process top 10 categories or all if less than 10
+        categories_to_display = stats["combined_category_counts"][:10]
+        
+        for category, count in categories_to_display:
+            percentage = count / total_insects if total_insects > 0 else 0
+            end_value = start_value + percentage
+            
+            pie_data.append({
+                "category": category,
+                "count": count,
+                "percentage": percentage * 100,  # Convert to percentage
+                "start": start_value,
+                "end": end_value
+            })
+            
+            start_value = end_value
+        
+        # Create Donut Chart HTML with ApexCharts
+        donut_chart = Div(
+            H3("Insect Category Distribution", cls="font-semibold mb-4 text-center text-bee-green text-lg"),
+            
+            # Chart Container
+            Div(
+                id="donut-chart-container",
+                cls="mx-auto"
+            ),
+            
+            # HTMX-powered chart reload button
+            Div(
+                Button(
+                    "Refresh Chart Data",
+                    cls="btn btn-sm btn-outline btn-primary mt-4",
+                    hx_get="/api/chart-data",
+                    hx_target="#donut-chart-container",
+                    hx_trigger="click",
+                    hx_indicator="#chart-loading"
+                ),
+                Span(
+                    Span(cls="loading loading-spinner loading-xs ml-2"),
+                    cls="htmx-indicator",
+                    id="chart-loading"
+                ),
+                cls="text-center mt-4"
+            ),
+            
+            # ApexCharts initialization script
+            Script(f"""
+            document.addEventListener('DOMContentLoaded', function() {{
+                // Extract data from server-side rendering
+                const categoryData = {json.dumps([{'category': cat, 'count': count} for cat, count in categories_to_display])};
+                
+                // Prepare data for ApexCharts
+                const labels = categoryData.map(item => item.category);
+                const counts = categoryData.map(item => item.count);
+                
+                // Custom bee-themed colors
+                const colors = [
+                    '#8B5A00', // Brown
+                    '#FFC107', // Yellow
+                    '#A5D6A7', // Light Green
+                    '#66BB6A', // Medium Green
+                    '#43A047', // Dark Green
+                    '#FFB74D', // Light Orange
+                    '#FFA000', // Dark Amber
+                    '#E65100', // Dark Orange
+                    '#795548', // Medium Brown
+                    '#4E342E'  // Dark Brown
+                ];
+                
+                // Initialize ApexCharts Donut Chart
+                const donutChart = new ApexCharts(document.querySelector("#donut-chart-container"), {{
+                    series: counts,
+                    chart: {{
+                        type: 'donut',
+                        height: 320,
+                        fontFamily: 'inherit',
+                        foreColor: 'inherit',
+                        animations: {{
+                            enabled: true,
+                            easing: 'easeinout',
+                            speed: 800
+                        }}
+                    }},
+                    labels: labels,
+                    colors: colors,
+                    legend: {{
+                        position: 'bottom',
+                        fontSize: '14px',
+                        formatter: function(seriesName, opts) {{
+                            // Show category name and percentage
+                            return `${{seriesName}}: ${{Math.round(opts.w.globals.series[opts.seriesIndex]/opts.w.globals.seriesTotals[0]*100)}}%`;
+                        }}
+                    }},
+                    tooltip: {{
+                        y: {{
+                            formatter: function(value) {{
+                                return value + " classifications";
+                            }}
+                        }}
+                    }},
+                    dataLabels: {{
+                        enabled: false
+                    }},
+                    responsive: [{{
+                        breakpoint: 480,
+                        options: {{
+                            chart: {{
+                                height: 260
+                            }},
+                            legend: {{
+                                position: 'bottom'
+                            }}
+                        }}
+                    }}],
+                    plotOptions: {{
+                        pie: {{
+                            donut: {{
+                                size: '50%',
+                                labels: {{
+                                    show: true,
+                                    name: {{
+                                        show: true
+                                    }},
+                                    value: {{
+                                        show: true,
+                                        formatter: function(val) {{
+                                            return val;
+                                        }}
+                                    }},
+                                    total: {{
+                                        show: true,
+                                        label: 'Total',
+                                        formatter: function(w) {{
+                                            return w.globals.seriesTotals.reduce((a, b) => a + b, 0);
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }});
+                
+                // Render the chart
+                donutChart.render();
+                
+                // Set up HTMX event listener to update chart when new data is received
+                document.body.addEventListener('htmx:afterSwap', function(evt) {{
+                    if (evt.detail.target.id === 'donut-chart-container') {{
+                        // Parse the new data (assuming JSON response)
+                        try {{
+                            const newData = JSON.parse(evt.detail.xhr.response);
+                            donutChart.updateSeries(newData.counts);
+                            donutChart.updateOptions({{
+                                labels: newData.labels
+                            }});
+                        }} catch(e) {{
+                            console.error('Error updating chart:', e);
+                        }}
+                    }}
+                }});
+            }});
+            """),
+            
+            cls="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+        )
+        
+        # Create Line Chart for Activity
+        trend_data = get_trend_indicator(stats)
+        line_chart = Div(
+            Div(
+                H3("Daily Classification Activity", cls="font-semibold text-bee-green text-lg"),
+                
+                # HTMX-powered time range selector
+                Div(
+                    Div(role="button", tabindex="0", cls="btn btn-sm btn-outline"),
+                    Span("Last 7 days", id="current-range"),
+                    Svg(
+                        Path(
+                            stroke="currentColor",
+                            stroke_linecap="round",
+                            stroke_linejoin="round",
+                            stroke_width="2",
+                            d="m1 1 4 4 4-4"
+                        ),
+                        cls="w-2.5 h-2.5 ml-1.5",
+                        aria_hidden="true",
+                        xmlns="http://www.w3.org/2000/svg",
+                        fill="none",
+                        viewBox="0 0 10 6"
+                    ),
+                    cls="dropdown dropdown-end"
+                ),
+                
+                cls="flex justify-between mb-4"
+            ),
+            
+            # Chart Container with Loading Indicator
+            Div(
+                Div(id="line-chart-container", cls="w-full"),
+                Div(
+                    Span(cls="loading loading-spinner loading-md text-primary"),
+                    id="line-loading",
+                    cls="htmx-indicator absolute inset-0 flex items-center justify-center bg-base-100 bg-opacity-60"
+                ),
+                cls="relative"
+            ),
+            
+            # Summary Statistics
+            Div(
+                Div(
+                    P("Total", cls="text-sm text-base-content/70"),
+                    P(str(stats["total"]), cls="text-xl font-bold", id="total-classifications")
+                ),
+                Div(
+                    P("Average / Day", cls="text-sm text-base-content/70"),
+                    P(
+                        str(round(stats["total"] / len(stats["daily_counts"])) if stats["daily_counts"] else 0),
+                        cls="text-xl font-bold",
+                        id="avg-classifications"
+                    )
+                ),
+                Div(
+                    P("Trend", cls="text-sm text-base-content/70"),
+                    P(
+                        NotStr(trend_data["html"]),
+                        cls="text-xl font-bold",
+                        id="trend-indicator"
+                    )
+                ),
+                cls="grid grid-cols-3 gap-4 mt-4"
+            ),
+            
+            # Line Chart Initialization Script
+            Script(f"""
+            document.addEventListener('DOMContentLoaded', function() {{
+                // Extract data from server-side rendering
+                const dailyData = {json.dumps([{'date': date, 'count': count} for date, count in stats["daily_counts"]])};
+                
+                // Prepare data for ApexCharts
+                const dates = dailyData.map(item => item.date);
+                const counts = dailyData.map(item => item.count);
+                
+                // Initialize the line chart
+                const lineChart = new ApexCharts(document.querySelector("#line-chart-container"), {{
+                    series: [{{
+                        name: 'Classifications',
+                        data: counts
+                    }}],
+                    chart: {{
+                        height: 300,
+                        type: 'line',
+                        fontFamily: 'inherit',
+                        foreColor: 'inherit',
+                        toolbar: {{
+                            show: false
+                        }},
+                        animations: {{
+                            enabled: true,
+                            easing: 'easeinout',
+                            speed: 800
+                        }}
+                    }},
+                    stroke: {{
+                        width: 3,
+                        curve: 'smooth'
+                    }},
+                    colors: ['oklch(47% 0.266 120.957)'], // Primary green color
+                    markers: {{
+                        size: 5,
+                        strokeWidth: 0,
+                        hover: {{
+                            size: 7
+                        }}
+                    }},
+                    xaxis: {{
+                        categories: dates,
+                        labels: {{
+                            rotateAlways: false,
+                            style: {{
+                                fontSize: '12px'
+                            }}
+                        }}
+                    }},
+                    yaxis: {{
+                        title: {{
+                            text: 'Classifications'
+                        }},
+                        min: 0,
+                        forceNiceScale: true
+                    }},
+                    tooltip: {{
+                        shared: true,
+                        intersect: false,
+                        y: {{
+                            formatter: function(value) {{
+                                return value + " classifications";
+                            }}
+                        }}
+                    }},
+                    grid: {{
+                        show: true,
+                        borderColor: 'var(--color-base-300)',
+                        strokeDashArray: 5,
+                        position: 'back'
+                    }},
+                    fill: {{
+                        type: 'gradient',
+                        gradient: {{
+                            shade: 'light',
+                            type: "vertical",
+                            shadeIntensity: 0.3,
+                            inverseColors: false,
+                            opacityFrom: 0.7,
+                            opacityTo: 0.2,
+                            stops: [0, 100]
+                        }}
+                    }}
+                }});
+                
+                // Render the line chart
+                lineChart.render();
+            }});
+            """),
+            
+            cls="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+        )
+        
+        # Charts Section
+        charts_section = Div(
+            H2("Classification Overview", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                Div(
+                    donut_chart,
+                    cls="w-full lg:w-1/2"
+                ),
+                Div(
+                    line_chart,
+                    cls="w-full lg:w-1/2"
+                ),
+                cls="flex flex-col lg:flex-row gap-6 w-full"
+            ),
+            cls="mb-8"
         )
 
-    # Updated carousel UI with the new design for insect classification
-    def carousel_ui(batch_results):
-        """Create a carousel UI to display multiple image analysis results with the new design"""
-        
-        # Create carousel items
-        carousel_items = []
-        carousel_indicators = []
-        
-        for i, result in enumerate(batch_results):
-            # Extract data
-            analysis_id = result.get("analysis_id", f"result_{i}")
-            image_path = result.get("image_path", "")
-            response = result.get("response", "No response generated")
-            context_paragraphs = result.get("context_paragraphs", [])
-            top_sources = result.get("top_sources", [])
-            token_maps = result.get("token_maps", {})
-            has_error = result.get("error", False)
-            
-            # Extract the one-word classification
-            classification = "error" if has_error else extract_classification(response)
-            badge_color = get_badge_color(classification)
-            
-            # Create a unique modal ID for this result
-            modal_id = f"modal_{analysis_id}"
-            
-            # Create carousel item for the image WITH its classification elements
-            carousel_items.append(
+        # Map Section - Add this after the charts_section and before confidence_feedback_section
+        map_section = Div(
+            H2("Conservation Project Map", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
                 Div(
-                    # Image display
-                    try_read_image(image_path),
-                    
-                    # Classification elements directly under each image
-                    Div(
-                        # Badge and controls section
-                        Div(
-                            # Classification badge
-                            Div(
-                                classification,
-                                cls=f"badge {badge_color} text-lg p-3 mr-4"
-                            ),
-                            
-                            # Swap component
-                            Label(
-                                # Hidden checkbox controls the state
-                                Input(type="checkbox"),
-                                # Swap-on shows when checked (thumbs down)
-                                Div("👎", cls="swap-on"),
-                                # Swap-off shows when unchecked (thumbs up)
-                                Div("👍", cls="swap-off"),
-                                cls="swap swap-flip text-3xl mx-2"
-                            ),
-                            
-                            # View raw output modal button
-                            Button(
-                                "view raw output",
-                                onclick=f"{modal_id}.showModal()",
-                                cls="btn btn-sm btn-outline ml-2"
-                            ),
-                            
-                            # Add dialog modal
-                            Dialog(
-                                Div(
-                                    H3("LLM Response", cls="text-lg font-bold"),
-                                    P(response, cls="py-4 whitespace-pre-wrap text-sm font-mono bg-black p-2 rounded overflow-auto max-h-96"),
-                                    Div(
-                                        Form(
-                                            Button("Close", cls="btn"),
-                                            method="dialog"
-                                        ),
-                                        cls="modal-action"
-                                    ),
-                                    cls="modal-box"
-                                ),
-                                id=modal_id,
-                                cls="modal"
-                            ),
-                            
-                            cls="flex items-center mt-4 mb-2 justify-center"
+                    P("View our conservation area at Bionua Project, Dunsany Nature Reserve:", 
+                    cls="text-base mb-2"),
+                    # Map iframe with responsive styling
+                    NotStr('<iframe src="https://restor.eco/embed/sites/ce616eed-268b-43a7-87cc-181c801709fa/" title="Bionua Project at Dunsany Nature Reserve" width="100%" height="500" style="border: none; border-radius: 0.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);" frameborder="0"></iframe>'),
+                    cls="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                cls="w-full mb-8"
+            ),
+            cls="mb-8"
+        )
+        
+        # Confidence & Feedback Section
+        confidence_feedback_section = Div(
+            Div(
+                Div(
+                    H3("Confidence Levels", cls="font-semibold mb-3"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Confidence"),
+                                Th("Count"),
+                            )
                         ),
-                        
-                        # Collapsible context section - only if context exists
-                        (Div(
-                            # Collapse title
-                            Div(
-                                "View Context",
-                                cls="collapse-title font-semibold"
-                            ),
-                            
-                            # Collapse content
-                            Div(
-                                # Context document
-                                (Div(
-                                    H4("Context Document", cls="text-lg font-semibold text-white mb-2"),
-                                    try_read_pdf_image(top_sources[0].get('image_key', '')),
-                                    cls="mb-4"
-                                ) if top_sources else ""),
-                                
-                                # Context paragraphs if available
-                                (Div(
-                                    H4("Retrieved Context", cls="text-lg font-semibold text-white mb-2"),
-                                    P(context_paragraphs[0] if context_paragraphs else "No context available", 
-                                    cls="text-white text-sm bg-zinc-700 p-3 rounded-md"),
-                                    cls="mb-4"
-                                ) if context_paragraphs else ""),
-                                
-                                # Token map
-                                (Div(
-                                    H4("Token Similarity Map", cls="text-lg font-semibold text-white mb-2"),
-                                    (Img(
-                                        src=f"/heatmap-image/{token_maps.get(top_sources[0].get('image_key', ''), [])[0]['path']}" 
-                                            if top_sources and token_maps.get(top_sources[0].get('image_key', ''), []) else "",
-                                        cls="w-full max-h-80 object-contain rounded-md"
-                                    ) if top_sources and token_maps.get(top_sources[0].get('image_key', ''), []) else 
-                                    Div("No token maps available", cls="text-zinc-400 text-center p-4")),
-                                    cls="mb-4"
-                                ) if top_sources and token_maps else ""),
-                                
-                                cls="collapse-content text-sm"
-                            ),
-                            
-                            tabindex="0",
-                            cls="bg-zinc-800 text-white focus:bg-zinc-700 collapse rounded-md",
-                        ) if top_sources else ""),
-                        
-                        cls="w-full px-4 pb-4"
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(
+                                        Span(
+                                            confidence,
+                                            cls=f"badge {'badge-success' if confidence == 'High' else 'badge-warning' if confidence == 'Medium' else 'badge-error'}"
+                                        )
+                                    ),
+                                    Td(str(count)),
+                                )
+                                for confidence, count in stats["confidence_counts"]
+                            ]
+                        ),
+                        cls="table w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                Div(
+                    H3("User Feedback", cls="font-semibold mb-3"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Feedback"),
+                                Th("Count"),
+                            )
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(
+                                        Span(
+                                            feedback,
+                                            cls=f"badge {'badge-success' if feedback == 'positive' else 'badge-error'}"
+                                        )
+                                    ),
+                                    Td(str(count)),
+                                )
+                                for feedback, count in stats["feedback_counts"]
+                            ] if stats["feedback_counts"] else [
+                                Tr(
+                                    Td("No feedback yet"),
+                                    Td("0")
+                                )
+                            ]
+                        ),
+                        cls="table w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                cls="grid grid-cols-1 md:grid-cols-2 gap-6"
+            ),
+            cls="mb-8"
+        )
+        
+        # DaisyUI Table for Recent Classifications
+        daisyui_table = Div(
+            Div(
+                H3("Recent Classifications", cls="font-semibold mb-3"),
+                
+                # HTMX-powered refresh button
+                Button(
+                    Svg(
+                        Path(
+                            stroke_linecap="round",
+                            stroke_linejoin="round",
+                            stroke_width="2",
+                            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                        ),
+                        cls="h-4 w-4 mr-1",
+                        xmlns="http://www.w3.org/2000/svg",
+                        fill="none",
+                        viewBox="0 0 24 24",
+                        stroke="currentColor"
+                    ),
+                    "Refresh",
+                    cls="btn btn-sm btn-outline btn-primary",
+                    hx_get="/api/recent-classifications",
+                    hx_target="#classifications-table-container",
+                    hx_trigger="click",
+                    hx_indicator="#table-loading"
+                ),
+                Span(
+                    Span(cls="loading loading-spinner loading-xs ml-2"),
+                    cls="htmx-indicator",
+                    id="table-loading"
+                ),
+                
+                cls="flex justify-between items-center mb-4"
+            ),
+            
+            # Table Container
+            Div(
+                Table(
+                    # Table Head
+                    Thead(
+                        Tr(
+                            Th("Image"),
+                            Th("ID"),
+                            Th("Category"),
+                            Th("Confidence"),
+                            Th("Feedback"),
+                            Th("Source"),
+                            Th("Time"),
+                            Th("Actions")
+                        )
                     ),
                     
-                    id=f"item{i+1}",
-                    cls="carousel-item w-full flex flex-col"
-                )
-            )
-            
-            # Create indicator buttons
-            carousel_indicators.append(
-                A(
-                    str(i+1),
-                    href=f"#item{i+1}",
-                    cls=f"btn btn-xs {'' if i > 0 else 'btn-active'}"
-                )
-            )
-        
-        # Create the complete carousel component
-        return Div(
-            H2("Insect Classification Results", cls="text-2xl font-bold text-white mb-4 text-center"),
-            
-            # Main carousel container with images and their classification elements
-            Div(
-                *carousel_items,
-                cls="carousel w-full rounded-lg overflow-hidden mb-4"
-            ),
-            
-            # Carousel indicators
-            Div(
-                *carousel_indicators,
-                cls="flex justify-center w-full gap-2 py-2"
-            ),
-            
-            # Process another batch button
-            Div(
-                Button(
-                    "Classify More Insects",
-                    hx_get="/batch-upload",
-                    hx_target="#main-content",
-                    cls="btn btn-warning w-full max-w-xs"
+                    # Table Body
+                    Tbody(
+                        *[
+                            Tr(
+                                # Image Cell
+                                Td(
+                                    NotStr(create_image_thumbnail(get_classification_image_path(id)))
+                                ),
+                                
+                                # ID Cell
+                                Td(f"{id[:8]}..."),
+                                
+                                # Category Cell
+                                Td(category),
+                                
+                                # Confidence Cell
+                                Td(NotStr(generate_confidence_badge(confidence))),
+                                
+                                # Feedback Cell
+                                Td(
+                                    NotStr(generate_feedback_badge(feedback) if feedback else generate_feedback_buttons(id))
+                                ),
+                                
+                                # Source Cell
+                                Td(
+                                    context_source if context_source else "None",
+                                    cls="max-w-xs truncate",
+                                    title=context_source if context_source else "No source"
+                                ),
+                                
+                                # Time Cell
+                                Td(created_at),
+                                
+                                # Actions Cell
+                                Td(
+                                    Div(
+                                        Div(role="button", tabindex="0", cls="btn btn-xs btn-ghost m-1"),
+                                        Svg(
+                                            Path(
+                                                stroke_linecap="round",
+                                                stroke_linejoin="round",
+                                                stroke_width="2",
+                                                d="M5 12h.01M12 12h.01M19 12h.01M6 12a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0z"
+                                            ),
+                                            cls="h-4 w-4",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="none",
+                                            viewBox="0 0 24 24",
+                                            stroke="currentColor"
+                                        ),
+                                        cls="dropdown dropdown-end"
+                                    )
+                                )
+                            )
+                            for id, category, confidence, feedback, created_at, context_source in stats["recent_classifications"]
+                        ]
+                    ),
+                    cls="table table-zebra w-full"
                 ),
-                cls="mt-8 text-center w-full"
+                id="classifications-table-container",
+                cls="overflow-x-auto"
+            ),
+            cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+        )
+        
+        # Flowbite Table for All Classifications
+        flowbite_table = Div(
+            Div(
+                H3("All Classifications", cls="font-semibold mb-3"),
+                
+                # Search and Filter Controls
+                Div(
+                    # Search input with HTMX
+                    Div(
+                        Div(
+                            Svg(
+                                Path(
+                                    stroke="currentColor",
+                                    stroke_linecap="round",
+                                    stroke_linejoin="round",
+                                    stroke_width="2",
+                                    d="m19 19-4-4m0-7A7 7 0 1 1 1 8a7 7 0 0 1 14 0Z"
+                                ),
+                                cls="w-4 h-4 text-gray-500 dark:text-gray-400",
+                                aria_hidden="true",
+                                xmlns="http://www.w3.org/2000/svg",
+                                fill="none",
+                                viewBox="0 0 20 20"
+                            ),
+                            cls="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none"
+                        ),
+                        Input(
+                            type="text",
+                            id="classification-search",
+                            cls="block w-full p-2 pl-10 text-sm border border-base-300 rounded-lg bg-base-100",
+                            placeholder="Search classifications...",
+                            hx_post="/api/search-classifications",
+                            hx_trigger="keyup changed delay:500ms",
+                            hx_target="#flowbite-table-body",
+                            hx_indicator="#search-indicator"
+                        ),
+                        Div(
+                            Span(cls="loading loading-spinner loading-xs"),
+                            id="search-indicator",
+                            cls="htmx-indicator absolute inset-y-0 right-0 flex items-center pr-3"
+                        ),
+                        cls="relative w-full sm:w-64"
+                    ),
+                    
+                    # Category filter dropdown
+                    Select(
+                        Option("All Categories", value=""),
+                        *[
+                            Option(category, value=category)
+                            for category, _ in stats["category_counts"]
+                        ],
+                        cls="block w-full sm:w-auto p-2 text-sm border border-base-300 rounded-lg bg-base-100",
+                        hx_post="/api/filter-classifications",
+                        hx_trigger="change",
+                        hx_target="#flowbite-table-body",
+                        hx_indicator="#filter-indicator"
+                    ),
+                    Span(
+                        cls="htmx-indicator loading loading-spinner loading-xs ml-2",
+                        id="filter-indicator"
+                    ),
+                    
+                    cls="flex flex-col sm:flex-row gap-3 w-full md:w-auto"
+                ),
+                
+                cls="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4"
             ),
             
-            # Simplified JavaScript - we no longer need to toggle sections visibility
-            Script("""
-            document.addEventListener('DOMContentLoaded', function() {
-                // Update active indicator on hash change
-                const updateActiveIndicator = function() {
-                    const id = window.location.hash.substring(1);
-                    if (!id) return;
+            # Flowbite Table Container
+            Div(
+                Table(
+                    # Table Head
+                    Thead(
+                        Tr(
+                            Th(
+                                Span("Image", cls="flex items-center"),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Category",
+                                    A(
+                                        Svg(
+                                            Path(
+                                                d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"
+                                            ),
+                                            cls="w-3 h-3",
+                                            aria_hidden="true",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="currentColor",
+                                            viewBox="0 0 24 24"
+                                        ),
+                                        href="#",
+                                        cls="ml-1.5",
+                                        hx_get="/api/sort-classifications?field=category&dir=asc",
+                                        hx_target="#flowbite-table-body"
+                                    ),
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Confidence",
+                                    A(
+                                        Svg(
+                                            Path(
+                                                d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"
+                                            ),
+                                            cls="w-3 h-3",
+                                            aria_hidden="true",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="currentColor",
+                                            viewBox="0 0 24 24"
+                                        ),
+                                        href="#",
+                                        cls="ml-1.5",
+                                        hx_get="/api/sort-classifications?field=confidence&dir=asc",
+                                        hx_target="#flowbite-table-body"
+                                    ),
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Feedback",
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Date",
+                                    A(
+                                        Svg(
+                                            Path(
+                                                d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"
+                                            ),
+                                            cls="w-3 h-3",
+                                            aria_hidden="true",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="currentColor",
+                                            viewBox="0 0 24 24"
+                                        ),
+                                        href="#",
+                                        cls="ml-1.5",
+                                        hx_get="/api/sort-classifications?field=date&dir=desc",
+                                        hx_target="#flowbite-table-body"
+                                    ),
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Span("Actions", cls="sr-only"),
+                                scope="col",
+                                cls="px-6 py-3"
+                            )
+                        )
+                    ),
                     
-                    // Update active indicator
-                    document.querySelectorAll('[href^="#item"]').forEach(indicator => {
-                        if (indicator.getAttribute('href') === '#' + id) {
-                            indicator.classList.add('btn-active');
-                        } else {
-                            indicator.classList.remove('btn-active');
-                        }
-                    });
-                };
+                    # Table Body with HTMX support
+                    Tbody(
+                        NotStr(generate_flowbite_table_rows(stats["recent_classifications"])),
+                        id="flowbite-table-body"
+                    ),
+                    
+                    cls="w-full text-sm text-left text-gray-500 dark:text-gray-400 flowbite-table"
+                ),
+                # Pagination with HTMX
+                Nav(
+                    Span(
+                        "Showing ",
+                        Span("1-10", cls="font-semibold text-gray-900 dark:text-white"),
+                        " of ",
+                        Span(str(stats["total_single"]), cls="font-semibold text-gray-900 dark:text-white"),
+                        cls="text-sm font-normal text-gray-500 dark:text-gray-400"
+                    ),
+                    Ul(
+                        Li(
+                            A(
+                                "Previous",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 ml-0 leading-tight text-gray-500 bg-white border border-gray-300 rounded-l-lg hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=prev",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "1",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=1",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "2",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=2",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "3",
+                                aria_current="page",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 text-blue-600 border border-gray-300 bg-blue-50 hover:bg-blue-100 hover:text-blue-700 dark:border-gray-700 dark:bg-gray-700 dark:text-white",
+                                hx_get="/api/classifications-page?page=3",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "Next",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 rounded-r-lg hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=next",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        cls="inline-flex -space-x-px text-sm h-8"
+                    ),
+                    cls="flex items-center justify-between p-4",
+                    aria_label="Table navigation"
+                ),
                 
-                // Listen for hash changes
-                window.addEventListener('hashchange', updateActiveIndicator);
+                cls="relative overflow-x-auto shadow-md sm:rounded-lg"
+            ),
+            
+            # Image Modal for Detail View
+            Div(
+                Div(
+                    Div(
+                        H3("Classification Details", cls="text-lg leading-6 font-medium text-gray-900", id="modal-title"),
+                        Div(
+                            Div(
+                                # Placeholder image
+                                Svg(
+                                    Path(
+                                        stroke_linecap="round",
+                                        stroke_linejoin="round",
+                                        stroke_width="2",
+                                        d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+                                    ),
+                                    id="modal-image-placeholder",
+                                    cls="h-48 w-48 text-gray-400",
+                                    fill="none",
+                                    viewBox="0 0 24 24",
+                                    stroke="currentColor"
+                                ),
+                                Img(
+                                    id="modal-image",
+                                    cls="max-h-64 hidden",
+                                    src="",
+                                    alt="Classification Image"
+                                ),
+                                cls="bg-gray-100 p-4 rounded-lg flex items-center justify-center"
+                            ),
+                            Div(
+                                P(
+                                    Span("ID:", cls="font-semibold"),
+                                    Span(id="modal-id")
+                                ),
+                                P(
+                                    Span("Category:", cls="font-semibold"),
+                                    Span(id="modal-category")
+                                ),
+                                P(
+                                    Span("Confidence:", cls="font-semibold"),
+                                    Span(id="modal-confidence")
+                                ),
+                                P(
+                                    Span("Reference Source:", cls="font-semibold"),
+                                    Span(id="modal-source"),
+                                    id="modal-source-container",
+                                    cls="hidden"
+                                ),
+                                P(
+                                    Span("Description:", cls="font-semibold"),
+                                    Span(id="modal-description"),
+                                    id="modal-description-container",
+                                    cls="hidden"
+                                ),
+                                cls="mt-4 text-left"
+                            ),
+                            cls="mt-2 px-7 py-3"
+                        ),
+                        Div(
+                            Button(
+                                "Close",
+                                id="modal-close",
+                                cls="px-4 py-2 bg-gray-500 text-white text-base font-medium rounded-md w-full shadow-sm hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-300"
+                            ),
+                            cls="items-center px-4 py-3"
+                        ),
+                        cls="mt-3 text-center"
+                    ),
+                    cls="relative top-20 mx-auto p-5 border w-11/12 md:w-3/4 lg:w-1/2 shadow-lg rounded-md bg-white"
+                ),
+                id="image-modal",
+                cls="fixed hidden inset-0 bg-black bg-opacity-50 overflow-y-auto h-full w-full z-50"
+            ),
+            
+            # Modal handling script
+            Script("""
+            // Modal handling functions
+            function showImageModal(id, category, confidence) {
+                // Set modal content
+                document.getElementById('modal-id').textContent = id;
+                document.getElementById('modal-category').textContent = category;
                 
-                // Initial update - if no hash, set to first item
-                if (!window.location.hash) {
-                    window.location.hash = 'item1';
-                } else {
-                    updateActiveIndicator();
+                // Set confidence with appropriate color
+                const confidenceEl = document.getElementById('modal-confidence');
+                confidenceEl.textContent = confidence;
+                confidenceEl.className = confidence === 'High' ? 'text-green-600' : 
+                                        confidence === 'Medium' ? 'text-yellow-600' : 'text-red-600';
+                
+                // Show modal
+                document.getElementById('image-modal').classList.remove('hidden');
+                
+                // Optional: Fetch additional details with HTMX
+                htmx.ajax('GET', '/api/classification-details/' + id, {target: '#modal-description-container'});
+            }
+            
+            // Close modal when close button is clicked
+            document.getElementById('modal-close').addEventListener('click', function() {
+                document.getElementById('image-modal').classList.add('hidden');
+            });
+            
+            // Close modal when backdrop is clicked
+            document.getElementById('image-modal').addEventListener('click', function(e) {
+                if (e.target === this) {
+                    this.classList.add('hidden');
                 }
             });
             """),
             
-            id="batch-results",
-            cls="w-full flex flex-col items-center bg-zinc-900 rounded-md p-6 fade-in"
+            cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border mb-8"
         )
-
-    # Process batch of images
-    @rt("/process-batch", methods=["POST"])
-    async def process_batch(request: Request):
-        """Process a batch of uploaded images for insect classification"""
-        form = await request.form()
         
-        # Extract all uploaded images
-        image_files = []
-        for key in form.keys():
-            if key.startswith('image_'):
-                image_files.append(form.get(key))
-        
-        # If no image_X fields, try the multiple file field
-        if not image_files and form.get("image_files"):
-            image_files = form.getlist("image_files")
-        
-        # Limit to 10 images
-        image_files = image_files[:10]
-        
-        if not image_files:
-            return Div("No insect images uploaded", cls="text-red-500 text-center p-4")
-        
-        logging.info(f"Processing batch of {len(image_files)} insect images")
-        
-        # Set the query for insect classification
-        query = "Classify this insect"
-        share_context = form.get("share_context", "false") == "true"
-        logging.info(f"Using query: {query}, Share context: {share_context}")
-        
-        # For shared context, retrieve documents once
-        shared_context = None
-        shared_top_sources = None
-        
-        if share_context:
-            logging.info(f"Retrieving shared context for query: {query}")
-            shared_context, shared_top_sources = await retrieve_relevant_documents(query)
-            logging.info(f"Retrieved {len(shared_context) if shared_context else 0} shared context paragraphs")
-        
-        # Create directory for temporary uploads if it doesn't exist
-        os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
-        
-        # Process each image
-        batch_results = []
-        token_maps_by_image = {}
-        
-        for i, image_file in enumerate(image_files):
-            if not image_file:
-                continue
-                
-            try:
-                # Generate a unique ID for this analysis
-                analysis_id = str(uuid.uuid4())
-                
-                # Get filename or create default
-                filename = getattr(image_file, 'filename', f"image_{i}.jpg")
-                # Sanitize filename
-                safe_filename = "".join(c for c in filename if c.isalnum() or c in "._-")
-                image_path = os.path.join(TEMP_UPLOAD_DIR, f"{analysis_id}_{safe_filename}")
-                
-                logging.info(f"Processing insect image {i+1}/{len(image_files)}: {filename} → {image_path}")
-                
-                # Save the uploaded image
-                content = await image_file.read()
-                with open(image_path, "wb") as f:
-                    f.write(content)
-                
-                # Verify the file was saved
-                if not os.path.exists(image_path):
-                    raise FileNotFoundError(f"Failed to save image to {image_path}")
-                    
-                # Open the image for processing
-                image = Image.open(image_path)
-                
-                # Get context - either shared or unique per image
-                if not share_context:
-                    logging.info(f"Retrieving unique context for insect image {i+1}")
-                    retrieved_paragraphs, top_sources = await retrieve_relevant_documents(query)
-                else:
-                    logging.info(f"Using shared context for insect image {i+1}")
-                    retrieved_paragraphs, top_sources = shared_context, shared_top_sources
-                
-                # Generate context text
-                context_text = "\n\n".join(retrieved_paragraphs) if retrieved_paragraphs else ""
-                
-                # Generate token maps for top document
-                image_token_maps = {}
-                if top_sources:
-                    top_source = top_sources[0]
-                    image_key = top_source.get('image_key')
-                    
-                    # Only generate token maps if we haven't already for this context
-                    if image_key and image_key not in token_maps_by_image:
-                        logging.info(f"Generating token maps for context document: {image_key}")
-                        image_heatmaps = await generate_similarity_maps(query, image_key)
-                        if image_heatmaps:
-                            token_maps_by_image[image_key] = image_heatmaps
-                            image_token_maps[image_key] = image_heatmaps
-                    elif image_key:
-                        # Reuse existing token maps
-                        image_token_maps[image_key] = token_maps_by_image[image_key]
-                
-                # Process with Mistral using multimodal capabilities
-                logging.info(f"Processing insect image {i+1} with Mistral")
-                response_text = await process_with_mistral(image, query, context_text, analysis_id)
-                
-                # Save to database
-                try:
-                    conn = sqlite3.connect(db_path)
-                    cursor = conn.cursor()
-                    
-                    # Insert basic info
-                    cursor.execute(
-                        "INSERT INTO image_analyses (analysis_id, image_path, analysis_type, query, response) VALUES (?, ?, ?, ?, ?)",
-                        (analysis_id, image_path, "insect_classification", query, response_text)
-                    )
-                    
-                    # Add context source if available
-                    if top_sources:
-                        top_source = top_sources[0]
-                        context_source = f"{top_source['filename']} (page {top_source['page']})"
+        # Tables Section with Tab Navigation
+        tables_section = Div(
+            H2("Classification Results", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                # Tab navigation
+                Div(
+                    Div(
+                        Div(role="tablist", cls="tabs tabs-boxed bg-base-200 p-1 mb-6"),
                         
-                        # Check if the column exists
-                        cursor.execute("PRAGMA table_info(image_analyses)")
-                        columns = [column[1] for column in cursor.fetchall()]
-                        if 'context_source' in columns:
-                            cursor.execute(
-                                "UPDATE image_analyses SET context_source = ? WHERE analysis_id = ?",
-                                (context_source, analysis_id)
-                            )
-                    
-                    conn.commit()
-                    conn.close()
-                    logging.info(f"Saved analysis {analysis_id} to database")
-                except Exception as db_error:
-                    logging.error(f"Database error for insect image {i+1}: {db_error}")
-                
-                # Add to batch results
-                batch_results.append({
-                    "analysis_id": analysis_id,
-                    "image_path": image_path,
-                    "response": response_text,
-                    "context_paragraphs": retrieved_paragraphs,
-                    "top_sources": top_sources,
-                    "token_maps": image_token_maps
-                })
-                
-            except Exception as e:
-                logging.error(f"Error processing insect image {i+1}: {e}")
-                import traceback
-                traceback.print_exc()
-                
-                # Add error result
-                batch_results.append({
-                    "error": True,
-                    "message": f"Error: {str(e)}",
-                    "analysis_id": f"error_{i}",
-                    "image_path": ""
-                })
-        
-        # Ensure volume is committed
-        try:
-            bee_volume.commit()
-        except Exception as e:
-            logging.error(f"Error committing volume: {e}")
-        
-        # Return carousel UI with all results
-        return carousel_ui(batch_results)
-
-    # Routes for token maps, image handling, and more...
-    @rt("/token-map/{image_key}/{token_idx}")
-    async def get_token_map(image_key: str, token_idx: int):
-        """Return the token map image HTML for display in the UI"""
-        # Get the file path
-        heatmap_filename = f"{image_key}_token_{token_idx}.png"
-        heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
-        logging.info(f"Looking for token map: {heatmap_path}")
-        
-        if os.path.exists(heatmap_path):
-            logging.info(f"Found token map at: {heatmap_path}")
-            # Encode the image directly to base64 for inline display
-            try:
-                with open(heatmap_path, "rb") as f:
-                    img_data = f.read()
-                    base64_img = base64.b64encode(img_data).decode('utf-8')
-                    
-                # Use an inline data URL instead of a separate request
-                return Div(
-                    Img(
-                        src=f"data:image/png;base64,{base64_img}",
-                        cls="mx-auto max-h-96 w-full object-contain token-map"
+                        Button(
+                            "Recent Classifications", 
+                            cls="tab tab-active",
+                            id="tab-recent",
+                            onclick="showTab('recent')",
+                            role="tab",
+                            aria_selected="true"
+                        ),
+                        
+                        Button(
+                            "All Classifications", 
+                            cls="tab",
+                            id="tab-all",
+                            onclick="showTab('all')",
+                            role="tab",
+                            aria_selected="false"
+                        ),
+                        
+                        cls="flex justify-center"
                     ),
-                    cls="p-2 flex items-center justify-center min-h-[300px]"
-                )
-            except Exception as e:
-                logging.error(f"Error reading token map file: {e}")
-                import traceback
-                traceback.print_exc()
-                return Div(f"Error reading token map: {str(e)}", cls="text-red-500 p-4")
-        else:
-            logging.error(f"Token map not found at: {heatmap_path}")
-            return Div(f"Token map not found for {image_key} token {token_idx}", cls="text-red-500 p-4")
-    
-    # Modified generate_similarity_maps function to create token similarity maps
-    async def generate_similarity_maps(query, image_key):
-        """Generate token similarity maps for a retrieved document based on similarity scores"""
-        global colpali_model, colpali_processor, page_images
-        
-        if not image_key or image_key not in page_images:
-            logging.error(f"Invalid image key: {image_key}")
-            return []
-            
-        try:
-            # Get image path and load image
-            image_path = page_images[image_key]
-            if not os.path.exists(image_path):
-                logging.error(f"Image file not found: {image_path}")
-                
-                # Try to find the image by reconstructing path patterns
-                parts = image_key.split('_')
-                if len(parts) >= 2:
-                    filename = '_'.join(parts[:-1])
-                    page_num = parts[-1]
                     
-                    # Check different potential locations
-                    potential_paths = [
-                        os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
-                        os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
-                        os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
-                    ]
-                    
-                    for potential_path in potential_paths:
-                        if os.path.exists(potential_path):
-                            logging.info(f"Found image at: {potential_path}")
-                            image_path = potential_path
-                            break
-                
-                if not os.path.exists(image_path):
-                    return []
-                    
-            # Load the image
-            image = Image.open(image_path)
-            
-            # Process query and image with ColPali
-            processed_query = colpali_processor.process_queries([query]).to(colpali_model.device)
-            batch_images = colpali_processor.process_images([image]).to(colpali_model.device)
-            
-            # Forward passes to get embeddings
-            with torch.no_grad():
-                query_embeddings = colpali_model(**processed_query)
-                image_embeddings = colpali_model(**batch_images)
-            
-            # Get the number of image patches
-            try:
-                # First try with the original params
-                n_patches = colpali_processor.get_n_patches(
-                    image_size=image.size,
-                    patch_size=colpali_model.patch_size,
-                    spatial_merge_size=getattr(colpali_model, 'spatial_merge_size', None)
-                )
-            except AttributeError:
-                # If 'factor' is missing, try the simpler version without mentioning factor
-                try:
-                    n_patches = colpali_processor.get_n_patches(
-                        image_size=image.size,
-                        patch_size=colpali_model.patch_size
-                    )
-                except Exception as e:
-                    logging.error(f"Failed to get n_patches: {e}")
-                    # Fallback to a reasonable default based on image size
-                    width, height = image.size
-                    patch_size = getattr(colpali_model, 'patch_size', 16)
-                    n_patches = (height // patch_size, width // patch_size)
-                    logging.info(f"Using fallback n_patches: {n_patches}")
-            
-            # Get image mask
-            image_mask = colpali_processor.get_image_mask(batch_images)
-            
-            # Generate similarity maps
-            batched_similarity_maps = get_similarity_maps_from_embeddings(
-                image_embeddings=image_embeddings,
-                query_embeddings=query_embeddings,
-                n_patches=n_patches,
-                image_mask=image_mask
-            )
-            
-            # Get the similarity map for this image
-            similarity_maps = batched_similarity_maps[0]  # (query_length, n_patches_x, n_patches_y)
-            
-            # Get tokens for the query
-            query_tokens = colpali_processor.tokenizer.tokenize(query)
-            
-            # Filter to meaningful tokens - approach from older version
-            token_sims = []
-            stopwords = set(["<bos>", "<eos>", "<pad>", "a", "an", "the", "in", "on", "at", "of", "for", "with", "by", "to", "from"])
-            
-            for token_idx, token in enumerate(query_tokens):
-                if token_idx >= similarity_maps.shape[0]:
-                    continue
-                    
-                # Skip stopwords and short tokens
-                if token in stopwords or len(token) <= 1:
-                    continue
-                    
-                token_clean = token.replace("Ġ", "").replace("▁", "")
-                if token_clean and len(token_clean) > 1:
-                    max_sim = similarity_maps[token_idx].max().item()
-                    token_sims.append((token_idx, token, max_sim))
-            
-            # Sort by similarity score and take top tokens
-            token_sims.sort(key=lambda x: x[2], reverse=True)
-            top_tokens = token_sims[:6]  # Get top 6 tokens
-            
-            # Create directory if it doesn't exist
-            os.makedirs(HEATMAP_DIR, exist_ok=True)
-            
-            # Generate and save heatmaps
-            image_heatmaps = []
-            for token_idx, token, score in top_tokens:
-                # Skip if score is very low
-                if score < 0.1:
-                    continue
-                    
-                # Generate heatmap
-                fig, ax = plot_similarity_map(
-                    image=image,
-                    similarity_map=similarity_maps[token_idx],
-                    figsize=(8, 8),
-                    show_colorbar=False,
-                )
-                
-                # Clean token for display
-                token_display = token.replace("Ġ", "").replace("▁", "")
-                ax.set_title(f"Token: '{token_display}', Score: {score:.2f}", fontsize=12)
-                
-                # Save heatmap
-                heatmap_filename = f"{image_key}_token_{token_idx}.png"
-                heatmap_path = os.path.join(HEATMAP_DIR, heatmap_filename)
-                fig.savefig(heatmap_path, bbox_inches='tight', dpi=150)
-                plt.close(fig)
-                
-                # Add to list
-                image_heatmaps.append({
-                    "token": token_display,
-                    "score": score,
-                    "path": heatmap_filename,
-                    "token_idx": token_idx
-                })
-            
-            logging.info(f"Generated {len(image_heatmaps)} token heatmaps")
-            return image_heatmaps
-            
-        except Exception as e:
-            logging.error(f"Error generating similarity maps: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
-
-    @fasthtml_app.get("/temp-image/{filename}")
-    async def serve_temp_image(filename: str):
-        """Serve temporary images (uploads and similarity maps)"""
-        image_path = os.path.join(TEMP_UPLOAD_DIR, filename)
-        logging.info(f"Requested temp image: {filename}, looking at: {image_path}")
-        
-        if os.path.exists(image_path):
-            logging.info(f"Found temp image at: {image_path}, size: {os.path.getsize(image_path)} bytes")
-            try:
-                # Open and read the file directly
-                with open(image_path, "rb") as f:
-                    content = f.read()
-                
-                # Determine media type based on file extension
-                ext = os.path.splitext(filename)[1].lower()
-                if ext in ['.jpg', '.jpeg']:
-                    media_type = "image/jpeg"
-                elif ext == '.png':
-                    media_type = "image/png"
-                elif ext == '.gif':
-                    media_type = "image/gif"
-                else:
-                    media_type = "application/octet-stream"
-                
-                # Return as binary response
-                return Response(
-                    content=content,
-                    media_type=media_type
-                )
-            except Exception as e:
-                logging.error(f"Error reading temp image file: {e}")
-                import traceback
-                traceback.print_exc()
-                return Response(
-                    content=f"Error reading image: {str(e)}",
-                    media_type="text/plain",
-                    status_code=500
-                )
-        else:
-            logging.error(f"Temp image not found: {image_path}")
-            
-            # Check for files with similar name patterns
-            try:
-                files = os.listdir(TEMP_UPLOAD_DIR)
-                
-                # Look for files with the analysis_id prefix
-                analysis_id = filename.split('_')[0]
-                matching_files = [f for f in files if f.startswith(analysis_id)]
-                
-                if matching_files:
-                    logging.info(f"Found similar files: {matching_files}")
-                    
-                    # Try to use the first matching file instead
-                    if len(matching_files) > 0:
-                        alt_path = os.path.join(TEMP_UPLOAD_DIR, matching_files[0])
-                        logging.info(f"Trying alternative file: {alt_path}")
+                    # Tab content containers
+                    Div(
+                        # DaisyUI Table Content
+                        Div(
+                            daisyui_table,
+                            id="tab-content-recent",
+                            cls="block"
+                        ),
                         
-                        if os.path.exists(alt_path):
-                            logging.info(f"Using alternative file: {alt_path}")
-                            with open(alt_path, "rb") as f:
-                                content = f.read()
-                            
-                            # Determine media type based on file extension
-                            alt_ext = os.path.splitext(matching_files[0])[1].lower()
-                            if alt_ext in ['.jpg', '.jpeg']:
-                                media_type = "image/jpeg"
-                            elif alt_ext == '.png':
-                                media_type = "image/png"
-                            elif alt_ext == '.gif':
-                                media_type = "image/gif"
-                            else:
-                                media_type = "application/octet-stream"
-                            
-                            return Response(
-                                content=content,
-                                media_type=media_type
-                            )
-                
-                # If we get here, no good alternative was found
-                logging.info(f"All files in {TEMP_UPLOAD_DIR}: {files[:20]}")
-            except Exception as e:
-                logging.error(f"Error listing directory: {e}")
-            
-            return Response(
-                content=f"Image not found: {filename}",
-                media_type="text/plain",
-                status_code=404
-            )
-
-    @fasthtml_app.get("/heatmap-image/{filename}")
-    async def get_heatmap_image(filename: str):
-        """Serve heatmap images"""
-        heatmap_path = os.path.join(HEATMAP_DIR, filename)
-        logging.info(f"Looking for heatmap image: {heatmap_path}")
-        
-        if os.path.exists(heatmap_path):
-            logging.info(f"Found heatmap at: {heatmap_path}, size: {os.path.getsize(heatmap_path)} bytes")
-            try:
-                # Open and read the file directly
-                with open(heatmap_path, "rb") as f:
-                    content = f.read()
+                        # Flowbite Table Content
+                        Div(
+                            flowbite_table,
+                            id="tab-content-all",
+                            cls="hidden"
+                        ),
+                        
+                        cls="w-full"
+                    ),
                     
-                # Return as binary response
-                return Response(
-                    content=content,
-                    media_type="image/png"
-                )
-            except Exception as e:
-                logging.error(f"Error reading heatmap file: {e}")
-                import traceback
-                traceback.print_exc()
-                return Response(
-                    content=f"Error reading heatmap: {str(e)}",
-                    media_type="text/plain",
-                    status_code=500
-                )
-        else:
-            logging.error(f"Heatmap image not found: {heatmap_path}")
-            # List what files do exist in the directory
-            try:
-                files = os.listdir(HEATMAP_DIR)
-                matching_files = [f for f in files if f.startswith(filename.split('_token_')[0])]
-                logging.info(f"Files in {HEATMAP_DIR} that match prefix: {matching_files}")
-            except Exception as e:
-                logging.error(f"Error listing directory: {e}")
-                
-            return Response(
-                content=f"Heatmap not found: {filename}",
-                media_type="text/plain",
-                status_code=404
-            )
-
-    # Main route function
-    @rt("/")
-    def get(session):
-        if 'session_id' not in session:
-            session['session_id'] = str(uuid.uuid4())
-        
-        logging.info(f"New session: {session['session_id']} - showing batch upload form")
-        
-        return (
-            Title("Insect Classification"),
-            Main(
-                # Loading indicator with better visibility
-                Div(
-                    Div(cls="loading loading-spinner loading-lg text-warning"),
-                    Div("Processing your insect images...", cls="text-white mt-4 text-lg"),
-                    id="loading-indicator",
-                    cls="htmx-indicator fixed top-0 left-0 w-full h-full bg-black bg-opacity-80 flex flex-col items-center justify-center z-50"
+                    # Simple tab switching script
+                    Script("""
+                    function showTab(tabName) {
+                        // Hide all tab contents
+                        document.getElementById('tab-content-recent').classList.add('hidden');
+                        document.getElementById('tab-content-all').classList.add('hidden');
+                        
+                        // Deactivate all tabs
+                        document.getElementById('tab-recent').classList.remove('tab-active');
+                        document.getElementById('tab-all').classList.remove('tab-active');
+                        
+                        // Show selected tab content
+                        document.getElementById('tab-content-' + tabName).classList.remove('hidden');
+                        
+                        // Activate selected tab
+                        document.getElementById('tab-' + tabName).classList.add('tab-active');
+                    }
+                    """),
+                    
+                    cls="w-full"
                 ),
-                
-                # Page header 
-                H1("Insect Classifier", cls="text-3xl font-bold mb-4 text-white"),
-                
-                # Header info
-                Div(
-                    P("Upload insect images for instant AI classification", 
-                      cls="text-white text-center mb-6"),
-                    cls="w-full max-w-2xl"
-                ),
-                
-                # Main content area - DIRECTLY SHOW BATCH FORM
-                Div(
-                    batch_upload_form(),
-                    id="main-content",
-                    cls="w-full max-w-2xl"
-                ),
-                
-                # Results area - will be populated by process-batch
-                Div(id="analysis-results", cls="w-full max-w-5xl mt-8"),
-                
-                cls="flex flex-col items-center min-h-screen bg-black p-4",
-            )
+                cls="w-full"
+            ),
+            cls="mb-8"
         )
-
-    # Add batch upload route
-    @rt("/batch-upload", methods=["GET"])
-    def get_batch_upload(session):
-        """Show the batch upload form"""
-        if 'session_id' not in session:
-            session['session_id'] = str(uuid.uuid4())
+        
+        # Context Sources Section (for RAG stats)
+        rag_section = Div(
+            H2("RAG Context Usage", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                Div(
+                    H3("Most Used Context Sources", cls="font-semibold mb-3"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Source"),
+                                Th("Usage Count"),
+                            )
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(source),
+                                    Td(str(count)),
+                                )
+                                for source, count in stats["context_counts"]
+                            ] if stats["context_counts"] else [
+                                Tr(
+                                    Td("No context sources recorded yet"),
+                                    Td("0")
+                                )
+                            ]
+                        ),
+                        cls="table w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                cls="w-full"
+            ),
+            cls="mb-8"
+        )
+        
+        return Title("Dashboard - Insect Classifier"), Main(
+            Div(
+                H1("Classification Dashboard", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
+                P("Statistics and insights from the Insect Classifier with RAG", cls="text-center mb-8 text-base-content/70"),
+                navbar,
+                summary_cards,
+                charts_section,
+                map_section,
+                confidence_feedback_section,
+                tables_section,
+                rag_section,
+                cls="container mx-auto px-4 py-8 max-w-7xl"
+            ),
+            cls="min-h-screen bg-base-100",
+            data_theme="light"
+        )
+    
+    #
+    @rt("/")
+    def homepage():
+        """Render the unified classifier dashboard with enhanced carousel and RAG display"""
+        
+        # Create toggle switches for classification options
+        def create_toggle(name, label, checked=False, description=None):
+            toggle_input = Input(
+                type="checkbox",
+                name=name,
+                checked="checked" if checked else None,
+                cls="toggle toggle-primary mr-3"
+            )
             
-        logging.info(f"Showing batch upload form for session: {session['session_id']}")
-        return batch_upload_form()
-
+            label_span = Span(label)
+            
+            label_element = Label(
+                toggle_input,
+                label_span,
+                cls="label cursor-pointer justify-start"
+            )
+            
+            toggle_element = Div(
+                label_element,
+                cls="mb-3"
+            )
+            
+            # If description is provided, add it to the container
+            if description:
+                description_p = P(description, cls="text-sm text-base-content/70 ml-10")
+                # Create a new Div with both elements
+                toggle_element = Div(
+                    label_element,
+                    description_p,
+                    cls="mb-3"
+                )
+                        
+            return toggle_element
+        
+        # Classification options panel with RAG option
+        classification_options = Div(
+            H3("Classification Options", cls="text-lg font-semibold mb-4 text-bee-green"),
+            create_toggle("use_rag", "Use Context-Enhanced Classification (RAG)", True, 
+                        "Enhances classification accuracy using relevant reference materials"),
+            create_toggle("detailed_description", "Detailed Description (shapes, colors)"),
+            create_toggle("plant_classification", "Plant Classification"),
+            create_toggle("taxonomy", "Taxonomic Classification"),
+            cls="mb-6 p-4 bg-base-200 rounded-lg"
+        )
+        
+        # Unified image upload section
+        upload_section = Div(
+            Label("Upload Insect Images", cls="block text-xl font-medium mb-2 text-bee-green"),
+            P("Upload one or more insect images (up to 5) for classification.", cls="mb-4"),
+            Div(
+                # Use DaisyUI file input instead of custom drag-and-drop
+                Label(
+                    "Select Images",
+                    cls="block mb-2 text-sm font-medium"
+                ),
+                Input(
+                    type="file",
+                    name="insect_images",
+                    accept="image/jpeg,image/png",
+                    multiple=True,
+                    cls="file-input file-input-bordered file-input-primary w-full",
+                    id="image-input",
+                    hx_on="change: handleFileSelection(event)"
+                ),
+                cls="mb-6"
+            ),
+            
+            # Preview area - shows either single preview or batch previews
+            Div(
+                # Single image preview
+                Img(
+                    id="single-preview",
+                    src="",
+                    cls="max-h-64 mx-auto hidden object-contain rounded-lg border shadow-sm"
+                ),
+                
+                # Batch previews container
+                Div(
+                    id="batch-previews",
+                    cls="batch-previews hidden"
+                ),
+                
+                # Count display
+                Div(
+                    Span("", id="image-count"),
+                    cls="text-center mt-2 text-sm text-base-content/70 hidden",
+                    id="count-display"
+                ),
+                
+                cls="mb-6"
+            ),
+            cls="mb-8"
+        )
+        
+        # Control panel 
+        control_panel = Div(
+            H2("Insect Image Classification", cls="text-xl font-bold mb-4 text-bee-green"),
+            upload_section,
+            classification_options,
+            Button(
+                "Classify Insects",
+                cls="btn btn-primary w-full",
+                id="classify-button",
+                disabled="disabled"
+            ),
+            cls="w-full bg-base-100 p-6 rounded-lg shadow-lg custom-border border mb-6"  # Added mb-6 for spacing
+        )
+        
+        # Results panel with DaisyUI carousel below upload section
+        results_panel = Div(
+            H2("Classification Results", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                Div(
+                    cls="loading loading-spinner loading-lg text-primary",
+                    id="loading-indicator"
+                ),
+                cls="flex justify-center items-center h-32 hidden",
+                id="loading-indicator-parent"
+            ),
+            Div(
+                P("Upload image(s) and click 'Classify Insects' to see results.", 
+                cls="text-center text-base-content/70 italic"),
+                id="results-placeholder",
+                cls="text-center py-12"
+            ),
+            
+            # Container for both single and batch results
+            Div(
+                # Single result container
+                Div(
+                    id="single-result",
+                    cls="hidden"
+                ),
+                
+                # Batch results carousel container - using DaisyUI carousel instead
+                Div(
+                    # This will be filled dynamically with JavaScript
+                    cls="carousel w-full rounded-lg overflow-hidden hidden",
+                    id="batch-results"
+                ),
+                
+                id="results-content",
+                cls="hidden"
+            ),
+            
+            # RAG Context Display Section (new)
+            Div(
+                H3("Classification Context", cls="text-lg font-semibold mb-2 text-bee-green"),
+                P("Reference materials used to enhance classification accuracy.", cls="mb-2 text-sm text-base-content/70"),
+                Div(
+                    # Context content will be populated here
+                    cls="bg-base-200 p-4 rounded-lg",
+                    id="rag-context-display"
+                ),
+                cls="mt-6 hidden",
+                id="rag-context-section"
+            ),
+            
+            # Actions for results
+            Div(
+                Button(
+                    "Copy Results",
+                    cls="btn btn-outline btn-accent btn-sm mr-2",
+                    id="copy-button"
+                ),
+                Button(
+                    "New Classification",
+                    cls="btn btn-outline btn-primary btn-sm",
+                    id="new-button"
+                ),
+                cls="mt-6 flex justify-end items-center gap-2 hidden",
+                id="result-actions"
+            ),
+            cls="w-full bg-base-100 p-6 rounded-lg shadow-lg custom-border border"
+        )
+        
+        # Navigation bar
+        navbar = Div(
+            Div(
+                A(
+                    Span("🐝", cls="text-xl"),
+                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
+                    href="/",
+                    cls="flex items-center"
+                ),
+                Div(
+                    A(
+                        "Dashboard",
+                        href="/dashboard",
+                        cls="btn btn-sm btn-ghost"
+                    ),
+                    cls="flex-none"
+                ),
+                cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
+            ),
+            cls="w-full"
+        )
+        
+        # Add updated script for form handling with carousel and RAG display enhancements
+        form_script = Script("""
+        document.addEventListener('DOMContentLoaded', function() {
+            // Form elements - cache all DOM elements we'll need to reference
+            const imageInput = document.getElementById('image-input');
+            const singlePreview = document.getElementById('single-preview');
+            const batchPreviewsContainer = document.getElementById('batch-previews');
+            const countDisplay = document.getElementById('count-display');
+            const imageCountElem = document.getElementById('image-count');
+            const classifyButton = document.getElementById('classify-button');
+            
+            // Results elements - references to DOM elements for displaying results
+            const loadingIndicator = document.getElementById('loading-indicator').parentElement;
+            const resultsPlaceholder = document.getElementById('results-placeholder');
+            const resultsContent = document.getElementById('results-content');
+            const singleResult = document.getElementById('single-result');
+            const batchResults = document.getElementById('batch-results');
+            const resultActions = document.getElementById('result-actions');
+            const copyButton = document.getElementById('copy-button');
+            const newButton = document.getElementById('new-button');
+            
+            // RAG Context elements
+            const ragContextSection = document.getElementById('rag-context-section');
+            const ragContextDisplay = document.getElementById('rag-context-display');
+            
+            // Mode tracking variables
+            let isBatchMode = false;
+            const MAX_IMAGES = 5;
+            let selectedFiles = [];
+            let rawResponseText = '';
+            
+            // Debug elements on page load
+            console.log("DOM loaded - Bee Classifier Initialized");
+            console.log("Button state:", classifyButton ? (classifyButton.disabled ? "disabled" : "enabled") : "button not found");
+            
+            // Explicitly attach the change event listener
+            // This ensures the file input triggers our handler even if the HTML attribute binding fails
+            if (imageInput) {
+                console.log("Setting up file input change listener");
+                imageInput.addEventListener('change', function(event) {
+                    console.log("File input changed - files selected:", event.target.files.length);
+                    handleFileSelection(event);
+                });
+            } else {
+                console.error("Critical Error: Image input element not found");
+            }
+            
+            // Get options from the form controls
+            function getOptions() {
+                return {
+                    use_rag: document.querySelector('input[name="use_rag"]').checked,
+                    detailed_description: document.querySelector('input[name="detailed_description"]').checked,
+                    plant_classification: document.querySelector('input[name="plant_classification"]').checked,
+                    taxonomy: document.querySelector('input[name="taxonomy"]').checked
+                };
+            }
+            
+            // Handle file selection - core function that processes selected files
+            window.handleFileSelection = function(event) {
+                console.log("handleFileSelection called");
+                const files = event.target.files;
+                
+                if (!files || files.length === 0) {
+                    console.log("No files selected");
+                    resetForm();
+                    return;
+                }
+                
+                console.log(`${files.length} files selected`);
+                
+                if (files.length > MAX_IMAGES) {
+                    alert(`Please select a maximum of ${MAX_IMAGES} images.`);
+                    resetForm();
+                    return;
+                }
+                
+                // Determine mode based on file count
+                isBatchMode = files.length > 1;
+                selectedFiles = Array.from(files);
+                
+                if (isBatchMode) {
+                    // Batch mode - show multiple previews
+                    console.log("Batch mode activated");
+                    singlePreview.classList.add('hidden');
+                    batchPreviewsContainer.classList.remove('hidden');
+                    batchPreviewsContainer.innerHTML = '';
+                    
+                    // Create preview for each image
+                    selectedFiles.forEach((file, index) => {
+                        const reader = new FileReader();
+                        
+                        reader.onload = function(e) {
+                            // Create preview container
+                            const previewDiv = document.createElement('div');
+                            previewDiv.className = 'preview-item';
+                            previewDiv.dataset.index = index;
+                            
+                            // Create image preview
+                            const img = document.createElement('img');
+                            img.src = e.target.result;
+                            img.className = 'preview-img';
+                            
+                            // Create remove button
+                            const removeBtn = document.createElement('div');
+                            removeBtn.className = 'remove-btn';
+                            removeBtn.innerHTML = '×';
+                            removeBtn.onclick = function() {
+                                // Remove this file
+                                selectedFiles.splice(index, 1);
+                                
+                                // Update UI
+                                if (selectedFiles.length === 0) {
+                                    resetForm();
+                                } else if (selectedFiles.length === 1) {
+                                    // Switch to single mode
+                                    isBatchMode = false;
+                                    showSinglePreview(selectedFiles[0]);
+                                } else {
+                                    // Stay in batch mode but update
+                                    updateBatchPreviews();
+                                }
+                            };
+                            
+                            // Add elements
+                            previewDiv.appendChild(img);
+                            previewDiv.appendChild(removeBtn);
+                            batchPreviewsContainer.appendChild(previewDiv);
+                        };
+                        
+                        reader.readAsDataURL(file);
+                    });
+                    
+                    // Update count display
+                    imageCountElem.textContent = `${selectedFiles.length} images selected`;
+                    countDisplay.classList.remove('hidden');
+                } else {
+                    // Single mode - show one preview
+                    console.log("Single image mode activated");
+                    showSinglePreview(selectedFiles[0]);
+                }
+                
+                // Enable classify button - with visual feedback
+                if (classifyButton) {
+                    classifyButton.disabled = false;
+                    classifyButton.classList.remove('opacity-50');
+                    classifyButton.classList.add('hover:bg-primary-focus');
+                    console.log("Classify button enabled");
+                } else {
+                    console.error("Critical Error: Classify button not found");
+                }
+            };
+            
+            // Show single image preview
+            function showSinglePreview(file) {
+                console.log("Showing single preview for file:", file.name);
+                const reader = new FileReader();
+                
+                reader.onload = function(e) {
+                    singlePreview.src = e.target.result;
+                    singlePreview.classList.remove('hidden');
+                    batchPreviewsContainer.classList.add('hidden');
+                    countDisplay.classList.add('hidden');
+                };
+                
+                reader.readAsDataURL(file);
+            }
+            
+            // Update batch previews
+            function updateBatchPreviews() {
+                console.log("Updating batch previews, count:", selectedFiles.length);
+                batchPreviewsContainer.innerHTML = '';
+                
+                selectedFiles.forEach((file, index) => {
+                    const reader = new FileReader();
+                    
+                    reader.onload = function(e) {
+                        // Create preview container
+                        const previewDiv = document.createElement('div');
+                        previewDiv.className = 'preview-item';
+                        previewDiv.dataset.index = index;
+                        
+                        // Create image preview
+                        const img = document.createElement('img');
+                        img.src = e.target.result;
+                        img.className = 'preview-img';
+                        
+                        // Create remove button
+                        const removeBtn = document.createElement('div');
+                        removeBtn.className = 'remove-btn';
+                        removeBtn.innerHTML = '×';
+                        removeBtn.onclick = function() {
+                            // Remove this file
+                            selectedFiles.splice(index, 1);
+                            
+                            // Update UI
+                            if (selectedFiles.length === 0) {
+                                resetForm();
+                            } else if (selectedFiles.length === 1) {
+                                // Switch to single mode
+                                isBatchMode = false;
+                                showSinglePreview(selectedFiles[0]);
+                            } else {
+                                // Stay in batch mode but update
+                                updateBatchPreviews();
+                            }
+                        };
+                        
+                        // Add elements
+                        previewDiv.appendChild(img);
+                        previewDiv.appendChild(removeBtn);
+                        batchPreviewsContainer.appendChild(previewDiv);
+                    };
+                    
+                    reader.readAsDataURL(file);
+                });
+                
+                // Update count
+                imageCountElem.textContent = `${selectedFiles.length} images selected`;
+                countDisplay.classList.remove('hidden');
+            }
+            
+            // Reset the form to initial state
+            function resetForm() {
+                console.log("Resetting form");
+                imageInput.value = '';
+                singlePreview.src = '';
+                singlePreview.classList.add('hidden');
+                batchPreviewsContainer.innerHTML = '';
+                batchPreviewsContainer.classList.add('hidden');
+                countDisplay.classList.add('hidden');
+                
+                // Reset button with visual indicators
+                if (classifyButton) {
+                    classifyButton.disabled = true;
+                    classifyButton.classList.add('opacity-50');
+                    classifyButton.classList.remove('hover:bg-primary-focus');
+                }
+                
+                selectedFiles = [];
+                isBatchMode = false;
+            }
+            
+            // Handle classify button click
+            if (classifyButton) {
+                classifyButton.addEventListener('click', function() {
+                    console.log("Classify button clicked");
+                    
+                    // Show loading state
+                    loadingIndicator.classList.remove('hidden');
+                    resultsPlaceholder.classList.add('hidden');
+                    resultsContent.classList.add('hidden');
+                    resultActions.classList.add('hidden');
+                    ragContextSection.classList.add('hidden'); // Hide RAG context section
+                    classifyButton.disabled = true;
+                    classifyButton.classList.add('opacity-50');
+                    
+                    if (isBatchMode) {
+                        // Batch mode - process multiple images
+                        console.log("Processing batch of", selectedFiles.length, "images");
+                        processBatchImages();
+                    } else {
+                        // Single mode - process one image
+                        console.log("Processing single image");
+                        processSingleImage();
+                    }
+                });
+            }
+            
+            // Process a single image
+            function processSingleImage() {
+                console.log("Starting single image processing");
+                
+                // Get the base64 image data
+                const base64Data = singlePreview.src.split(',')[1];
+                
+                // Send request to API
+                fetch('/api/classify', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        image_data: base64Data,
+                        options: getOptions()
+                    })
+                })
+                .then(response => {
+                    console.log("Received API response, status:", response.status);
+                    return response.json();
+                })
+                .then(data => {
+                    // Hide loading indicator
+                    loadingIndicator.classList.add('hidden');
+                    
+                    if (data.error) {
+                        console.error("Error from API:", data.error);
+                        // Show error message
+                        singleResult.innerHTML = `
+                            <div class="alert alert-error">
+                                <span>Error: ${data.error}</span>
+                            </div>
+                        `;
+                        singleResult.classList.remove('hidden');
+                        batchResults.classList.add('hidden');
+                        resultsContent.classList.remove('hidden');
+                        return;
+                    }
+                    
+                    console.log("Classification successful, displaying results");
+                    
+                    // Display the result using the enhanced display function
+                    displaySingleResult(data);
+                    
+                    // Display RAG context if available
+                    displayRagContext(data);
+                    
+                    // Show containers
+                    singleResult.classList.remove('hidden');
+                    batchResults.classList.add('hidden');
+                    resultsContent.classList.remove('hidden');
+                    resultActions.classList.remove('hidden');
+                })
+                .catch(error => {
+                    console.error('Error classifying image:', error);
+                    loadingIndicator.classList.add('hidden');
+                    singleResult.innerHTML = `
+                        <div class="alert alert-error">
+                            <span>Error: Could not process your request. Please try again.</span>
+                        </div>
+                    `;
+                    singleResult.classList.remove('hidden');
+                    batchResults.classList.add('hidden');
+                    resultsContent.classList.remove('hidden');
+                    classifyButton.disabled = false;
+                    classifyButton.classList.remove('opacity-50');
+                });
+            }
+            
+            // Process batch of images
+            function processBatchImages() {
+                console.log("Starting batch image processing");
+                
+                // Create form data for file upload
+                const formData = new FormData();
+                
+                // Add all files
+                selectedFiles.forEach((file, index) => {
+                    formData.append(`image_${index}`, file);
+                    console.log(`Added image_${index} to form data:`, file.name);
+                });
+                
+                // Add options
+                const options = getOptions();
+                formData.append('options', JSON.stringify(options));
+                console.log("Added options to form data:", options);
+                
+                // Send batch request
+                fetch('/classify-batch', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => {
+                    console.log("Received batch API response, status:", response.status);
+                    return response.json();
+                })
+                .then(data => {
+                    // Hide loading indicator
+                    loadingIndicator.classList.add('hidden');
+                    
+                    if (data.error) {
+                        console.error("Error from batch API:", data.error);
+                        // Show error message
+                        batchResults.innerHTML = `
+                            <div class="alert alert-error">
+                                <span>Error: ${data.error}</span>
+                            </div>
+                        `;
+                        singleResult.classList.add('hidden');
+                        batchResults.classList.remove('hidden');
+                        resultsContent.classList.remove('hidden');
+                        return;
+                    }
+                    
+                    console.log("Batch classification successful, displaying results");
+                    
+                    // Save raw response for copy button
+                    rawResponseText = data.raw_response;
+                    
+                    // Display batch results using the enhanced carousel display function
+                    displayBatchCarousel(data);
+                    
+                    // Display RAG context if available
+                    displayRagContext(data);
+                    
+                    // Show result sections
+                    singleResult.classList.add('hidden');
+                    batchResults.classList.remove('hidden');
+                    resultsContent.classList.remove('hidden');
+                    resultActions.classList.remove('hidden');
+                })
+                .catch(error => {
+                    console.error('Error in batch processing:', error);
+                    loadingIndicator.classList.add('hidden');
+                    batchResults.innerHTML = `
+                        <div class="alert alert-error">
+                            <span>Error: Could not process your request. Please try again.</span>
+                        </div>
+                    `;
+                    singleResult.classList.add('hidden');
+                    batchResults.classList.remove('hidden');
+                    resultsContent.classList.remove('hidden');
+                    classifyButton.disabled = false;
+                    classifyButton.classList.remove('opacity-50');
+                });
+            }
+            
+            // Setup copy button
+            if (copyButton) {
+                copyButton.addEventListener('click', function() {
+                    console.log("Copy button clicked");
+                    navigator.clipboard.writeText(rawResponseText);
+                    copyButton.innerHTML = 'Copied!';
+                    setTimeout(() => {
+                        copyButton.innerHTML = 'Copy Results';
+                    }, 2000);
+                });
+            }
+            
+            // Setup new button
+            if (newButton) {
+                newButton.addEventListener('click', function() {
+                    console.log("New classification button clicked");
+                    // Reset form
+                    resetForm();
+                    
+                    // Reset results
+                    resultsPlaceholder.classList.remove('hidden');
+                    resultsContent.classList.add('hidden');
+                    resultActions.classList.add('hidden');
+                    ragContextSection.classList.add('hidden'); // Hide RAG context
+                    singleResult.classList.add('hidden');
+                    batchResults.classList.add('hidden');
+                });
+            }
+            
+            // Function to display RAG context section with actual PDF images
+            function displayRagContext(result) {
+                // Check if we have context data to display
+                if (result.context_source || 
+                    (result.context_paragraphs && result.context_paragraphs.length > 0) ||
+                    (result.top_sources && result.top_sources.length > 0)) {
+                    
+                    let contextHTML = '';
+                    
+                    // Add top source image if available
+                    if (result.top_sources && result.top_sources.length > 0) {
+                        const topSource = result.top_sources[0];
+                        const imagePath = topSource.image_path || '';
+                        
+                        if (imagePath) {
+                            contextHTML += `
+                                <div class="mb-4">
+                                    <h4 class="font-semibold mb-2">Reference Document Image:</h4>
+                                    <div class="bg-base-300 p-2 rounded-lg flex justify-center">
+                                        <img src="/image-thumbnail?path=${encodeURIComponent(imagePath)}" 
+                                            alt="Reference Document" 
+                                            class="max-h-96 object-contain cursor-pointer" 
+                                            onclick="window.open('/image-thumbnail?path=${encodeURIComponent(imagePath)}&full=true', '_blank')"
+                                            title="Click to view full size">
+                                    </div>
+                                </div>
+                            `;
+                        } else {
+                            // Try to construct a path based on metadata if the direct path isn't available
+                            const filename = topSource.filename || '';
+                            const page = topSource.page || 0;
+                            
+                            contextHTML += `
+                                <div class="mb-4">
+                                    <h4 class="font-semibold mb-2">Reference Document:</h4>
+                                    <div class="bg-base-300 p-2 rounded-lg flex justify-center">
+                                        <img src="/context-image?filename=${encodeURIComponent(filename)}&page=${page}" 
+                                            alt="Reference Document" 
+                                            class="max-h-96 object-contain cursor-pointer"
+                                            onerror="this.onerror=null; this.src='/placeholder-image'; this.classList.add('opacity-50');"
+                                            onclick="if(!this.classList.contains('opacity-50')) window.open('/context-image?filename=${encodeURIComponent(filename)}&page=${page}&full=true', '_blank')"
+                                            title="Click to view full size">
+                                    </div>
+                                </div>
+                            `;
+                        }
+                    }
+                    
+                    // Add the source information
+                    if (result.context_source) {
+                        contextHTML += `
+                            <div class="mb-3">
+                                <span class="font-semibold">Source Document:</span>
+                                <span>${result.context_source}</span>
+                            </div>
+                        `;
+                    }
+                    
+                    // Add context paragraphs
+                    if (result.context_paragraphs && result.context_paragraphs.length > 0) {
+                        contextHTML += `
+                            <div class="mb-3">
+                                <div class="font-semibold mb-2">Reference Text:</div>
+                                <div class="text-sm bg-base-300 p-3 rounded-md max-h-40 overflow-y-auto">
+                                    ${result.context_paragraphs[0]}
+                                </div>
+                            </div>
+                        `;
+                        
+                        // If there are more paragraphs, add a collapsible section
+                        if (result.context_paragraphs.length > 1) {
+                            contextHTML += `
+                                <details class="collapse mb-3">
+                                    <summary class="collapse-title font-medium">Additional Reference Texts</summary>
+                                    <div class="collapse-content">
+                            `;
+                            
+                            for (let i = 1; i < result.context_paragraphs.length; i++) {
+                                contextHTML += `
+                                    <div class="mb-2 text-sm bg-base-300 p-3 rounded-md">
+                                        ${result.context_paragraphs[i]}
+                                    </div>
+                                `;
+                            }
+                            
+                            contextHTML += `
+                                    </div>
+                                </details>
+                            `;
+                        }
+                    }
+                    
+                    // Add top sources list if available
+                    if (result.top_sources && result.top_sources.length > 0) {
+                        contextHTML += `
+                            <div class="mb-3">
+                                <div class="font-semibold mb-2">Top Reference Sources:</div>
+                                <ul class="list-disc pl-5">
+                        `;
+                        
+                        result.top_sources.forEach(source => {
+                            contextHTML += `
+                                <li>${source.filename || 'Unknown'}, page ${source.page || '?'}</li>
+                            `;
+                        });
+                        
+                        contextHTML += `
+                                </ul>
+                            </div>
+                        `;
+                    }
+                    
+                    // If we have any context to display, show the section
+                    if (contextHTML) {
+                        ragContextDisplay.innerHTML = contextHTML;
+                        ragContextSection.classList.remove('hidden');
+                    }
+                }
+            }
+            
+            // Function to display single classification result with context
+            function displaySingleResult(result) {
+                console.log("Displaying single result:", result.category);
+                const singleResult = document.getElementById('single-result');
+                
+                // Determine confidence class
+                let confidenceClass = 'badge-warning';
+                if (result.confidence === 'High') {
+                    confidenceClass = 'badge-success';
+                } else if (result.confidence === 'Low') {
+                    confidenceClass = 'badge-error';
+                }
+                
+                // Create result HTML
+                let resultHTML = `
+                    <div class="p-4 bg-base-200 rounded-lg mb-4">
+                        <div class="flex justify-between items-center mb-2">
+                            <h3 class="text-lg font-bold">${result.category}</h3>
+                            <span class="badge ${confidenceClass}">Confidence: ${result.confidence}</span>
+                        </div>
+                        <p class="mb-4">${result.description}</p>
+                `;
+                
+                // Add additional details if available
+                const details = result.details;
+                for (const key in details) {
+                    if (key !== 'Main Category' && key !== 'Confidence' && key !== 'Description') {
+                        resultHTML += `
+                            <div class="mb-2">
+                                <span class="font-semibold">${key}:</span>
+                                <span>${details[key]}</span>
+                            </div>
+                        `;
+                    }
+                }
+                
+                resultHTML += `</div>`;
+                
+                // Add feedback controls
+                resultHTML += `
+                    <div class="flex items-center mt-4 mb-4">
+                        <span class="text-sm mr-2">Rate this classification:</span>
+                        <button class="btn btn-outline btn-sm mr-2" id="thumbs-up-button" onclick="provideFeedback('${result.id}', 'positive')">
+                            👍
+                        </button>
+                        <button class="btn btn-outline btn-sm" id="thumbs-down-button" onclick="provideFeedback('${result.id}', 'negative')">
+                            👎
+                        </button>
+                        <span id="feedback-message" class="text-sm ml-4"></span>
+                    </div>
+                `;
+                
+                // Add raw response in collapsible section
+                resultHTML += `
+                    <details class="collapse bg-base-200">
+                        <summary class="collapse-title font-medium">Raw Response</summary>
+                        <div class="collapse-content">
+                            <pre class="text-xs whitespace-pre-wrap">${result.raw_response}</pre>
+                        </div>
+                    </details>
+                `;
+                
+                // Update the container
+                singleResult.innerHTML = resultHTML;
+                
+                // Save raw response for copy button
+                rawResponseText = result.raw_response;
+            }
+            
+            // Function to display batch results as a DaisyUI carousel
+            function displayBatchCarousel(batchResult) {
+                console.log("Displaying batch carousel for", batchResult.results.length, "images");
+                const batchResultsContainer = document.getElementById('batch-results');
+                
+                // Clear the container
+                batchResultsContainer.innerHTML = '';
+                
+                // Create carousel slides
+                batchResult.results.forEach((result, index) => {
+                    // Determine confidence class
+                    let confidenceClass = 'badge-warning';
+                    if (result.confidence === 'High') {
+                        confidenceClass = 'badge-success';
+                    } else if (result.confidence === 'Low') {
+                        confidenceClass = 'badge-error';
+                    }
+                    
+                    // Create a unique ID for the slide
+                    const slideId = `slide-${index + 1}`;
+                    
+                    // Create the carousel item - using DaisyUI carousel
+                    const carouselItem = document.createElement('div');
+                    carouselItem.id = slideId;
+                    carouselItem.className = 'carousel-item relative w-full';
+                    
+                    // Create the content for this slide
+                    carouselItem.innerHTML = `
+                        <div class="w-full px-4 py-6 bg-base-200 rounded-lg flex flex-col items-center">
+                            <div class="w-full max-w-3xl mx-auto">
+                                <div class="flex justify-between items-center mb-4">
+                                    <h3 class="text-lg font-medium">Result ${index + 1} of ${batchResult.results.length}</h3>
+                                    <span class="badge ${confidenceClass}">Confidence: ${result.confidence}</span>
+                                </div>
+                                
+                                <h4 class="text-xl font-bold mb-2">${result.category}</h4>
+                                <p class="mb-4">${result.description}</p>
+                                
+                                <!-- Additional details if available -->
+                                <div class="mb-4">
+                                    ${Object.entries(result.details || {})
+                                        .filter(([key]) => !['Main Category', 'Confidence', 'Description'].includes(key))
+                                        .map(([key, value]) => `
+                                            <div class="mb-2">
+                                                <span class="font-semibold">${key}:</span>
+                                                <span>${value}</span>
+                                            </div>
+                                        `).join('')
+                                    }
+                                </div>
+                                
+                                <!-- Feedback buttons -->
+                                <div class="flex items-center mt-4">
+                                    <span class="text-sm mr-2">Rate this classification:</span>
+                                    <button class="btn btn-outline btn-sm mr-2" id="thumbs-up-button-${index}" onclick="provideFeedback('${result.id}', 'positive', 'thumbs-up-button-${index}', 'thumbs-down-button-${index}', 'feedback-message-${index}')">
+                                        👍
+                                    </button>
+                                    <button class="btn btn-outline btn-sm" id="thumbs-down-button-${index}" onclick="provideFeedback('${result.id}', 'negative', 'thumbs-up-button-${index}', 'thumbs-down-button-${index}', 'feedback-message-${index}')">
+                                        👎
+                                    </button>
+                                    <span id="feedback-message-${index}" class="text-sm ml-4"></span>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Carousel navigation buttons -->
+                        <div class="absolute left-5 right-5 top-1/2 flex -translate-y-1/2 transform justify-between">
+                            <a href="#slide-${index === 0 ? batchResult.results.length : index}" class="btn btn-circle">❮</a>
+                            <a href="#slide-${index === batchResult.results.length - 1 ? 1 : index + 2}" class="btn btn-circle">❯</a>
+                        </div>
+                    `;
+                    
+                    // Add this slide to the carousel
+                    batchResultsContainer.appendChild(carouselItem);
+                });
+                
+                // Add carousel indicators at the bottom
+                const indicatorsContainer = document.createElement('div');
+                indicatorsContainer.className = 'flex justify-center w-full py-2 gap-2 mt-4';
+                
+                batchResult.results.forEach((_, index) => {
+                    const btnIndicator = document.createElement('a');
+                    btnIndicator.href = `#slide-${index + 1}`;
+                    btnIndicator.className = 'btn btn-xs';
+                    btnIndicator.textContent = (index + 1).toString();
+                    indicatorsContainer.appendChild(btnIndicator);
+                });
+                
+                batchResultsContainer.appendChild(indicatorsContainer);
+                
+                // Show the carousel
+                batchResultsContainer.classList.remove('hidden');
+                
+                // Save raw response for copy button
+                rawResponseText = batchResult.raw_response;
+            }
+            
+            // Global function for providing feedback
+            window.provideFeedback = function(resultId, feedbackType, upButtonId, downButtonId, messageId) {
+                console.log("Providing feedback:", feedbackType, "for result:", resultId);
+                
+                // Get button elements
+                const upButton = document.getElementById(upButtonId || 'thumbs-up-button');
+                const downButton = document.getElementById(downButtonId || 'thumbs-down-button');
+                const messageElement = document.getElementById(messageId || 'feedback-message');
+                
+                if (!upButton || !downButton) {
+                    console.error("Feedback buttons not found");
+                    return;
+                }
+                
+                // Update button UI state
+                if (feedbackType === 'positive') {
+                    upButton.classList.add('btn-success', 'btn-active');
+                    downButton.classList.remove('btn-error', 'btn-active');
+                } else {
+                    upButton.classList.remove('btn-success', 'btn-active');
+                    downButton.classList.add('btn-error', 'btn-active');
+                }
+                
+                // Show sending message
+                if (messageElement) {
+                    messageElement.textContent = 'Saving feedback...';
+                }
+                
+                // Send feedback to server
+                fetch('/api/feedback', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        id: resultId,
+                        feedback: feedbackType
+                    })
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Failed to save feedback');
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    console.log('Feedback saved successfully:', data);
+                    if (messageElement) {
+                        messageElement.textContent = 'Feedback saved!';
+                        
+                        // Clear message after a delay
+                        setTimeout(() => {
+                            messageElement.textContent = '';
+                        }, 3000);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error saving feedback:', error);
+                    if (messageElement) {
+                        messageElement.textContent = 'Error saving feedback.';
+                    }
+                    
+                    // Reset buttons 
+                    upButton.classList.remove('btn-success', 'btn-active');
+                    downButton.classList.remove('btn-error', 'btn-active');
+                });
+            };
+        });
+        """)
+        
+        # Add enhanced styles for the carousel and RAG context display
+        enhanced_styles = Style("""
+        /* DaisyUI carousel improvements */
+        .carousel {
+            background: var(--color-base-200);
+            border-radius: 0.5rem;
+        }
+        
+        .carousel-item {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        /* Batch previews styling */
+        .batch-previews {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 15px 0;
+        }
+        
+        .preview-item {
+            position: relative;
+            width: 80px;
+            height: 80px;
+        }
+        
+        .preview-img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 0.5rem;
+            border: 2px solid var(--color-base-300);
+        }
+        
+        .remove-btn {
+            position: absolute;
+            top: -8px;
+            right: -8px;
+            background: var(--color-error);
+            color: white;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        
+        /* RAG context styling */
+        #rag-context-display {
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        
+        /* Responsive layout */
+        @media (min-width: 768px) {
+            #results-content, #rag-context-section {
+                max-height: none;
+                overflow-y: visible;
+            }
+        }
+        """)
+        
+        return Title("Insect Classifier"), Main(
+            form_script,
+            enhanced_styles,
+            Div(
+                H1("Insect Classification App", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
+                P("Powered by Claude's Vision AI with RAG", cls="text-center mb-8 text-base-content/70"),
+                navbar,  # Add the navbar here
+                Div(
+                    control_panel,
+                    results_panel,
+                    cls="flex flex-col w-full"  # Changed to vertical layout
+                ),
+                cls="container mx-auto px-4 py-8 max-w-6xl"
+            ),
+            cls="min-h-screen bg-base-100",
+            data_theme="light"
+        )
+    
+    # Return the FastHTML app
     return fasthtml_app
 
+# When running locally
 if __name__ == "__main__":
-    serve_vllm()
-    serve_fasthtml()
+    print("Starting Insect Classification App...")
+    # This section is only executed when running the script directly, not through Modal
