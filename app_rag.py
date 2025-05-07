@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "skxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -2045,7 +2045,7 @@ Please examine all images, using the document image to inform your analysis of t
             
             cursor.execute(
                 "INSERT INTO batch_results (batch_id, result_count, results) VALUES (?, ?, ?)",
-                (batch_id, len(image_results), json.dumps(image_results))
+                (batch_id, len(image_results), json.dumps(convert_numpy_to_python(image_results)))
             )
             
             conn.commit()
@@ -2060,9 +2060,9 @@ Please examine all images, using the document image to inform your analysis of t
             
         except Exception as e:
             print(f"⚠️ Error saving batch results to database: {e}")
-        
+
         # IMPROVED: Add more data to the response
-        return {
+        result_to_return = {
             "batch_id": batch_id,
             "count": len(image_results),
             "results": image_results,
@@ -2073,7 +2073,10 @@ Please examine all images, using the document image to inform your analysis of t
             "query_used": query_used,
             "rag_enabled": options.get("use_rag", True)
         }
-        
+
+        # Apply NumPy to Python conversion before returning
+        return convert_numpy_to_python(result_to_return)
+  
     except requests.exceptions.HTTPError as http_err:
         error_detail = "Unknown error"
         try:
