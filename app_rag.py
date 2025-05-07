@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -3029,18 +3029,9 @@ def serve():
     
     # Include homepage and dashboard routes
     @rt("/dashboard")
-    def dashboard(request: Request):
+    def dashboard():
         """Render the enhanced insect classification dashboard with Flowbite components and HTMX"""
-        # Get site parameter with default of "dunsay"
-        site = request.query_params.get("site", "dunsay")
-        
-        # Get appropriate stats based on site
-        if site == "dunsay":
-            # Use real data for Dunsay
-            stats = get_classification_stats()
-        else:
-            # Use placeholder data for other sites
-            stats = get_placeholder_stats()
+        stats = get_classification_stats()
         
         # Create navigation bar
         navbar = Div(
@@ -3069,61 +3060,38 @@ def serve():
             cls="w-full"
         )
         
-        # Site selector for switching between locations
-        site_selector = Div(
-            H3("Conservation Site", cls="font-semibold mb-2"),
-            Div(
-                Select(
-                    Option("Dunsay Nature Reserve", value="dunsay", selected="selected" if site == "dunsay" else None),
-                    Option("Site 2 (Demo)", value="site2", selected="selected" if site == "site2" else None),
-                    cls="select select-bordered w-full max-w-xs",
-                    id="site-selector",
-                    hx_get="/api/change-site",
-                    hx_trigger="change",
-                    hx_target="#dashboard-container",
-                    hx_indicator="#site-loading",
-                    hx_include="#site-selector"
-                ),
-                Span(
-                    Span(cls="loading loading-spinner loading-xs ml-2"),
-                    cls="htmx-indicator",
-                    id="site-loading"
-                ),
-                cls="flex items-center"
-            ),
-            cls="mb-6"
-        )
-        
         # Stats summary cards section
         summary_cards = Div(
             Div(
                 Div(
                     Div(
-                        H3("Total Classifications", cls="font-bold text-lg"),
-                        P(str(stats["total"]), cls="text-4xl font-semibold text-primary"),
-                        cls="p-6"
+                        Div(
+                            H3("Total Classifications", cls="font-bold text-lg"),
+                            P(str(stats["total"]), cls="text-4xl font-semibold text-primary"),
+                            cls="p-6"
+                        ),
+                        cls="bg-base-100 rounded-lg shadow-md border custom-border"
                     ),
-                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
-                ),
-                Div(
                     Div(
-                        H3("Single Images", cls="font-bold text-lg"),
-                        P(str(stats["total_single"]), cls="text-3xl font-semibold"),
-                        cls="p-6"
+                        Div(
+                            H3("Single Images", cls="font-bold text-lg"),
+                            P(str(stats["total_single"]), cls="text-3xl font-semibold"),
+                            cls="p-6"
+                        ),
+                        cls="bg-base-100 rounded-lg shadow-md border custom-border"
                     ),
-                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
-                ),
-                Div(
                     Div(
-                        H3("Batch Images", cls="font-bold text-lg"),
-                        P(str(stats["total_batch"]), cls="text-3xl font-semibold"),
-                        cls="p-6"
+                        Div(
+                            H3("Batch Images", cls="font-bold text-lg"),
+                            P(str(stats["total_batch"]), cls="text-3xl font-semibold"),
+                            cls="p-6"
+                        ),
+                        cls="bg-base-100 rounded-lg shadow-md border custom-border"
                     ),
-                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                    cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
                 ),
-                cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
-            ),
-            cls="mb-8"
+                cls="mb-8"
+            )
         )
         
         # Calculate data for the donut chart
@@ -3158,83 +3126,22 @@ def serve():
                 cls="mx-auto"
             ),
             
-            # HTMX-powered chart reload button with dropdown
+            # HTMX-powered chart reload button
             Div(
-                Div(
-                    # Dropdown button for chart type
-                    Div(
-                        Label(
-                            Span("Categories", id="chart-type-label"),
-                            Svg(
-                                Path(
-                                    stroke="currentColor",
-                                    stroke_linecap="round",
-                                    stroke_linejoin="round",
-                                    stroke_width="2",
-                                    d="m1 1 4 4 4-4"
-                                ),
-                                cls="w-2.5 h-2.5 ml-1.5",
-                                aria_hidden="true",
-                                xmlns="http://www.w3.org/2000/svg",
-                                fill="none",
-                                viewBox="0 0 10 6"
-                            ),
-                            tabindex="0",
-                            cls="btn btn-sm btn-outline flex items-center cursor-pointer",
-                        ),
-                        
-                        # Dropdown menu
-                        Ul(
-                            Li(
-                                A(
-                                    "Categories",
-                                    hx_get="/api/chart-data?type=categories&site=" + site,
-                                    hx_target="#donut-chart-container",
-                                    hx_trigger="click",
-                                    hx_indicator="#chart-loading",
-                                    onclick="document.getElementById('chart-type-label').innerText = 'Categories';"
-                                )
-                            ),
-                            Li(
-                                A(
-                                    "Confidence",
-                                    hx_get="/api/chart-data?type=confidence&site=" + site,
-                                    hx_target="#donut-chart-container",
-                                    hx_trigger="click",
-                                    hx_indicator="#chart-loading",
-                                    onclick="document.getElementById('chart-type-label').innerText = 'Confidence';"
-                                )
-                            ),
-                            Li(
-                                A(
-                                    "Feedback",
-                                    hx_get="/api/chart-data?type=feedback&site=" + site,
-                                    hx_target="#donut-chart-container",
-                                    hx_trigger="click",
-                                    hx_indicator="#chart-loading",
-                                    onclick="document.getElementById('chart-type-label').innerText = 'Feedback';"
-                                )
-                            ),
-                            tabindex="0",
-                            cls="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52 mt-1"
-                        ),
-                        cls="dropdown dropdown-end"
-                    ),
-                    Button(
-                        "Refresh Data",
-                        cls="btn btn-sm btn-outline btn-primary ml-2",
-                        hx_get="/api/chart-data?type=categories&site=" + site,
-                        hx_target="#donut-chart-container",
-                        hx_trigger="click",
-                        hx_indicator="#chart-loading"
-                    ),
-                    Span(
-                        Span(cls="loading loading-spinner loading-xs ml-2"),
-                        cls="htmx-indicator",
-                        id="chart-loading"
-                    ),
-                    cls="flex items-center justify-center mt-4"
+                Button(
+                    "Refresh Chart Data",
+                    cls="btn btn-sm btn-outline btn-primary mt-4",
+                    hx_get="/api/chart-data",
+                    hx_target="#donut-chart-container",
+                    hx_trigger="click",
+                    hx_indicator="#chart-loading"
                 ),
+                Span(
+                    Span(cls="loading loading-spinner loading-xs ml-2"),
+                    cls="htmx-indicator",
+                    id="chart-loading"
+                ),
+                cls="text-center mt-4"
             ),
             
             # ApexCharts initialization script
@@ -3340,34 +3247,16 @@ def serve():
                 // Set up HTMX event listener to update chart when new data is received
                 document.body.addEventListener('htmx:afterSwap', function(evt) {{
                     if (evt.detail.target.id === 'donut-chart-container') {{
+                        // Parse the new data (assuming JSON response)
                         try {{
-                            // Parse the new data (assuming JSON response)
                             const newData = JSON.parse(evt.detail.xhr.response);
-                            if (donutChart) {{
-                                donutChart.updateSeries(newData.counts);
-                                donutChart.updateOptions({{
-                                    labels: newData.labels
-                                }});
-                            }}
-                        }} catch(e) {{
-                            console.error('Error updating donut chart:', e);
-                        }}
-                    }}
-                }});
-                
-                // Handle site changes
-                document.addEventListener('siteChanged', function(evt) {{
-                    if (donutChart) {{
-                        // Refresh chart data for new site
-                        fetch(`/api/chart-data?type=categories&site=${{evt.detail.site}}`)
-                        .then(response => response.json())
-                        .then(data => {{
-                            donutChart.updateSeries(data.counts);
+                            donutChart.updateSeries(newData.counts);
                             donutChart.updateOptions({{
-                                labels: data.labels
+                                labels: newData.labels
                             }});
-                        }})
-                        .catch(error => console.error('Error updating chart on site change:', error));
+                        }} catch(e) {{
+                            console.error('Error updating chart:', e);
+                        }}
                     }}
                 }});
             }});
@@ -3384,265 +3273,160 @@ def serve():
                 
                 # HTMX-powered time range selector
                 Div(
-                    # Dropdown for time range
-                    Div(
-                        Label(
-                            Span("Last 7 days", id="time-range-label"),
-                            Svg(
-                                Path(
-                                    stroke="currentColor",
-                                    stroke_linecap="round",
-                                    stroke_linejoin="round",
-                                    stroke_width="2",
-                                    d="m1 1 4 4 4-4"
-                                ),
-                                cls="w-2.5 h-2.5 ml-1.5",
-                                aria_hidden="true",
-                                xmlns="http://www.w3.org/2000/svg",
-                                fill="none",
-                                viewBox="0 0 10 6"
-                            ),
-                            tabindex="0",
-                            cls="btn btn-sm btn-outline flex items-center cursor-pointer",
+                    Div(role="button", tabindex="0", cls="btn btn-sm btn-outline"),
+                    Span("Last 7 days", id="current-range"),
+                    Svg(
+                        Path(
+                            stroke="currentColor",
+                            stroke_linecap="round",
+                            stroke_linejoin="round",
+                            stroke_width="2",
+                            d="m1 1 4 4 4-4"
                         ),
-                        
-                        # Dropdown menu
-                        Ul(
-                            Li(
-                                A(
-                                    "Last 7 days",
-                                    hx_get=f"/api/chart-data?type=line&range=7d&site={site}",
-                                    hx_target="#line-chart-container",
-                                    hx_trigger="click",
-                                    hx_indicator="#line-loading",
-                                    onclick="document.getElementById('time-range-label').innerText = 'Last 7 days';"
-                                )
-                            ),
-                            Li(
-                                A(
-                                    "Last 30 days",
-                                    hx_get=f"/api/chart-data?type=line&range=30d&site={site}",
-                                    hx_target="#line-chart-container",
-                                    hx_trigger="click",
-                                    hx_indicator="#line-loading",
-                                    onclick="document.getElementById('time-range-label').innerText = 'Last 30 days';"
-                                )
-                            ),
-                            Li(
-                                A(
-                                    "Last 90 days",
-                                    hx_get=f"/api/chart-data?type=line&range=90d&site={site}",
-                                    hx_target="#line-chart-container",
-                                    hx_trigger="click",
-                                    hx_indicator="#line-loading",
-                                    onclick="document.getElementById('time-range-label').innerText = 'Last 90 days';"
-                                )
-                            ),
-                            tabindex="0",
-                            cls="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52 mt-1"
-                        ),
-                        cls="dropdown dropdown-end"
+                        cls="w-2.5 h-2.5 ml-1.5",
+                        aria_hidden="true",
+                        xmlns="http://www.w3.org/2000/svg",
+                        fill="none",
+                        viewBox="0 0 10 6"
                     ),
-                    
-                    cls="flex justify-between mb-4"
+                    cls="dropdown dropdown-end"
                 ),
                 
-                # Chart Container with Loading Indicator
-                Div(
-                    Div(id="line-chart-container", cls="w-full"),
-                    Div(
-                        Span(cls="loading loading-spinner loading-md text-primary"),
-                        id="line-loading",
-                        cls="htmx-indicator absolute inset-0 flex items-center justify-center bg-base-100 bg-opacity-60"
-                    ),
-                    cls="relative"
-                ),
-                
-                # Summary Statistics
-                Div(
-                    Div(
-                        P("Total", cls="text-sm text-base-content/70"),
-                        P(str(stats["total"]), cls="text-xl font-bold", id="total-classifications")
-                    ),
-                    Div(
-                        P("Average / Day", cls="text-sm text-base-content/70"),
-                        P(
-                            str(round(stats["total"] / len(stats["daily_counts"])) if stats["daily_counts"] else 0),
-                            cls="text-xl font-bold",
-                            id="avg-classifications"
-                        )
-                    ),
-                    Div(
-                        P("Trend", cls="text-sm text-base-content/70"),
-                        P(
-                            NotStr(trend_data["html"]),
-                            cls="text-xl font-bold",
-                            id="trend-indicator"
-                        )
-                    ),
-                    cls="grid grid-cols-3 gap-4 mt-4"
-                ),
-                
-                # Line Chart Initialization Script
-                Script(f"""
-                document.addEventListener('DOMContentLoaded', function() {{
-                    // Extract data from server-side rendering
-                    const dailyData = {json.dumps([{'date': date, 'count': count} for date, count in stats["daily_counts"]])};
-                    
-                    // Prepare data for ApexCharts
-                    const dates = dailyData.map(item => item.date);
-                    const counts = dailyData.map(item => item.count);
-                    
-                    // Initialize the line chart
-                    const lineChart = new ApexCharts(document.querySelector("#line-chart-container"), {{
-                        series: [{{
-                            name: 'Classifications',
-                            data: counts
-                        }}],
-                        chart: {{
-                            height: 300,
-                            type: 'line',
-                            fontFamily: 'inherit',
-                            foreColor: 'inherit',
-                            toolbar: {{
-                                show: false
-                            }},
-                            animations: {{
-                                enabled: true,
-                                easing: 'easeinout',
-                                speed: 800
-                            }}
-                        }},
-                        stroke: {{
-                            width: 3,
-                            curve: 'smooth'
-                        }},
-                        colors: ['oklch(47% 0.266 120.957)'], // Primary green color
-                        markers: {{
-                            size: 5,
-                            strokeWidth: 0,
-                            hover: {{
-                                size: 7
-                            }}
-                        }},
-                        xaxis: {{
-                            categories: dates,
-                            labels: {{
-                                rotateAlways: false,
-                                style: {{
-                                    fontSize: '12px'
-                                }}
-                            }}
-                        }},
-                        yaxis: {{
-                            title: {{
-                                text: 'Classifications'
-                            }},
-                            min: 0,
-                            forceNiceScale: true
-                        }},
-                        tooltip: {{
-                            shared: true,
-                            intersect: false,
-                            y: {{
-                                formatter: function(value) {{
-                                    return value + " classifications";
-                                }}
-                            }}
-                        }},
-                        grid: {{
-                            show: true,
-                            borderColor: 'var(--color-base-300)',
-                            strokeDashArray: 5,
-                            position: 'back'
-                        }},
-                        fill: {{
-                            type: 'gradient',
-                            gradient: {{
-                                shade: 'light',
-                                type: "vertical",
-                                shadeIntensity: 0.3,
-                                inverseColors: false,
-                                opacityFrom: 0.7,
-                                opacityTo: 0.2,
-                                stops: [0, 100]
-                            }}
-                        }}
-                    }});
-                    
-                    // Render the line chart
-                    lineChart.render();
-                    
-                    // Set up HTMX event listener to update chart when new data is received
-                    document.body.addEventListener('htmx:afterSwap', function(evt) {{
-                        if (evt.detail.target.id === 'line-chart-container') {{
-                            try {{
-                                // Parse the new data (assuming JSON response)
-                                const newData = JSON.parse(evt.detail.xhr.response);
-                                if (lineChart) {{
-                                    lineChart.updateSeries([{{
-                                        name: 'Classifications',
-                                        data: newData.counts
-                                    }}]);
-                                    lineChart.updateOptions({{
-                                        xaxis: {{
-                                            categories: newData.dates
-                                        }}
-                                    }});
-                                    
-                                    // Update summary statistics
-                                    if (newData.summary) {{
-                                        document.getElementById('total-classifications').innerText = newData.summary.total;
-                                        document.getElementById('avg-classifications').innerText = newData.summary.average;
-                                        if (newData.summary.trend_html) {{
-                                            document.getElementById('trend-indicator').innerHTML = newData.summary.trend_html;
-                                        }}
-                                    }}
-                                }}
-                            }} catch(e) {{
-                                console.error('Error updating line chart:', e);
-                            }}
-                        }}
-                    }});
-                    
-                    // Handle site changes
-                    document.addEventListener('siteChanged', function(evt) {{
-                        if (lineChart) {{
-                            // Refresh chart data for new site
-                            fetch(`/api/chart-data?type=line&range=7d&site=${{evt.detail.site}}`)
-                            .then(response => response.json())
-                            .then(data => {{
-                                lineChart.updateSeries([{{
-                                    name: 'Classifications',
-                                    data: data.counts
-                                }}]);
-                                lineChart.updateOptions({{
-                                    xaxis: {{
-                                        categories: data.dates
-                                    }}
-                                }});
-                                
-                                // Update summary statistics
-                                if (data.summary) {{
-                                    document.getElementById('total-classifications').innerText = data.summary.total;
-                                    document.getElementById('avg-classifications').innerText = data.summary.average;
-                                    if (data.summary.trend_html) {{
-                                        document.getElementById('trend-indicator').innerHTML = data.summary.trend_html;
-                                    }}
-                                }}
-                            }})
-                            .catch(error => console.error('Error updating line chart on site change:', error));
-                        }}
-                    }});
-                }});
-                """),
-                
-                cls="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                cls="flex justify-between mb-4"
             ),
+            
+            # Chart Container with Loading Indicator
+            Div(
+                Div(id="line-chart-container", cls="w-full"),
+                Div(
+                    Span(cls="loading loading-spinner loading-md text-primary"),
+                    id="line-loading",
+                    cls="htmx-indicator absolute inset-0 flex items-center justify-center bg-base-100 bg-opacity-60"
+                ),
+                cls="relative"
+            ),
+            
+            # Summary Statistics
+            Div(
+                Div(
+                    P("Total", cls="text-sm text-base-content/70"),
+                    P(str(stats["total"]), cls="text-xl font-bold", id="total-classifications")
+                ),
+                Div(
+                    P("Average / Day", cls="text-sm text-base-content/70"),
+                    P(
+                        str(round(stats["total"] / len(stats["daily_counts"])) if stats["daily_counts"] else 0),
+                        cls="text-xl font-bold",
+                        id="avg-classifications"
+                    )
+                ),
+                Div(
+                    P("Trend", cls="text-sm text-base-content/70"),
+                    P(
+                        NotStr(trend_data["html"]),
+                        cls="text-xl font-bold",
+                        id="trend-indicator"
+                    )
+                ),
+                cls="grid grid-cols-3 gap-4 mt-4"
+            ),
+            
+            # Line Chart Initialization Script
+            Script(f"""
+            document.addEventListener('DOMContentLoaded', function() {{
+                // Extract data from server-side rendering
+                const dailyData = {json.dumps([{'date': date, 'count': count} for date, count in stats["daily_counts"]])};
+                
+                // Prepare data for ApexCharts
+                const dates = dailyData.map(item => item.date);
+                const counts = dailyData.map(item => item.count);
+                
+                // Initialize the line chart
+                const lineChart = new ApexCharts(document.querySelector("#line-chart-container"), {{
+                    series: [{{
+                        name: 'Classifications',
+                        data: counts
+                    }}],
+                    chart: {{
+                        height: 300,
+                        type: 'line',
+                        fontFamily: 'inherit',
+                        foreColor: 'inherit',
+                        toolbar: {{
+                            show: false
+                        }},
+                        animations: {{
+                            enabled: true,
+                            easing: 'easeinout',
+                            speed: 800
+                        }}
+                    }},
+                    stroke: {{
+                        width: 3,
+                        curve: 'smooth'
+                    }},
+                    colors: ['oklch(47% 0.266 120.957)'], // Primary green color
+                    markers: {{
+                        size: 5,
+                        strokeWidth: 0,
+                        hover: {{
+                            size: 7
+                        }}
+                    }},
+                    xaxis: {{
+                        categories: dates,
+                        labels: {{
+                            rotateAlways: false,
+                            style: {{
+                                fontSize: '12px'
+                            }}
+                        }}
+                    }},
+                    yaxis: {{
+                        title: {{
+                            text: 'Classifications'
+                        }},
+                        min: 0,
+                        forceNiceScale: true
+                    }},
+                    tooltip: {{
+                        shared: true,
+                        intersect: false,
+                        y: {{
+                            formatter: function(value) {{
+                                return value + " classifications";
+                            }}
+                        }}
+                    }},
+                    grid: {{
+                        show: true,
+                        borderColor: 'var(--color-base-300)',
+                        strokeDashArray: 5,
+                        position: 'back'
+                    }},
+                    fill: {{
+                        type: 'gradient',
+                        gradient: {{
+                            shade: 'light',
+                            type: "vertical",
+                            shadeIntensity: 0.3,
+                            inverseColors: false,
+                            opacityFrom: 0.7,
+                            opacityTo: 0.2,
+                            stops: [0, 100]
+                        }}
+                    }}
+                }});
+                
+                // Render the line chart
+                lineChart.render();
+            }});
+            """),
+            
             cls="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border"
         )
         
-        # Charts Section
+        # Charts Section with added comparison chart and plant diversity chart
         charts_section = Div(
             H2("Classification Overview", cls="text-xl font-bold mb-4 text-bee-green"),
             Div(
@@ -3654,83 +3438,118 @@ def serve():
                     line_chart,
                     cls="w-full lg:w-1/2"
                 ),
-                cls="flex flex-col lg:flex-row gap-6 w-full"
+                cls="flex flex-col lg:flex-row gap-6 w-full mb-6"
+            ),
+            
+            # New Time Comparison Chart (added)
+            Div(
+                NotStr("""
+                <div class="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border">
+                <div class="flex justify-between items-center mb-4">
+                    <div>
+                    <h3 class="text-xl font-semibold text-bee-green">Classification Comparison</h3>
+                    <p class="text-base-content/70 text-sm">Compare classifications over time</p>
+                    </div>
+                    <div class="flex items-center">
+                    <span id="comparison-growth" class="text-green-500 text-xl font-bold mr-1">23%</span>
+                    <svg id="comparison-growth-icon" class="w-3 h-3" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 10 14">
+                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13V1m0 0L1 5m4-4 4 4"/>
+                    </svg>
+                    </div>
+                </div>
+                
+                <div id="comparison-chart" class="w-full h-64"></div>
+                
+                <div class="flex justify-between items-center pt-5 border-t border-base-300 mt-4">
+                    <!-- Period selector dropdown -->
+                    <div class="dropdown">
+                    <button 
+                        id="comparison-dropdown-button"
+                        class="text-sm font-medium text-base-content/70 hover:text-base-content text-center inline-flex items-center"
+                        type="button">
+                        <span id="current-period-text">Week-over-Week</span>
+                        <svg class="w-2.5 m-2.5 ms-1.5" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 10 6">
+                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m1 1 4 4 4-4"/>
+                        </svg>
+                    </button>
+                    <div id="comparison-dropdown" class="dropdown-content hidden z-10 bg-base-100 shadow-lg rounded-lg w-44">
+                        <ul class="py-2 text-sm">
+                        <li><a href="#" data-period="year" class="block px-4 py-2 hover:bg-base-200">Year-over-Year</a></li>
+                        <li><a href="#" data-period="month" class="block px-4 py-2 hover:bg-base-200">Month-over-Month</a></li>
+                        <li><a href="#" data-period="week" class="block px-4 py-2 hover:bg-base-200">Week-over-Week</a></li>
+                        </ul>
+                    </div>
+                    </div>
+                    
+                    <!-- View detailed report link -->
+                    <a href="/detailed-comparison-report" class="uppercase text-sm font-semibold inline-flex items-center text-primary hover:underline">
+                    Detailed Report
+                    <svg class="w-2.5 h-2.5 ms-1.5" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 6 10">
+                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m1 9 4-4-4-4"/>
+                    </svg>
+                    </a>
+                </div>
+                </div>
+                """),
+                cls="w-full mb-6"
+            ),
+            
+            # New Plant Diversity Radial Chart (added)
+            Div(
+                NotStr("""
+                <div class="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 class="text-xl font-semibold text-bee-green">Plant Classification Diversity</h3>
+                    
+                    <!-- Information tooltip -->
+                    <div class="dropdown dropdown-end">
+                    <button class="text-base-content/50 hover:text-base-content">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                    </button>
+                    <div class="dropdown-content card compact bg-base-100 shadow-lg rounded-box w-64 p-2 text-sm">
+                        <div class="card-body">
+                        <h3 class="font-semibold">Plant Diversity Analysis</h3>
+                        <p>Shows the percentage distribution of plant types identified in insect habitat images.</p>
+                        </div>
+                    </div>
+                    </div>
+                </div>
+                
+                <!-- Radial chart container -->
+                <div id="plant-diversity-chart" class="w-full h-80"></div>
+                
+                <!-- Footer actions -->
+                <div class="flex justify-end mt-4 pt-4 border-t border-base-300">
+                    <a href="/plant-diversity-report" class="text-sm font-semibold text-primary hover:underline inline-flex items-center">
+                    View Full Biodiversity Report
+                    <svg class="w-2.5 h-2.5 ms-1.5" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 6 10">
+                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m1 9 4-4-4-4"/>
+                    </svg>
+                    </a>
+                </div>
+                </div>
+                """),
+                cls="w-full"
             ),
             cls="mb-8"
         )
-
-        # Map Section - Using real data for Dunsay, placeholder for Site 2
-        if site == "dunsay":
-            # Real data for Dunsay
-            map_content = NotStr('<iframe src="https://restor.eco/embed/sites/ce616eed-268b-43a7-87cc-181c801709fa/" title="Bionua Project at Dunsany Nature Reserve" width="100%" height="500" style="border: none; border-radius: 0.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);" frameborder="0"></iframe>')
-            map_title = "Bionua Project at Dunsay Nature Reserve"
-        else:
-            # Placeholder visualization for Site 2
-            map_content = Div(
-                H3("Site 2 - Placeholder Data", cls="text-lg font-semibold mb-4"),
-                P("This is a demonstration site showing placeholder data for visualization purposes.", cls="mb-4"),
-                # Placeholder visualization
-                Div(
-                    id="placeholder-chart",
-                    cls="h-64 bg-base-200 rounded-lg flex items-center justify-center"
-                ),
-                # Placeholder chart initialization
-                Script("""
-                document.addEventListener('DOMContentLoaded', function() {
-                    const placeholderChart = new ApexCharts(document.querySelector("#placeholder-chart"), {
-                        series: [{
-                            name: 'Pollinators',
-                            data: [31, 40, 28, 51, 42, 82, 56]
-                        }],
-                        chart: {
-                            height: 250,
-                            type: 'area',
-                            fontFamily: 'inherit',
-                            foreColor: 'inherit',
-                            animations: {
-                                enabled: true
-                            }
-                        },
-                        dataLabels: {
-                            enabled: false
-                        },
-                        stroke: {
-                            curve: 'smooth'
-                        },
-                        xaxis: {
-                            categories: ["Day 1", "Day 2", "Day 3", "Day 4", "Day 5", "Day 6", "Day 7"]
-                        },
-                        fill: {
-                            type: 'gradient',
-                            gradient: {
-                                shade: 'dark',
-                                gradientToColors: [ '#FDD835'],
-                                shadeIntensity: 1,
-                                type: 'horizontal',
-                                opacityFrom: 1,
-                                opacityTo: 1
-                            },
-                        },
-                    });
-                    placeholderChart.render();
-                });
-                """)
-            )
-            map_title = "Site 2 (Demo)"
         
+        # Map Section
         map_section = Div(
             H2("Conservation Project Map", cls="text-xl font-bold mb-4 text-bee-green"),
             Div(
                 Div(
-                    P(f"View our conservation area at {map_title}:", 
+                    P("View our conservation area at Bionua Project, Dunsany Nature Reserve:", 
                     cls="text-base mb-2"),
-                    map_content,
+                    # Map iframe with responsive styling
+                    NotStr('<iframe src="https://restor.eco/embed/sites/ce616eed-268b-43a7-87cc-181c801709fa/" title="Bionua Project at Dunsany Nature Reserve" width="100%" height="500" style="border: none; border-radius: 0.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);" frameborder="0"></iframe>'),
                     cls="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border"
                 ),
                 cls="w-full mb-8"
             ),
-            cls="mb-8",
-            id="site-data-container"
+            cls="mb-8"
         )
         
         # Confidence & Feedback Section
@@ -3822,7 +3641,7 @@ def serve():
                     ),
                     "Refresh",
                     cls="btn btn-sm btn-outline btn-primary",
-                    hx_get=f"/api/recent-classifications?site={site}",
+                    hx_get="/api/recent-classifications",
                     hx_target="#classifications-table-container",
                     hx_trigger="click",
                     hx_indicator="#table-loading"
@@ -3910,7 +3729,8 @@ def serve():
                             for id, category, confidence, feedback, created_at, context_source in stats["recent_classifications"]
                         ]
                     ),
-                    cls="table table-zebra w-full"
+                    cls="table table-zebra w-full",
+                    id="recent-classifications-table"
                 ),
                 id="classifications-table-container",
                 cls="overflow-x-auto"
@@ -3918,7 +3738,323 @@ def serve():
             cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
         )
         
-        # Flowbite Table for All Classifications (omitted for brevity)
+        # Flowbite Table for All Classifications
+        flowbite_table = Div(
+            Div(
+                H3("All Classifications", cls="font-semibold mb-3"),
+                
+                # Search and Filter Controls
+                Div(
+                    # Search input with HTMX
+                    Div(
+                        Div(
+                            Svg(
+                                Path(
+                                    stroke="currentColor",
+                                    stroke_linecap="round",
+                                    stroke_linejoin="round",
+                                    stroke_width="2",
+                                    d="m19 19-4-4m0-7A7 7 0 1 1 1 8a7 7 0 0 1 14 0Z"
+                                ),
+                                cls="w-4 h-4 text-gray-500 dark:text-gray-400",
+                                aria_hidden="true",
+                                xmlns="http://www.w3.org/2000/svg",
+                                fill="none",
+                                viewBox="0 0 20 20"
+                            ),
+                            cls="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none"
+                        ),
+                        Input(
+                            type="text",
+                            id="classification-search",
+                            cls="block w-full p-2 pl-10 text-sm border border-base-300 rounded-lg bg-base-100",
+                            placeholder="Search classifications...",
+                            hx_post="/api/search-classifications",
+                            hx_trigger="keyup changed delay:500ms",
+                            hx_target="#flowbite-table-body",
+                            hx_indicator="#search-indicator"
+                        ),
+                        Div(
+                            Span(cls="loading loading-spinner loading-xs"),
+                            id="search-indicator",
+                            cls="htmx-indicator absolute inset-y-0 right-0 flex items-center pr-3"
+                        ),
+                        cls="relative w-full sm:w-64"
+                    ),
+                    
+                    # Category filter dropdown
+                    Select(
+                        Option("All Categories", value=""),
+                        *[
+                            Option(category, value=category)
+                            for category, _ in stats["category_counts"]
+                        ],
+                        cls="block w-full sm:w-auto p-2 text-sm border border-base-300 rounded-lg bg-base-100",
+                        hx_post="/api/filter-classifications",
+                        hx_trigger="change",
+                        hx_target="#flowbite-table-body",
+                        hx_indicator="#filter-indicator"
+                    ),
+                    Span(
+                        cls="htmx-indicator loading loading-spinner loading-xs ml-2",
+                        id="filter-indicator"
+                    ),
+                    
+                    cls="flex flex-col sm:flex-row gap-3 w-full md:w-auto"
+                ),
+                
+                cls="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4"
+            ),
+            
+            # Flowbite Table Container
+            Div(
+                Table(
+                    # Table Head
+                    Thead(
+                        Tr(
+                            Th(
+                                Span("Image", cls="flex items-center"),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Category",
+                                    A(
+                                        Svg(
+                                            Path(
+                                                d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"
+                                            ),
+                                            cls="w-3 h-3",
+                                            aria_hidden="true",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="currentColor",
+                                            viewBox="0 0 24 24"
+                                        ),
+                                        href="#",
+                                        cls="ml-1.5",
+                                        hx_get="/api/sort-classifications?field=category&dir=asc",
+                                        hx_target="#flowbite-table-body"
+                                    ),
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Confidence",
+                                    A(
+                                        Svg(
+                                            Path(
+                                                d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"
+                                            ),
+                                            cls="w-3 h-3",
+                                            aria_hidden="true",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="currentColor",
+                                            viewBox="0 0 24 24"
+                                        ),
+                                        href="#",
+                                        cls="ml-1.5",
+                                        hx_get="/api/sort-classifications?field=confidence&dir=asc",
+                                        hx_target="#flowbite-table-body"
+                                    ),
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Feedback",
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Date",
+                                    A(
+                                        Svg(
+                                            Path(
+                                                d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"
+                                            ),
+                                            cls="w-3 h-3",
+                                            aria_hidden="true",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="currentColor",
+                                            viewBox="0 0 24 24"
+                                        ),
+                                        href="#",
+                                        cls="ml-1.5",
+                                        hx_get="/api/sort-classifications?field=date&dir=desc",
+                                        hx_target="#flowbite-table-body"
+                                    ),
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Span("Actions", cls="sr-only"),
+                                scope="col",
+                                cls="px-6 py-3"
+                            )
+                        )
+                    ),
+                    
+                    # Table Body with HTMX support
+                    Tbody(
+                        NotStr(generate_flowbite_table_rows(stats["recent_classifications"])),
+                        id="flowbite-table-body"
+                    ),
+                    
+                    cls="w-full text-sm text-left text-gray-500 dark:text-gray-400 flowbite-table",
+                    id="all-classifications-table"
+                ),
+                # Pagination with HTMX
+                Nav(
+                    Span(
+                        "Showing ",
+                        Span("1-10", cls="font-semibold text-gray-900 dark:text-white"),
+                        " of ",
+                        Span(str(stats["total_single"]), cls="font-semibold text-gray-900 dark:text-white"),
+                        cls="text-sm font-normal text-gray-500 dark:text-gray-400"
+                    ),
+                    Ul(
+                        Li(
+                            A(
+                                "Previous",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 ml-0 leading-tight text-gray-500 bg-white border border-gray-300 rounded-l-lg hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=prev",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "1",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=1",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "2",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=2",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "3",
+                                aria_current="page",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 text-blue-600 border border-gray-300 bg-blue-50 hover:bg-blue-100 hover:text-blue-700 dark:border-gray-700 dark:bg-gray-700 dark:text-white",
+                                hx_get="/api/classifications-page?page=3",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "Next",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 rounded-r-lg hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=next",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        cls="inline-flex -space-x-px text-sm h-8"
+                    ),
+                    cls="flex items-center justify-between p-4",
+                    aria_label="Table navigation"
+                ),
+                
+                cls="relative overflow-x-auto shadow-md sm:rounded-lg"
+            ),
+            cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border mb-8"
+        )
+        
+        # Tables Section with Tab Navigation
+        tables_section = Div(
+            H2("Classification Results", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                # Tab navigation
+                Div(
+                    Div(
+                        Div(role="tablist", cls="tabs tabs-boxed bg-base-200 p-1 mb-6"),
+                        
+                        Button(
+                            "Recent Classifications", 
+                            cls="tab tab-active",
+                            id="tab-recent",
+                            onclick="showTab('recent')",
+                            role="tab",
+                            aria_selected="true"
+                        ),
+                        
+                        Button(
+                            "All Classifications", 
+                            cls="tab",
+                            id="tab-all",
+                            onclick="showTab('all')",
+                            role="tab",
+                            aria_selected="false"
+                        ),
+                        
+                        cls="flex justify-center"
+                    ),
+                    
+                    # Tab content containers
+                    Div(
+                        # DaisyUI Table Content
+                        Div(
+                            daisyui_table,
+                            id="tab-content-recent",
+                            cls="block"
+                        ),
+                        
+                        # Flowbite Table Content
+                        Div(
+                            flowbite_table,
+                            id="tab-content-all",
+                            cls="hidden"
+                        ),
+                        
+                        cls="w-full"
+                    ),
+                    
+                    # Simple tab switching script
+                    Script("""
+                    function showTab(tabName) {
+                        // Hide all tab contents
+                        document.getElementById('tab-content-recent').classList.add('hidden');
+                        document.getElementById('tab-content-all').classList.add('hidden');
+                        
+                        // Deactivate all tabs
+                        document.getElementById('tab-recent').classList.remove('tab-active');
+                        document.getElementById('tab-all').classList.remove('tab-active');
+                        
+                        // Show selected tab content
+                        document.getElementById('tab-content-' + tabName).classList.remove('hidden');
+                        
+                        // Activate selected tab
+                        document.getElementById('tab-' + tabName).classList.add('tab-active');
+                    }
+                    """),
+                    
+                    cls="w-full"
+                ),
+                cls="w-full"
+            ),
+            cls="mb-8"
+        )
         
         # Context Sources Section (for RAG stats)
         rag_section = Div(
@@ -3956,120 +4092,384 @@ def serve():
             cls="mb-8"
         )
         
-        # Add helper script for site selector
-        site_selector_script = Script("""
+        # Add script for the charts and table export functionality
+        chart_scripts = Script("""
+        // Chart creation functions
         document.addEventListener('DOMContentLoaded', function() {
-            // Set up site selector
-            const siteSelector = document.getElementById('site-selector');
-            if (siteSelector) {
-                siteSelector.addEventListener('change', function() {
-                    // Site changed
-                    const newSite = this.value;
-                    console.log('Site changed to:', newSite);
-                    
-                    // Update URL without reloading page
-                    const url = new URL(window.location);
-                    url.searchParams.set('site', newSite);
-                    window.history.pushState({}, '', url);
-                    
-                    // Trigger site change event for charts
-                    document.dispatchEvent(new CustomEvent('siteChanged', { 
-                        detail: { site: newSite } 
-                    }));
+            // Time Comparison Chart
+            function createComparisonChart() {
+            // Initialize the ApexCharts with multiple data series
+            const comparisonChart = new ApexCharts(document.querySelector("#comparison-chart"), {
+                series: [
+                {
+                    name: "Current Period",
+                    data: [31, 40, 28, 51, 42, 82, 56]
+                },
+                {
+                    name: "Previous Period", 
+                    data: [11, 32, 45, 32, 34, 52, 41]
+                }
+                ],
+                chart: {
+                height: 300,
+                type: 'line',
+                fontFamily: 'inherit',
+                foreColor: 'inherit',
+                toolbar: {
+                    show: false
+                },
+                animations: {
+                    enabled: true,
+                    easing: 'easeinout',
+                    speed: 800
+                }
+                },
+                colors: ['oklch(47% 0.266 120.957)', 'oklch(74% 0.234 93.635)'], // Green and yellow bee colors
+                stroke: {
+                width: 3,
+                curve: 'smooth'
+                },
+                grid: {
+                show: true,
+                borderColor: 'var(--color-base-300)',
+                strokeDashArray: 5,
+                },
+                markers: {
+                size: 5,
+                strokeWidth: 0,
+                hover: {
+                    size: 7
+                }
+                },
+                xaxis: {
+                categories: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                labels: {
+                    style: {
+                    fontSize: '12px'
+                    }
+                }
+                },
+                yaxis: {
+                title: {
+                    text: 'Classifications'
+                },
+                min: 0,
+                forceNiceScale: true
+                },
+                legend: {
+                position: 'top',
+                horizontalAlign: 'right',
+                fontSize: '14px'
+                },
+                tooltip: {
+                shared: true,
+                intersect: false,
+                y: {
+                    formatter: function(value) {
+                    return value + " classifications";
+                    }
+                }
+                },
+                fill: {
+                type: 'gradient',
+                gradient: {
+                    shade: 'light',
+                    type: "vertical",
+                    shadeIntensity: 0.3,
+                    inverseColors: false,
+                    opacityFrom: 0.7,
+                    opacityTo: 0.2,
+                    stops: [0, 100]
+                }
+                }
+            });
+            
+            // Render the chart
+            comparisonChart.render();
+            
+            // Set up period comparison change handlers
+            document.querySelectorAll('#comparison-dropdown a').forEach(item => {
+                item.addEventListener('click', function(e) {
+                e.preventDefault();
+                const period = this.getAttribute('data-period');
+                const currentPeriodText = document.getElementById('current-period-text');
+                
+                // Update button text
+                currentPeriodText.textContent = this.textContent;
+                
+                // Sample data for different periods (would fetch from API in real app)
+                const periodData = {
+                    'year': {
+                    current: [120, 150, 180, 210, 250, 320, 410],
+                    previous: [100, 130, 160, 190, 220, 270, 350]
+                    },
+                    'month': {
+                    current: [45, 52, 38, 65, 72, 56, 81],
+                    previous: [38, 45, 32, 58, 61, 48, 72]
+                    },
+                    'week': {
+                    current: [31, 40, 28, 51, 42, 82, 56],
+                    previous: [11, 32, 45, 32, 34, 52, 41]
+                    }
+                };
+                
+                // Update chart with new data
+                comparisonChart.updateSeries([
+                    {
+                    name: "Current Period",
+                    data: periodData[period].current
+                    },
+                    {
+                    name: "Previous Period",
+                    data: periodData[period].previous
+                    }
+                ]);
+                
+                // Calculate growth percentage
+                const currentTotal = periodData[period].current.reduce((a, b) => a + b, 0);
+                const previousTotal = periodData[period].previous.reduce((a, b) => a + b, 0);
+                const growth = Math.round(((currentTotal - previousTotal) / previousTotal) * 100);
+                
+                // Update growth indicator
+                const growthIndicator = document.getElementById('comparison-growth');
+                growthIndicator.textContent = growth + '%';
+                
+                // Update growth icon and color
+                const growthIcon = document.getElementById('comparison-growth-icon');
+                if (growth > 0) {
+                    growthIndicator.classList.remove('text-red-500');
+                    growthIndicator.classList.add('text-green-500');
+                    growthIcon.innerHTML = '<path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13V1m0 0L1 5m4-4 4 4"/>';
+                } else {
+                    growthIndicator.classList.remove('text-green-500');
+                    growthIndicator.classList.add('text-red-500');
+                    growthIcon.innerHTML = '<path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 1v12m0 0 4-4m-4 4-4-4"/>';
+                }
                 });
+            });
             }
+            
+            // Plant Diversity Radial Chart
+            function createPlantDiversityChart() {
+            const plantDiversityChart = new ApexCharts(document.querySelector("#plant-diversity-chart"), {
+                series: [76, 45, 32, 18, 10],
+                chart: {
+                height: 320,
+                type: 'radialBar',
+                },
+                plotOptions: {
+                radialBar: {
+                    dataLabels: {
+                    name: {
+                        fontSize: '14px',
+                        fontFamily: 'inherit',
+                        fontWeight: 'medium',
+                        color: 'var(--color-base-content)'
+                    },
+                    value: {
+                        fontSize: '16px',
+                        fontFamily: 'inherit',
+                        fontWeight: 'bold',
+                        formatter: function (val) {
+                        return val + '%';
+                        }
+                    },
+                    total: {
+                        show: true,
+                        label: 'Plant Types',
+                        formatter: function (w) {
+                        // Calculate the average of all values
+                        return Math.round(w.globals.seriesTotals.reduce((a, b) => a + b, 0) / w.globals.series.length) + '%';
+                        }
+                    }
+                    },
+                    track: {
+                    background: 'var(--color-base-200)',
+                    strokeWidth: '100%',
+                    margin: 5
+                    },
+                    hollow: {
+                    size: '35%'
+                    }
+                }
+                },
+                colors: [
+                'oklch(47% 0.266 120.957)',    // Green - primary
+                'oklch(74% 0.234 93.635)',     // Yellow - secondary
+                'oklch(41% 0.234 41.252)',     // Brown - accent
+                '#43A047',                     // Additional green
+                '#8D6E63'                      // Additional brown
+                ],
+                labels: ['Flowering Plants', 'Grasses', 'Shrubs', 'Trees', 'Other'],
+                legend: {
+                show: true,
+                position: 'bottom',
+                fontFamily: 'inherit',
+                fontSize: '13px',
+                offsetY: 10
+                }
+            });
+            
+            plantDiversityChart.render();
+            }
+            
+            // Table export functionality
+            function setupTableExports() {
+            // Function to export table data to CSV
+            function exportTableToCSV(tableId, filename = 'download') {
+                const table = document.getElementById(tableId);
+                if (!table) {
+                console.error(`Table with ID ${tableId} not found`);
+                return;
+                }
+                
+                // Get all table rows
+                const rows = table.querySelectorAll('tr');
+                
+                // Prepare CSV content
+                let csvContent = [];
+                
+                // Process header row
+                const headerRow = rows[0];
+                const headers = headerRow.querySelectorAll('th');
+                const headerValues = [];
+                
+                headers.forEach(header => {
+                // Extract text content without the sort icons
+                let headerText = header.textContent.trim();
+                // Remove any extra whitespace
+                headerText = headerText.replace(/\\s+/g, ' ');
+                headerValues.push(`"${headerText}"`);
+                });
+                
+                csvContent.push(headerValues.join(','));
+                
+                // Process data rows (skip header row)
+                for (let i = 1; i < rows.length; i++) {
+                const row = rows[i];
+                const cells = row.querySelectorAll('td');
+                const rowValues = [];
+                
+                cells.forEach(cell => {
+                    // Extract text and wrap in quotes to handle commas in data
+                    rowValues.push(`"${cell.textContent.trim()}"`);
+                });
+                
+                csvContent.push(rowValues.join(','));
+                }
+                
+                // Create a CSV string
+                const csvString = csvContent.join('\\n');
+                
+                // Create a download link and trigger it
+                const link = document.createElement('a');
+                link.setAttribute('href', 'data:text/csv;charset=utf-8,' + encodeURIComponent(csvString));
+                link.setAttribute('download', `${filename}.csv`);
+                link.style.display = 'none';
+                
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+            
+            // Add export buttons to each table
+            const tables = document.querySelectorAll('table');
+            tables.forEach((table, index) => {
+                const tableId = table.id || `table-${index}`;
+                
+                // Ensure the table has an ID
+                if (!table.id) {
+                table.id = tableId;
+                }
+                
+                // Create export controls container
+                const exportContainer = document.createElement('div');
+                exportContainer.className = 'flex justify-end mb-4';
+                
+                // Create dropdown for export options
+                exportContainer.innerHTML = `
+                <div class="dropdown dropdown-end">
+                    <button class="btn btn-sm btn-outline">
+                    Export
+                    <svg class="w-4 h-4 ml-1" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                    </svg>
+                    </button>
+                    <ul class="dropdown-content menu p-2 shadow bg-base-100 rounded-box w-52">
+                    <li><a href="#" data-export="csv" data-table="${tableId}">Export as CSV</a></li>
+                    <li><a href="#" data-export="excel" data-table="${tableId}">Export as Excel</a></li>
+                    <li><a href="#" data-export="pdf" data-table="${tableId}">Export as PDF</a></li>
+                    </ul>
+                </div>
+                `;
+                
+                // Insert export controls before the table
+                table.parentNode.insertBefore(exportContainer, table);
+                
+                // Add event listeners for export buttons
+                exportContainer.querySelectorAll('[data-export]').forEach(button => {
+                button.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    const format = button.getAttribute('data-export');
+                    const targetTable = button.getAttribute('data-table');
+                    
+                    if (format === 'csv') {
+                    exportTableToCSV(targetTable, `table-export-${Date.now()}`);
+                    } else {
+                    // For other formats, you might need additional libraries
+                    // This is a placeholder for future implementation
+                    alert(`Export as ${format.toUpperCase()} will be implemented soon!`);
+                    }
+                });
+                });
+            });
+            }
+            
+            // Initialize everything
+            if (document.querySelector("#comparison-chart")) {
+                createComparisonChart();
+            }
+            
+            if (document.querySelector("#plant-diversity-chart")) {
+                createPlantDiversityChart();
+            }
+            
+            setupTableExports();
+            
+            // Set up dropdown toggles
+            document.getElementById('comparison-dropdown-button')?.addEventListener('click', function() {
+                document.getElementById('comparison-dropdown').classList.toggle('hidden');
+            });
+            
+            // Close dropdowns when clicking outside
+            document.addEventListener('click', function(e) {
+                if (!e.target.closest('#comparison-dropdown-button')) {
+                    const dropdown = document.getElementById('comparison-dropdown');
+                    if (dropdown && !dropdown.classList.contains('hidden')) {
+                        dropdown.classList.add('hidden');
+                    }
+                }
+            });
         });
         """)
-        
-        # Assemble full dashboard with site selector
-        dashboard_container = Div(
-            H1("Classification Dashboard", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
-            P("Statistics and insights from the Insect Classifier with RAG", cls="text-center mb-8 text-base-content/70"),
-            navbar,
-            site_selector,
-            summary_cards,
-            charts_section,
-            map_section,
-            confidence_feedback_section,
-            daisyui_table,
-            rag_section,
-            site_selector_script,
-            cls="container mx-auto px-4 py-8 max-w-7xl",
-            id="dashboard-container"
-        )
-        
+
         return Title("Dashboard - Insect Classifier"), Main(
-            dashboard_container,
+            chart_scripts,  # Add the scripts for charts and table export
+            Div(
+                H1("Classification Dashboard", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
+                P("Statistics and insights from the Insect Classifier with RAG", cls="text-center mb-8 text-base-content/70"),
+                navbar,
+                summary_cards,
+                charts_section,
+                map_section,
+                confidence_feedback_section,
+                tables_section,
+                rag_section,
+                cls="container mx-auto px-4 py-8 max-w-7xl"
+            ),
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
-
-    # Helper function for placeholder stats
-    def get_placeholder_stats():
-        """Generate placeholder statistics for demonstration"""
-        import random
-        import datetime
-        
-        # Create placeholder category counts
-        category_counts = [
-            ("Bumblebees", 45),
-            ("Solitary bees", 36),
-            ("Honeybee", 78),
-            ("Wasps", 22),
-            ("Hoverflies", 18),
-            ("Butterflies & Moths", 32),
-            ("Beetles (>3mm)", 15),
-            ("Small insects (<3mm)", 12),
-            ("Other insects", 9),
-            ("Other flies", 7)
-        ]
-        
-        # Create placeholder daily counts - upward trend for visual interest
-        today = datetime.datetime.now().date()
-        daily_counts = []
-        for i in range(14):
-            day = today - datetime.timedelta(days=13-i)
-            # Create an upward trend with some random variation
-            count = 5 + int(i * 1.5) + random.randint(-2, 5)
-            daily_counts.append((day.strftime("%Y-%m-%d"), count))
-        
-        # Return placeholder stats dictionary
-        return {
-            "category_counts": category_counts,
-            "combined_category_counts": category_counts,
-            "confidence_counts": [
-                ("High", 120),
-                ("Medium", 95),
-                ("Low", 45)
-            ],
-            "feedback_counts": [
-                ("positive", 85),
-                ("negative", 15)
-            ],
-            "recent_classifications": [
-                ("demo123", "Honeybee", "High", "positive", "2025-05-05 14:30:00", "Demo Source"),
-                ("demo124", "Bumblebees", "Medium", None, "2025-05-05 14:25:00", "Demo Source"),
-                ("demo125", "Solitary bees", "High", "positive", "2025-05-05 14:20:00", "Demo Source"),
-                ("demo126", "Wasps", "Medium", "negative", "2025-05-05 14:15:00", "Demo Source"),
-                ("demo127", "Hoverflies", "Low", None, "2025-05-05 14:10:00", "Demo Source"),
-                ("demo128", "Butterflies & Moths", "High", "positive", "2025-05-05 14:05:00", "Demo Source"),
-                ("demo129", "Beetles (>3mm)", "Medium", None, "2025-05-05 14:00:00", "Demo Source"),
-                ("demo130", "Honeybee", "High", "positive", "2025-05-05 13:55:00", "Demo Source"),
-                ("demo131", "Bumblebees", "Low", "negative", "2025-05-05 13:50:00", "Demo Source"),
-                ("demo132", "Solitary bees", "Medium", None, "2025-05-05 13:45:00", "Demo Source")
-            ],
-            "daily_counts": daily_counts,
-            "context_counts": [
-                ("Demo Guide Page 12", 45),
-                ("Demo Guide Page 8", 32),
-                ("Demo Reference Book Page 15", 28),
-                ("Demo Field Guide Page 23", 21),
-                ("Demo Research Paper Page 7", 18)
-            ],
-            "total_single": 180,
-            "total_batch": 80,
-            "total": 260
-        }
     
     #
     @rt("/")
