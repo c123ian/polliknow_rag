@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -1448,7 +1448,7 @@ def generate_flowbite_table_rows(results):
 
 @app.function(
     image=image,
-    cpu=1.0,
+    gpu=modal.gpu.A10G(count=1),
     timeout=600,  # Increased timeout
     volumes={DATA_DIR: bee_volume}
 )
@@ -1781,274 +1781,22 @@ Please examine both images, using the document image to inform your analysis of 
             "id": result_id
         }
 
-
-@app.function(
-    image=image,
-    cpu=1.0,
-    timeout=300,
-    volumes={DATA_DIR: bee_volume}
-)
-async def classify_document_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
-    """
-    Classify document using Claude's Vision capabilities, treating it purely as an image
-    
-    Args:
-        image_data: Base64 encoded image of the document
-        options: Dictionary of toggle options
-    
-    Returns:
-        Dictionary with classification and analysis results
-    """
-    global colpali_embeddings, df, page_images
-    
-    result_id = uuid.uuid4().hex
-    
-    # Build additional instructions based on options
-    additional_instructions = []
-    format_instructions = []
-    
-    if options.get("detailed_analysis", False):
-        additional_instructions.append("Provide a detailed analysis of the document, focusing on its visual structure, layout, and any visible elements.")
-        format_instructions.append("- Detailed Analysis: [description of document structure and layout]")
-        
-    if options.get("extract_key_points", False):
-        additional_instructions.append("Extract key points visible in the document without using OCR or text extraction.")
-        format_instructions.append("- Key Points: [list of main points visible in the document]")
-        
-    if options.get("identify_document_type", False):
-        additional_instructions.append("Identify the document type based on its visual appearance.")
-        format_instructions.append("- Document Type: [invoice, report, form, etc.]")
-    
-    # Get relevant context documents using RAG retrieval
-    context_text = ""
-    context_source = None
-    context_images = []
-    top_sources = []
-    
-    # Check if RAG is available and enabled
-    rag_enabled = options.get("use_rag", True)
-    rag_available = colpali_embeddings is not None and df is not None and len(df) > 0
-    
-    if rag_enabled:
-        if rag_available:
-            query = "document analysis" # General query for document context
-            try:
-                # Use the vision retrieval function to get similar document images
-                context_images, top_sources = await retrieve_relevant_documents(query, top_k=3)
-                logging.info(f"Retrieved {len(context_images)} context images and {len(top_sources)} top sources")
-
-                if context_images and top_sources and len(top_sources) > 0:
-                    source = top_sources[0]
-                    context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
-                    logging.info(f"Using context source: {context_source}")
-            except Exception as e:
-                logging.error(f"Error retrieving context: {e}")
-                import traceback
-                traceback.print_exc()
-                # Continue without context if retrieval fails
-        else:
-            logging.warning("RAG requested but data not available. Proceeding without context")
-    
-    # Build the prompt for document analysis - treating the document as a pure image
-    document_analysis_prompt = """
-    You are an expert document analyst. Your task is to analyze the provided document image and provide detailed insights.
-    
-    Please analyze the document based on its visual appearance without performing explicit OCR or text extraction.
-    Focus on what you can observe directly in the image - layout, structure, visual elements, and general content.
-    
-    {additional_instructions}
-    
-    Format your response as follows:
-    - Document Overview: [brief description of what you see]
-    - Visual Structure: [description of layout and visual organization]
-    - Content Type: [what kind of content appears to be in the document]
-    {format_instructions}
-    
-    IMPORTANT: Just provide the formatted response above with no additional explanation or apology.
-    """
-    
-    # Prepare the prompt
-    additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
-    format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
-    
-    prompt = document_analysis_prompt.format(
-        additional_instructions=additional_instructions_text,
-        format_instructions=format_instructions_text
-    )
-    
-    print("🔍 Sending document image to Claude for visual analysis...")
-    
-    try:
-        # Prepare the request for Claude API
-        headers = {
-            "x-api-key": CLAUDE_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        }
-        
-        # Build content array for the message
-        content = []
-        
-        # Add the input document image
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/jpeg",
-                "data": image_data
-            }
-        })
-        
-        # Add context images if available
-        for i, context_image in enumerate(context_images):
-            if i >= 2:  # Limit to 2 context images to avoid token limits
-                break
-                
-            # Convert PIL Image to base64
-            buffered = BytesIO()
-            context_image.save(buffered, format="JPEG", quality=85)
-            context_image_data = base64.b64encode(buffered.getvalue()).decode('utf-8')
-            
-            content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": context_image_data
-                }
-            })
-        
-        # Add the text prompt
-        content.append({
-            "type": "text",
-            "text": prompt
-        })
-        
-        payload = {
-            "model": "claude-3-7-sonnet-20250219",
-            "max_tokens": 1024,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": content
-                }
-            ]
-        }
-        
-        # Log what's being sent to the API
-        logging.info(f"Sending request to Claude API with {len(content)} content items")
-        if context_images:
-            logging.info(f"Including {len(context_images)} context images in request")
-        
-        # Make the API call
-        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
-        response.raise_for_status()
-        
-        # Extract the response content
-        result = response.json()
-        analysis_text = result["content"][0]["text"]
-        
-        # Parse the analysis result
-        lines = analysis_text.strip().split("\n")
-        parsed_result = {}
-        
-        for line in lines:
-            if ":" in line:
-                key, value = line.split(":", 1)
-                key = key.strip().replace("- ", "")
-                value = value.strip()
-                parsed_result[key] = value
-        
-        # Store essential information
-        document_overview = parsed_result.get("Document Overview", "No overview provided")
-        visual_structure = parsed_result.get("Visual Structure", "Structure not analyzed")
-        content_type = parsed_result.get("Content Type", "Unknown")
-        
-        # Store the full result in the database
-        try:
-            conn = setup_database(DB_PATH)
-            cursor = conn.cursor()
-            
-            # Include context_source in the insert
-            cursor.execute(
-                "INSERT INTO results (id, category, confidence, description, additional_details, context_source) VALUES (?, ?, ?, ?, ?, ?)",
-                (result_id, content_type, "Medium", document_overview, json.dumps(parsed_result), context_source)
-            )
-            
-            conn.commit()
-            conn.close()
-            
-            return {
-                "id": result_id,
-                "document_type": content_type,
-                "overview": document_overview,
-                "visual_structure": visual_structure,
-                "details": parsed_result,
-                "context_source": context_source,
-                "top_sources": top_sources,
-                "rag_available": rag_available,
-                "rag_enabled": rag_enabled,
-                "context_images_used": len(context_images),
-                "raw_response": analysis_text
-            }
-            
-        except Exception as db_error:
-            print(f"⚠️ Error saving to database: {db_error}")
-            # Still return the result even if database save fails
-            return {
-                "id": result_id,
-                "document_type": content_type,
-                "overview": document_overview,
-                "visual_structure": visual_structure,
-                "details": parsed_result,
-                "context_source": context_source,
-                "top_sources": top_sources,
-                "rag_available": rag_available,
-                "rag_enabled": rag_enabled,
-                "context_images_used": len(context_images),
-                "raw_response": analysis_text,
-                "db_error": str(db_error)
-            }
-            
-    except requests.exceptions.HTTPError as http_err:
-        error_detail = "Unknown error"
-        try:
-            error_json = response.json()
-            error_detail = error_json.get('error', {}).get('message', str(http_err))
-        except:
-            error_detail = response.text if response.text else str(http_err)
-        
-        logging.error(f"HTTP error occurred: {error_detail}")
-        return {
-            "error": f"API Error: {error_detail}",
-            "id": result_id
-        }
-    except Exception as e:
-        logging.error(f"Error in document classification: {e}")
-        return {
-            "error": str(e),
-            "id": result_id
-        }
     
 # Batch classification function
 @app.function(
     image=image,
-    cpu=1.0,
+    gpu=modal.gpu.A10G(count=1),
     timeout=500,  # Longer timeout for batch processing
     volumes={DATA_DIR: bee_volume}
 )
+
 def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> Dict[str, Any]:
-    """
-    Classify multiple insect images in batch using Claude's API
-    
-    Args:
-        images_data: List of base64 encoded images (max 5)
-        options: Dictionary of toggle options
-    
-    Returns:
-        Dictionary with batch classification results
-    """
+    """Classify multiple insect images in batch using Claude's API"""
     global colpali_embeddings, df, page_images
+    
+    # IMPORTANT: Load RAG data at the start of this function
+    load_rag_data()
+    print_rag_diagnostics()
     
     batch_id = uuid.uuid4().hex
     
@@ -2074,36 +1822,59 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
         format_instructions.append("- Taxonomy: [Order, Family, Genus, Species where possible]")
     
     # Get relevant context using visual similarity with first image
-    # This is a simplification - in a more advanced implementation, you might
-    # want to get context relevant to all images, but for simplicity we'll use the first
+    # IMPROVED: Use targeted query based on options
     context_source = None
     context_image_data = None
     top_sources = []
+    query_used = "insect classification"  # Default query
     
-    if options.get("use_rag", True) and images_data and len(images_data) > 0:  # Default to using RAG
+    # Check if RAG is enabled
+    if options.get("use_rag", True):
         try:
+            # Select query based on options
+            if options.get("plant_classification", False):
+                query_used = "insect and plant identification"
+            elif options.get("taxonomy", False):
+                query_used = "insect taxonomy classification"
+            else:
+                query_used = "insect classification"
+                
+            logging.info(f"Using RAG with query: '{query_used}'")
+            
             # Use the first image in the batch to find relevant documents
             query_image_data = images_data[0]
-            top_sources = retrieve_visually_similar_documents(query_image_data, top_k=1)
+            top_sources = retrieve_visually_similar_documents(query_image_data, top_k=3)
             
             if top_sources and len(top_sources) > 0:
                 source = top_sources[0]
                 context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                logging.info(f"Using context source: {context_source}")
                 
                 # Get the context image
                 context_image_path = get_context_image_path([source])
                 if context_image_path and os.path.exists(context_image_path):
-                    with open(context_image_path, "rb") as f:
-                        context_image_data = base64.b64encode(f.read()).decode('utf-8')
-                    logging.info(f"Found batch context image: {context_image_path}")
+                    try:
+                        # Open the image and convert to JPEG format
+                        with Image.open(context_image_path) as img:
+                            # Convert to RGB if needed (remove alpha channel or other modes)
+                            if img.mode != 'RGB':
+                                img = img.convert('RGB')
+                                
+                            # Save as JPEG to a BytesIO buffer
+                            buffer = BytesIO()
+                            img.save(buffer, format="JPEG", quality=90)
+                            context_image_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                            logging.info(f"Successfully processed context image from: {context_image_path}")
+                    except Exception as e:
+                        logging.error(f"Error processing context image {context_image_path}: {e}")
+                        context_image_data = None
+                else:
+                    logging.warning(f"Could not find context image for {context_source}")
+            else:
+                logging.warning("No similar documents found for RAG context")
         except Exception as e:
             logging.error(f"Error retrieving batch context: {e}")
             traceback.print_exc()
-    
-    # Prepare the batch prompt
-    categories_list = "\n".join([f"- {category}" for category in INSECT_CATEGORIES])
-    additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
-    format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
     
     # Create context instructions based on whether we have a context image
     image_context_instructions = ""
@@ -2145,10 +1916,10 @@ Please examine all images, using the document image to inform your analysis of t
     IMPORTANT: Provide a separate, clearly labeled analysis for each image using the format above.
     """.format(
         count=len(images_data),
-        categories=categories_list,
+        categories="\n".join([f"- {category}" for category in INSECT_CATEGORIES]),
         image_context_instructions=image_context_instructions,
-        additional_instructions=additional_instructions_text,
-        format_instructions=format_instructions_text
+        additional_instructions="\n".join(additional_instructions) if additional_instructions else "",
+        format_instructions="\n".join(format_instructions) if format_instructions else ""
     )
     
     print(f"🔍 Sending batch of {len(images_data)} images to Claude for classification...")
@@ -2200,6 +1971,14 @@ Please examine all images, using the document image to inform your analysis of t
                 }
             ]
         }
+        
+        # IMPROVED: Log what's being sent to the API
+        logging.info(f"Sending request to Claude API with {len(content)} content items")
+        if context_image_data:
+            logging.info("Including context image in batch request")
+            # Add verification of content array
+            content_types = [item.get("type") for item in content]
+            logging.info(f"Content array contains: {content_types}")
         
         # Make the API call
         response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
@@ -2282,6 +2061,7 @@ Please examine all images, using the document image to inform your analysis of t
         except Exception as e:
             print(f"⚠️ Error saving batch results to database: {e}")
         
+        # IMPROVED: Add more data to the response
         return {
             "batch_id": batch_id,
             "count": len(image_results),
@@ -2289,7 +2069,9 @@ Please examine all images, using the document image to inform your analysis of t
             "context_source": context_source,
             "top_sources": top_sources,
             "context_image_used": context_image_data is not None,
-            "raw_response": batch_text
+            "raw_response": batch_text,
+            "query_used": query_used,
+            "rag_enabled": options.get("use_rag", True)
         }
         
     except requests.exceptions.HTTPError as http_err:
@@ -2652,37 +2434,7 @@ def serve():
             import traceback
             traceback.print_exc()
             return JSONResponse({"error": str(e)}, status_code=500)
-    
-    @rt("/analyze-document", methods=["POST"])
-    async def api_analyze_document(request):
-        """API endpoint to analyze document as a pure image using Claude's Vision API"""
-        try:
-            # Get image data and options from request JSON
-            data = await request.json()
-            image_data = data.get("image_data", "")
-            options = data.get("options", {})
-            
-            if not image_data:
-                return JSONResponse({"error": "No document image data provided"}, status_code=400)
-            
-            # Add document-specific options if not present
-            if "detailed_analysis" not in options:
-                options["detailed_analysis"] = True
-            if "extract_key_points" not in options:
-                options["extract_key_points"] = True
-            if "identify_document_type" not in options:
-                options["identify_document_type"] = True
-            
-            # Call the document classification function
-            result = classify_document_claude.remote(image_data, options)
-            
-            return JSONResponse(result)
-                
-        except Exception as e:
-            print(f"Error analyzing document: {e}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, status_code=500)
+
     
     @rt("/classify-batch", methods=["POST"])
     async def api_classify_batch(request):
@@ -5403,6 +5155,37 @@ def serve():
                 
                 // Save raw response for copy button
                 rawResponseText = batchResult.raw_response;
+                
+                // Add RAG context display - This part needs to be added
+                if (batchResult.context_image_used) {
+                    ragContextSection.classList.remove('hidden');
+                    
+                    // Build context HTML
+                    let contextHTML = '';
+                    
+                    // Add source information
+                    if (batchResult.context_source) {
+                        contextHTML += `
+                            <div class="mb-3">
+                                <span class="font-semibold">Source Document:</span>
+                                <span>${batchResult.context_source}</span>
+                            </div>
+                        `;
+                    }
+                    
+                    // Add query information
+                    if (batchResult.query_used) {
+                        contextHTML += `
+                            <div class="mb-3">
+                                <span class="font-semibold">Query Used:</span>
+                                <span class="badge badge-primary">${batchResult.query_used}</span>
+                            </div>
+                        `;
+                    }
+                    
+                    // Update the display
+                    ragContextDisplay.innerHTML = contextHTML;
+                }
             }
             
             // Global function for providing feedback
