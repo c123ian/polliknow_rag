@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxx"
+CLAUDE_API_KEY = "skxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -4265,44 +4265,14 @@ def serve():
                         
             return toggle_element
         
-        # Classification options panel with only RAG toggle
+        # Classification options panel with RAG option
         classification_options = Div(
             H3("Classification Options", cls="text-lg font-semibold mb-4 text-bee-green"),
             create_toggle("use_rag", "Use Context-Enhanced Classification (RAG)", True, 
                         "Enhances classification accuracy using relevant reference materials"),
-            cls="mb-6 p-4 bg-base-200 rounded-lg"
-        )
-        
-        # Classification steps component
-        classification_steps = Div(
-            H3("Classification Process", cls="text-lg font-semibold mb-4 text-bee-green"),
-            Div(
-                NotStr("""
-                <ul class="steps steps-horizontal lg:steps-horizontal w-full">
-                    <li class="step" id="step-classify">
-                        <div class="flex flex-col items-center">
-                            <span class="text-xl mb-1">🐝</span>
-                            <span>Insect Classification</span>
-                        </div>
-                    </li>
-                    <li class="step" id="step-plants">
-                        <div class="flex flex-col items-center">
-                            <span class="text-xl mb-1">🌱</span>
-                            <span>Plant Identification</span>
-                        </div>
-                    </li>
-                    <li class="step" id="step-taxonomy">
-                        <div class="flex flex-col items-center">
-                            <span class="text-xl mb-1">🕵️</span>
-                            <span>Taxonomic Analysis</span>
-                        </div>
-                    </li>
-                </ul>
-                """),
-                cls="w-full mb-4"
-            ),
-            P("All steps will be performed automatically during classification", 
-            cls="text-sm text-base-content/70 text-center"),
+            create_toggle("detailed_description", "Detailed Description (shapes, colors)"),
+            create_toggle("plant_classification", "Plant Classification"),
+            create_toggle("taxonomy", "Taxonomic Classification"),
             cls="mb-6 p-4 bg-base-200 rounded-lg"
         )
         
@@ -4360,7 +4330,6 @@ def serve():
             H2("Insect Image Classification", cls="text-xl font-bold mb-4 text-bee-green"),
             upload_section,
             classification_options,
-            classification_steps,  # Added the steps component here
             Button(
                 "Classify Insects",
                 cls="btn btn-primary w-full",
@@ -4507,40 +4476,14 @@ def serve():
                 console.error("Critical Error: Image input element not found");
             }
             
-            // Get options from the form controls - always include all processing steps
+            // Get options from the form controls
             function getOptions() {
                 return {
                     use_rag: document.querySelector('input[name="use_rag"]').checked,
-                    detailed_description: true,  // Always on
-                    plant_classification: true,  // Always on
-                    taxonomy: true               // Always on
+                    detailed_description: document.querySelector('input[name="detailed_description"]').checked,
+                    plant_classification: document.querySelector('input[name="plant_classification"]').checked,
+                    taxonomy: document.querySelector('input[name="taxonomy"]').checked
                 };
-            }
-            
-            // Update the steps UI based on progress
-            function updateStepsUI(stage) {
-                // Reset all steps
-                document.getElementById('step-classify').classList.remove('step-primary');
-                document.getElementById('step-plants').classList.remove('step-primary');
-                document.getElementById('step-taxonomy').classList.remove('step-primary');
-                
-                // Update steps based on stage
-                switch(stage) {
-                    case 'classify':
-                        document.getElementById('step-classify').classList.add('step-primary');
-                        break;
-                    case 'plants':
-                        document.getElementById('step-classify').classList.add('step-primary');
-                        document.getElementById('step-plants').classList.add('step-primary');
-                        break;
-                    case 'taxonomy':
-                        document.getElementById('step-classify').classList.add('step-primary');
-                        document.getElementById('step-plants').classList.add('step-primary');
-                        document.getElementById('step-taxonomy').classList.add('step-primary');
-                        break;
-                    default:
-                        break;
-                }
             }
             
             // Handle file selection - core function that processes selected files
@@ -4726,9 +4669,6 @@ def serve():
                 
                 selectedFiles = [];
                 isBatchMode = false;
-                
-                // Reset steps UI
-                updateStepsUI(null);
             }
             
             // Handle classify button click
@@ -4744,9 +4684,6 @@ def serve():
                     ragContextSection.classList.add('hidden'); // Hide RAG context section
                     classifyButton.disabled = true;
                     classifyButton.classList.add('opacity-50');
-                    
-                    // Start with first step
-                    updateStepsUI('classify');
                     
                     if (isBatchMode) {
                         // Batch mode - process multiple images
@@ -4802,21 +4739,6 @@ def serve():
                     
                     console.log("Classification successful, displaying results");
                     
-                    // Update steps UI based on result content
-                    updateStepsUI('classify'); // Initial classification always done
-                    
-                    // Check if plant identification is included
-                    if (data.details && 
-                    (data.details["Plant Identification"] || 
-                        data.details["Detailed Description"])) {
-                        updateStepsUI('plants');
-                        
-                        // Check if taxonomy is included
-                        if (data.details && data.details["Taxonomy"]) {
-                            updateStepsUI('taxonomy');
-                        }
-                    }
-                    
                     // Display the result using the enhanced display function
                     displaySingleResult(data);
                     
@@ -4842,9 +4764,6 @@ def serve():
                     resultsContent.classList.remove('hidden');
                     classifyButton.disabled = false;
                     classifyButton.classList.remove('opacity-50');
-                    
-                    // Reset steps UI
-                    updateStepsUI(null);
                 });
             }
             
@@ -4895,9 +4814,6 @@ def serve():
                     
                     console.log("Batch classification successful, displaying results");
                     
-                    // Update steps UI with final state
-                    updateStepsUI('taxonomy'); // For batch, assume all steps completed
-                    
                     // Save raw response for copy button
                     rawResponseText = data.raw_response;
                     
@@ -4926,9 +4842,6 @@ def serve():
                     resultsContent.classList.remove('hidden');
                     classifyButton.disabled = false;
                     classifyButton.classList.remove('opacity-50');
-                    
-                    // Reset steps UI
-                    updateStepsUI(null);
                 });
             }
             
@@ -4961,7 +4874,7 @@ def serve():
                 });
             }
             
-            // Display RAG context section
+            // Function to display RAG context section with actual PDF images
             function displayRagContext(result) {
                 // Check if we have context data to display
                 if (result.context_source || 
@@ -4969,6 +4882,45 @@ def serve():
                     (result.top_sources && result.top_sources.length > 0)) {
                     
                     let contextHTML = '';
+                    
+                    // Add top source image if available
+                    if (result.top_sources && result.top_sources.length > 0) {
+                        const topSource = result.top_sources[0];
+                        const imagePath = topSource.image_path || '';
+                        
+                        if (imagePath) {
+                            contextHTML += `
+                                <div class="mb-4">
+                                    <h4 class="font-semibold mb-2">Reference Document Image:</h4>
+                                    <div class="bg-base-300 p-2 rounded-lg flex justify-center">
+                                        <img src="/image-thumbnail?path=${encodeURIComponent(imagePath)}" 
+                                            alt="Reference Document" 
+                                            class="max-h-96 object-contain cursor-pointer" 
+                                            onclick="window.open('/image-thumbnail?path=${encodeURIComponent(imagePath)}&full=true', '_blank')"
+                                            title="Click to view full size">
+                                    </div>
+                                </div>
+                            `;
+                        } else {
+                            // Try to construct a path based on metadata if the direct path isn't available
+                            const filename = topSource.filename || '';
+                            const page = topSource.page || 0;
+                            
+                            contextHTML += `
+                                <div class="mb-4">
+                                    <h4 class="font-semibold mb-2">Reference Document:</h4>
+                                    <div class="bg-base-300 p-2 rounded-lg flex justify-center">
+                                        <img src="/context-image?filename=${encodeURIComponent(filename)}&page=${page}" 
+                                            alt="Reference Document" 
+                                            class="max-h-96 object-contain cursor-pointer"
+                                            onerror="this.onerror=null; this.src='/placeholder-image'; this.classList.add('opacity-50');"
+                                            onclick="if(!this.classList.contains('opacity-50')) window.open('/context-image?filename=${encodeURIComponent(filename)}&page=${page}&full=true', '_blank')"
+                                            title="Click to view full size">
+                                    </div>
+                                </div>
+                            `;
+                        }
+                    }
                     
                     // Add the source information
                     if (result.context_source) {
@@ -5014,7 +4966,7 @@ def serve():
                         }
                     }
                     
-                    // Add top sources if available
+                    // Add top sources list if available
                     if (result.top_sources && result.top_sources.length > 0) {
                         contextHTML += `
                             <div class="mb-3">
@@ -5206,6 +5158,37 @@ def serve():
                 
                 // Save raw response for copy button
                 rawResponseText = batchResult.raw_response;
+                
+                // Add RAG context display - This part needs to be added
+                if (batchResult.context_image_used) {
+                    ragContextSection.classList.remove('hidden');
+                    
+                    // Build context HTML
+                    let contextHTML = '';
+                    
+                    // Add source information
+                    if (batchResult.context_source) {
+                        contextHTML += `
+                            <div class="mb-3">
+                                <span class="font-semibold">Source Document:</span>
+                                <span>${batchResult.context_source}</span>
+                            </div>
+                        `;
+                    }
+                    
+                    // Add query information
+                    if (batchResult.query_used) {
+                        contextHTML += `
+                            <div class="mb-3">
+                                <span class="font-semibold">Query Used:</span>
+                                <span class="badge badge-primary">${batchResult.query_used}</span>
+                            </div>
+                        `;
+                    }
+                    
+                    // Update the display
+                    ragContextDisplay.innerHTML = contextHTML;
+                }
             }
             
             // Global function for providing feedback
@@ -5334,15 +5317,6 @@ def serve():
         #rag-context-display {
             max-height: 500px;
             overflow-y: auto;
-        }
-        
-        /* Steps styling improvements */
-        .steps-horizontal .step {
-            min-width: 100px;
-        }
-        
-        .steps-horizontal {
-            overflow-x: auto;
         }
         
         /* Responsive layout */
