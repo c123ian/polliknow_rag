@@ -18,7 +18,6 @@ from io import BytesIO
 from nltk.tokenize import word_tokenize
 import matplotlib.pyplot as plt
 import traceback
-from starlette.requests import Request
 
 from fasthtml.common import *
 from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
@@ -44,7 +43,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxx"
+CLAUDE_API_KEY = 
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -1294,6 +1293,7 @@ def get_classification_image_path(result_id):
     # If all else fails, return None to use a placeholder
     return None
 
+
 def get_trend_indicator(stats):
     """Calculate a trend indicator for daily classifications"""
     daily_counts = stats.get("daily_counts", [])
@@ -1444,8 +1444,314 @@ def generate_flowbite_table_rows(results):
     
     return html
 
-# Generate classification using Claude's API for a single image
+# NEW: Functions for Plant-Insect Relationship Network Visualization
 
+# Helper function to call Claude API for structured data extraction
+async def call_claude_for_structured_data(prompt, model="claude-3-7-sonnet-20250219"):
+    """Call Claude API to extract structured data"""
+    try:
+        headers = {
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        payload = {
+            "model": model,
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        }
+        
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        result = response.json()
+        return result["content"][0]["text"]
+        
+    except Exception as e:
+        logging.error(f"Error calling Claude API: {e}")
+        return "[]"  # Return empty JSON array as string on error
+
+# Build network of insect-plant relationships
+async def build_insect_plant_network(insect_filter=None):
+    """Build network data structure from classified insects and RAG data"""
+    global colpali_embeddings, df, page_images
+    
+    # Initialize network structure
+    nodes = []
+    links = []
+    
+    try:
+        # Connect to the database
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        cursor = conn.cursor()
+        
+        # Get classified insects
+        if insect_filter:
+            cursor.execute(
+                "SELECT DISTINCT category FROM results WHERE category = ?",
+                (insect_filter,)
+            )
+        else:
+            cursor.execute(
+                "SELECT DISTINCT category FROM results"
+            )
+        
+        insect_categories = [row[0] for row in cursor.fetchall()]
+        
+        # For each insect category, find relationships with plants
+        for insect in insect_categories:
+            # Count occurrences of this insect for node sizing
+            cursor.execute(
+                "SELECT COUNT(*) FROM results WHERE category = ?",
+                (insect,)
+            )
+            count = cursor.fetchone()[0]
+            
+            # Add insect node
+            nodes.append({
+                "id": insect,
+                "group": "insect",
+                "value": min(count * 5, 50),  # Scale value by count, max of 50
+                "type": "insect"
+            })
+            
+            # Use RAG to find plant relationships
+            plant_relationships = await find_plant_relationships(insect)
+            
+            # Add plants and relationships to the network
+            for plant_info in plant_relationships:
+                plant_name = plant_info["plant"]
+                
+                # Add plant node if not already in network
+                if not any(node["id"] == plant_name for node in nodes):
+                    nodes.append({
+                        "id": plant_name,
+                        "group": "plant",
+                        "value": plant_info.get("strength", 10),
+                        "type": "plant"
+                    })
+                
+                # Add relationship link
+                links.append({
+                    "source": insect,
+                    "target": plant_name,
+                    "value": plant_info.get("strength", 5),
+                    "type": plant_info.get("relationship_type", "interacts")
+                })
+        
+        conn.close()
+        
+        return {
+            "nodes": nodes,
+            "links": links
+        }
+    except Exception as e:
+        logging.error(f"Error building network data: {e}")
+        traceback.print_exc()
+        return {"nodes": [], "links": []}
+
+# Find plant relationships for an insect using RAG
+async def find_plant_relationships(insect_name):
+    """Use RAG to find plant relationships for an insect species"""
+    relationships = []
+    
+    try:
+        # Construct multiple queries to find different types of relationships
+        queries = [
+            f"What plants do {insect_name} pollinate?",
+            f"What plants do {insect_name} feed on?",
+            f"What plants are important habitats for {insect_name}?"
+        ]
+        
+        # Process each query to find relationships
+        for query in queries:
+            # Use existing RAG retrieval to find relevant context
+            context_images, top_sources = await retrieve_relevant_documents(query, top_k=3)
+            
+            if top_sources and len(top_sources) > 0:
+                # Extract context paragraphs from the documents
+                context_texts = []
+                for source in top_sources:
+                    try:
+                        # Get document content
+                        idx = source.get('idx')
+                        if idx is not None and idx < len(df):
+                            context_texts.append(df.iloc[idx]['text'])
+                    except Exception as e:
+                        logging.error(f"Error getting context text: {e}")
+                
+                if context_texts:
+                    # Use Claude API to extract relationships from context
+                    relationships_from_context = await extract_relationships_from_context(
+                        insect_name, 
+                        query, 
+                        context_texts
+                    )
+                    relationships.extend(relationships_from_context)
+        
+        # Remove duplicates based on plant name
+        unique_plants = {}
+        for rel in relationships:
+            plant_name = rel["plant"]
+            if plant_name not in unique_plants:
+                unique_plants[plant_name] = rel
+            elif rel.get("strength", 0) > unique_plants[plant_name].get("strength", 0):
+                unique_plants[plant_name] = rel
+        
+        return list(unique_plants.values())
+        
+    except Exception as e:
+        logging.error(f"Error finding plant relationships for {insect_name}: {e}")
+        return []
+
+# Extract structured plant relationships from context
+async def extract_relationships_from_context(insect, query, context_texts):
+    """Extract structured plant relationships from context using Claude API"""
+    try:
+        # Combine context texts
+        combined_context = "\n\n".join(context_texts)
+        
+        # Prepare the prompt for Claude
+        prompt = f"""
+        Based on the following context information, identify plants that have a relationship with {insect}.
+        
+        Context:
+        {combined_context}
+        
+        Query: {query}
+        
+        Extract ONLY plant names that have a definite relationship with {insect} based on the context.
+        For each plant, determine:
+        1. The plant name
+        2. The type of relationship (e.g., pollination, food source, habitat)
+        3. The strength of the relationship (1-10, where 10 is strongest)
+        
+        If NO plant relationships are mentioned in the context, return an empty list.
+        
+        Format your response as a JSON array of objects with these properties:
+        [
+          {{
+            "plant": "plant name",
+            "relationship_type": "type of relationship",
+            "strength": number (1-10),
+            "source": "brief mention of where this came from"
+          }}
+        ]
+        
+        ONLY include plants with clear relationships to {insect} from the context.
+        """
+        
+        # Call Claude API
+        response = await call_claude_for_structured_data(prompt, model="claude-3-7-sonnet-20250219")
+        
+        # Parse the response (assumption: response is a JSON array)
+        try:
+            relationships = json.loads(response)
+            if not isinstance(relationships, list):
+                relationships = []
+        except json.JSONDecodeError:
+            logging.error(f"Error parsing JSON from Claude response: {response}")
+            relationships = []
+        
+        return relationships
+        
+    except Exception as e:
+        logging.error(f"Error extracting relationships from context: {e}")
+        return []
+
+# Get detailed relationship information from RAG
+async def get_relationship_from_rag(insect, plant):
+    """Get detailed relationship information from RAG"""
+    try:
+        # Create a specific query about this relationship
+        query = f"What is the relationship between {insect} and {plant}? How do they interact?"
+        
+        # Use the existing RAG retrieval function
+        context_images, top_sources = await retrieve_relevant_documents(query, top_k=2)
+        
+        # Extract context text from sources
+        context_texts = []
+        if top_sources and len(top_sources) > 0:
+            for source in top_sources:
+                try:
+                    # Get document content
+                    idx = source.get('idx')
+                    if idx is not None and idx < len(df):
+                        context_texts.append(df.iloc[idx]['text'])
+                        source_info = f"{source.get('filename', 'Unknown document')}, page {source.get('page', 'unknown')}"
+                except Exception as e:
+                    logging.error(f"Error getting context text: {e}")
+        
+        if not context_texts:
+            return {
+                "type": "interaction",
+                "description": "No specific information about this relationship was found in the reference materials."
+            }
+        
+        # Combine context texts
+        combined_context = "\n\n".join(context_texts)
+        
+        # Prepare the prompt for Claude
+        prompt = f"""
+        Based on the following context information, describe the relationship between {insect} and {plant}.
+        
+        Context:
+        {combined_context}
+        
+        Extract:
+        1. The type of relationship (e.g., pollination, food source, habitat)
+        2. A detailed description of how these species interact
+        
+        If the context doesn't mention this specific relationship, say that.
+        
+        Format your response as a JSON object with these properties:
+        {{
+          "type": "type of relationship",
+          "description": "detailed description of the relationship",
+          "source": "source of this information from the context"
+        }}
+        """
+        
+        # Call Claude API
+        response = await call_claude_for_structured_data(prompt)
+        
+        # Parse the response
+        try:
+            relationship_data = json.loads(response)
+            if not isinstance(relationship_data, dict):
+                relationship_data = {
+                    "type": "unknown",
+                    "description": "Could not extract relationship details from context."
+                }
+            
+            # Add source information if available
+            if top_sources and len(top_sources) > 0:
+                source = top_sources[0]
+                relationship_data["source"] = f"{source.get('filename', 'Unknown document')}, page {source.get('page', 'unknown')}"
+                
+        except json.JSONDecodeError:
+            logging.error(f"Error parsing JSON from Claude response: {response}")
+            relationship_data = {
+                "type": "unknown",
+                "description": "Could not extract relationship details from context."
+            }
+        
+        return relationship_data
+        
+    except Exception as e:
+        logging.error(f"Error getting relationship details: {e}")
+        return {
+            "type": "unknown",
+            "description": f"Error retrieving relationship information: {str(e)}"
+        }
+
+# Generate classification using Claude's API for a single image
 @app.function(
     image=image,
     gpu=modal.gpu.A10G(count=1),
@@ -1518,32 +1824,6 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
             top_sources = retrieve_visually_similar_documents(image_data, top_k=3)
             
             if top_sources and len(top_sources) > 0:
-                for source in top_sources:
-                    # Add the image path to each source
-                    image_key = source.get('image_key')
-                    if image_key and image_key in page_images:
-                        image_path = page_images[image_key]
-                        if os.path.exists(image_path):
-                            source['image_path'] = image_path
-                        else:
-                            # Try alternate formats
-                            parts = image_key.split('_')
-                            if len(parts) >= 2:
-                                filename = '_'.join(parts[:-1])
-                                page_num = parts[-1]
-                                
-                                alt_paths = [
-                                    os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
-                                    os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
-                                    os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
-                                ]
-                                
-                                for alt_path in alt_paths:
-                                    if os.path.exists(alt_path):
-                                        source['image_path'] = alt_path
-                                        break
-                
-                # Continue processing the first source for Claude API
                 source = top_sources[0]
                 context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
                 logging.info(f"Using context source: {context_source}")
@@ -1555,7 +1835,7 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
                     try:
                         # Open the image and convert to JPEG format
                         with Image.open(context_image_path) as img:
-                            # Convert to RGB if needed
+                            # Convert to RGB if needed (remove alpha channel or other modes)
                             if img.mode != 'RGB':
                                 img = img.convert('RGB')
                                 
@@ -1781,6 +2061,254 @@ Please examine both images, using the document image to inform your analysis of 
             "id": result_id
         }
 
+
+@app.function(
+    image=image,
+    gpu=modal.gpu.A10G(count=1),
+    timeout=300,
+    volumes={DATA_DIR: bee_volume}
+)
+async def classify_document_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
+    """
+    Classify document using Claude's Vision capabilities, treating it purely as an image
+    
+    Args:
+        image_data: Base64 encoded image of the document
+        options: Dictionary of toggle options
+    
+    Returns:
+        Dictionary with classification and analysis results
+    """
+    global colpali_embeddings, df, page_images
+    
+    result_id = uuid.uuid4().hex
+    
+    # Build additional instructions based on options
+    additional_instructions = []
+    format_instructions = []
+    
+    if options.get("detailed_analysis", False):
+        additional_instructions.append("Provide a detailed analysis of the document, focusing on its visual structure, layout, and any visible elements.")
+        format_instructions.append("- Detailed Analysis: [description of document structure and layout]")
+        
+    if options.get("extract_key_points", False):
+        additional_instructions.append("Extract key points visible in the document without using OCR or text extraction.")
+        format_instructions.append("- Key Points: [list of main points visible in the document]")
+        
+    if options.get("identify_document_type", False):
+        additional_instructions.append("Identify the document type based on its visual appearance.")
+        format_instructions.append("- Document Type: [invoice, report, form, etc.]")
+    
+    # Get relevant context documents using RAG retrieval
+    context_text = ""
+    context_source = None
+    context_images = []
+    top_sources = []
+    
+    # Check if RAG is available and enabled
+    rag_enabled = options.get("use_rag", True)
+    rag_available = colpali_embeddings is not None and df is not None and len(df) > 0
+    
+    if rag_enabled:
+        if rag_available:
+            query = "document analysis" # General query for document context
+            try:
+                # Use the vision retrieval function to get similar document images
+                context_images, top_sources = await retrieve_relevant_documents(query, top_k=3)
+                logging.info(f"Retrieved {len(context_images)} context images and {len(top_sources)} top sources")
+
+                if context_images and top_sources and len(top_sources) > 0:
+                    source = top_sources[0]
+                    context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                    logging.info(f"Using context source: {context_source}")
+            except Exception as e:
+                logging.error(f"Error retrieving context: {e}")
+                import traceback
+                traceback.print_exc()
+                # Continue without context if retrieval fails
+        else:
+            logging.warning("RAG requested but data not available. Proceeding without context")
+    
+    # Build the prompt for document analysis - treating the document as a pure image
+    document_analysis_prompt = """
+    You are an expert document analyst. Your task is to analyze the provided document image and provide detailed insights.
+    
+    Please analyze the document based on its visual appearance without performing explicit OCR or text extraction.
+    Focus on what you can observe directly in the image - layout, structure, visual elements, and general content.
+    
+    {additional_instructions}
+    
+    Format your response as follows:
+    - Document Overview: [brief description of what you see]
+    - Visual Structure: [description of layout and visual organization]
+    - Content Type: [what kind of content appears to be in the document]
+    {format_instructions}
+    
+    IMPORTANT: Just provide the formatted response above with no additional explanation or apology.
+    """
+    
+    # Prepare the prompt
+    additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
+    format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
+    
+    prompt = document_analysis_prompt.format(
+        additional_instructions=additional_instructions_text,
+        format_instructions=format_instructions_text
+    )
+    
+    print("🔍 Sending document image to Claude for visual analysis...")
+    
+    try:
+        # Prepare the request for Claude API
+        headers = {
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        # Build content array for the message
+        content = []
+        
+        # Add the input document image
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": image_data
+            }
+        })
+        
+        # Add context images if available
+        for i, context_image in enumerate(context_images):
+            if i >= 2:  # Limit to 2 context images to avoid token limits
+                break
+                
+            # Convert PIL Image to base64
+            buffered = BytesIO()
+            context_image.save(buffered, format="JPEG", quality=85)
+            context_image_data = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": context_image_data
+                }
+            })
+        
+        # Add the text prompt
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        payload = {
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ]
+        }
+        
+        # Log what's being sent to the API
+        logging.info(f"Sending request to Claude API with {len(content)} content items")
+        if context_images:
+            logging.info(f"Including {len(context_images)} context images in request")
+        
+        # Make the API call
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        # Extract the response content
+        result = response.json()
+        analysis_text = result["content"][0]["text"]
+        
+        # Parse the analysis result
+        lines = analysis_text.strip().split("\n")
+        parsed_result = {}
+        
+        for line in lines:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip().replace("- ", "")
+                value = value.strip()
+                parsed_result[key] = value
+        
+        # Store essential information
+        document_overview = parsed_result.get("Document Overview", "No overview provided")
+        visual_structure = parsed_result.get("Visual Structure", "Structure not analyzed")
+        content_type = parsed_result.get("Content Type", "Unknown")
+        
+        # Store the full result in the database
+        try:
+            conn = setup_database(DB_PATH)
+            cursor = conn.cursor()
+            
+            # Include context_source in the insert
+            cursor.execute(
+                "INSERT INTO results (id, category, confidence, description, additional_details, context_source) VALUES (?, ?, ?, ?, ?, ?)",
+                (result_id, content_type, "Medium", document_overview, json.dumps(parsed_result), context_source)
+            )
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "id": result_id,
+                "document_type": content_type,
+                "overview": document_overview,
+                "visual_structure": visual_structure,
+                "details": parsed_result,
+                "context_source": context_source,
+                "top_sources": top_sources,
+                "rag_available": rag_available,
+                "rag_enabled": rag_enabled,
+                "context_images_used": len(context_images),
+                "raw_response": analysis_text
+            }
+            
+        except Exception as db_error:
+            print(f"⚠️ Error saving to database: {db_error}")
+            # Still return the result even if database save fails
+            return {
+                "id": result_id,
+                "document_type": content_type,
+                "overview": document_overview,
+                "visual_structure": visual_structure,
+                "details": parsed_result,
+                "context_source": context_source,
+                "top_sources": top_sources,
+                "rag_available": rag_available,
+                "rag_enabled": rag_enabled,
+                "context_images_used": len(context_images),
+                "raw_response": analysis_text,
+                "db_error": str(db_error)
+            }
+            
+    except requests.exceptions.HTTPError as http_err:
+        error_detail = "Unknown error"
+        try:
+            error_json = response.json()
+            error_detail = error_json.get('error', {}).get('message', str(http_err))
+        except:
+            error_detail = response.text if response.text else str(http_err)
+        
+        logging.error(f"HTTP error occurred: {error_detail}")
+        return {
+            "error": f"API Error: {error_detail}",
+            "id": result_id
+        }
+    except Exception as e:
+        logging.error(f"Error in document classification: {e}")
+        return {
+            "error": str(e),
+            "id": result_id
+        }
     
 # Batch classification function
 @app.function(
@@ -1789,14 +2317,18 @@ Please examine both images, using the document image to inform your analysis of 
     timeout=500,  # Longer timeout for batch processing
     volumes={DATA_DIR: bee_volume}
 )
-
 def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> Dict[str, Any]:
-    """Classify multiple insect images in batch using Claude's API"""
-    global colpali_embeddings, df, page_images
+    """
+    Classify multiple insect images in batch using Claude's API
     
-    # IMPORTANT: Load RAG data at the start of this function
-    load_rag_data()
-    print_rag_diagnostics()
+    Args:
+        images_data: List of base64 encoded images (max 5)
+        options: Dictionary of toggle options
+    
+    Returns:
+        Dictionary with batch classification results
+    """
+    global colpali_embeddings, df, page_images
     
     batch_id = uuid.uuid4().hex
     
@@ -1822,59 +2354,36 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
         format_instructions.append("- Taxonomy: [Order, Family, Genus, Species where possible]")
     
     # Get relevant context using visual similarity with first image
-    # IMPROVED: Use targeted query based on options
+    # This is a simplification - in a more advanced implementation, you might
+    # want to get context relevant to all images, but for simplicity we'll use the first
     context_source = None
     context_image_data = None
     top_sources = []
-    query_used = "insect classification"  # Default query
     
-    # Check if RAG is enabled
-    if options.get("use_rag", True):
+    if options.get("use_rag", True) and images_data and len(images_data) > 0:  # Default to using RAG
         try:
-            # Select query based on options
-            if options.get("plant_classification", False):
-                query_used = "insect and plant identification"
-            elif options.get("taxonomy", False):
-                query_used = "insect taxonomy classification"
-            else:
-                query_used = "insect classification"
-                
-            logging.info(f"Using RAG with query: '{query_used}'")
-            
             # Use the first image in the batch to find relevant documents
             query_image_data = images_data[0]
-            top_sources = retrieve_visually_similar_documents(query_image_data, top_k=3)
+            top_sources = retrieve_visually_similar_documents(query_image_data, top_k=1)
             
             if top_sources and len(top_sources) > 0:
                 source = top_sources[0]
                 context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
-                logging.info(f"Using context source: {context_source}")
                 
                 # Get the context image
                 context_image_path = get_context_image_path([source])
                 if context_image_path and os.path.exists(context_image_path):
-                    try:
-                        # Open the image and convert to JPEG format
-                        with Image.open(context_image_path) as img:
-                            # Convert to RGB if needed (remove alpha channel or other modes)
-                            if img.mode != 'RGB':
-                                img = img.convert('RGB')
-                                
-                            # Save as JPEG to a BytesIO buffer
-                            buffer = BytesIO()
-                            img.save(buffer, format="JPEG", quality=90)
-                            context_image_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
-                            logging.info(f"Successfully processed context image from: {context_image_path}")
-                    except Exception as e:
-                        logging.error(f"Error processing context image {context_image_path}: {e}")
-                        context_image_data = None
-                else:
-                    logging.warning(f"Could not find context image for {context_source}")
-            else:
-                logging.warning("No similar documents found for RAG context")
+                    with open(context_image_path, "rb") as f:
+                        context_image_data = base64.b64encode(f.read()).decode('utf-8')
+                    logging.info(f"Found batch context image: {context_image_path}")
         except Exception as e:
             logging.error(f"Error retrieving batch context: {e}")
             traceback.print_exc()
+    
+    # Prepare the batch prompt
+    categories_list = "\n".join([f"- {category}" for category in INSECT_CATEGORIES])
+    additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
+    format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
     
     # Create context instructions based on whether we have a context image
     image_context_instructions = ""
@@ -1916,10 +2425,10 @@ Please examine all images, using the document image to inform your analysis of t
     IMPORTANT: Provide a separate, clearly labeled analysis for each image using the format above.
     """.format(
         count=len(images_data),
-        categories="\n".join([f"- {category}" for category in INSECT_CATEGORIES]),
+        categories=categories_list,
         image_context_instructions=image_context_instructions,
-        additional_instructions="\n".join(additional_instructions) if additional_instructions else "",
-        format_instructions="\n".join(format_instructions) if format_instructions else ""
+        additional_instructions=additional_instructions_text,
+        format_instructions=format_instructions_text
     )
     
     print(f"🔍 Sending batch of {len(images_data)} images to Claude for classification...")
@@ -1971,14 +2480,6 @@ Please examine all images, using the document image to inform your analysis of t
                 }
             ]
         }
-        
-        # IMPROVED: Log what's being sent to the API
-        logging.info(f"Sending request to Claude API with {len(content)} content items")
-        if context_image_data:
-            logging.info("Including context image in batch request")
-            # Add verification of content array
-            content_types = [item.get("type") for item in content]
-            logging.info(f"Content array contains: {content_types}")
         
         # Make the API call
         response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
@@ -2045,7 +2546,7 @@ Please examine all images, using the document image to inform your analysis of t
             
             cursor.execute(
                 "INSERT INTO batch_results (batch_id, result_count, results) VALUES (?, ?, ?)",
-                (batch_id, len(image_results), json.dumps(convert_numpy_to_python(image_results)))
+                (batch_id, len(image_results), json.dumps(image_results))
             )
             
             conn.commit()
@@ -2060,23 +2561,17 @@ Please examine all images, using the document image to inform your analysis of t
             
         except Exception as e:
             print(f"⚠️ Error saving batch results to database: {e}")
-
-        # IMPROVED: Add more data to the response
-        result_to_return = {
+        
+        return {
             "batch_id": batch_id,
             "count": len(image_results),
             "results": image_results,
             "context_source": context_source,
             "top_sources": top_sources,
             "context_image_used": context_image_data is not None,
-            "raw_response": batch_text,
-            "query_used": query_used,
-            "rag_enabled": options.get("use_rag", True)
+            "raw_response": batch_text
         }
-
-        # Apply NumPy to Python conversion before returning
-        return convert_numpy_to_python(result_to_return)
-  
+        
     except requests.exceptions.HTTPError as http_err:
         error_detail = "Unknown error"
         try:
@@ -2296,122 +2791,6 @@ def serve():
     #################################################
     # API routes and page handlers go here
     #################################################
-    @rt("/context-image")
-    async def serve_context_image(request):
-        """Serve a context image from a PDF page based on filename and page number"""
-        try:
-            # Get parameters
-            filename = request.query_params.get("filename", "")
-            page = request.query_params.get("page", "0")
-            full_size = request.query_params.get("full", "false").lower() == "true"
-            
-            if not filename:
-                return Response(
-                    content="Missing filename parameter",
-                    media_type="text/plain",
-                    status_code=400
-                )
-            
-            try:
-                page_num = int(page)
-            except ValueError:
-                page_num = 0
-            
-            # Try to find the image in different path formats
-            potential_paths = [
-                # Standard path format
-                os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
-                # Alternative format with "page_" prefix
-                os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
-                # Flattened path
-                os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png"),
-                # Try with file extension removed if present
-                os.path.join(PDF_IMAGES_DIR, os.path.splitext(filename)[0], f"{page_num}.png"),
-                # Path for FIT-Counts-guide specifically
-                os.path.join(PDF_IMAGES_DIR, "FIT-Counts-guide", f"{page_num}.png")
-            ]
-            
-            # Try each potential path
-            image_path = None
-            for path in potential_paths:
-                if os.path.exists(path):
-                    image_path = path
-                    break
-            
-            if not image_path:
-                # Return a placeholder SVG if no image is found
-                placeholder_svg = """
-                <svg xmlns="http://www.w3.org/2000/svg" width="300" height="200" viewBox="0 0 300 200">
-                    <rect width="300" height="200" fill="#f5f5f5"/>
-                    <text x="150" y="100" font-family="Arial" font-size="16" text-anchor="middle">Image not found</text>
-                </svg>
-                """
-                return Response(
-                    content=placeholder_svg.encode("utf-8"),
-                    media_type="image/svg+xml"
-                )
-            
-            # Read the image file
-            with open(image_path, "rb") as f:
-                image_data = f.read()
-            
-            # If not full size, resize the image
-            if not full_size:
-                try:
-                    from PIL import Image
-                    from io import BytesIO
-                    
-                    img = Image.open(BytesIO(image_data))
-                    
-                    # Calculate proportional resize
-                    max_width = 800
-                    max_height = 600
-                    
-                    width, height = img.size
-                    if width > max_width or height > max_height:
-                        ratio = min(max_width / width, max_height / height)
-                        new_width = int(width * ratio)
-                        new_height = int(height * ratio)
-                        img = img.resize((new_width, new_height), Image.LANCZOS)
-                    
-                    # Save to BytesIO
-                    output = BytesIO()
-                    img.save(output, format=img.format if img.format else "PNG")
-                    image_data = output.getvalue()
-                except Exception as e:
-                    logging.warning(f"Error resizing image: {e}")
-                    # Continue with original image data if resize fails
-            
-            # Determine content type based on file extension
-            if image_path.lower().endswith(".jpg") or image_path.lower().endswith(".jpeg"):
-                content_type = "image/jpeg"
-            elif image_path.lower().endswith(".png"):
-                content_type = "image/png"
-            else:
-                content_type = "application/octet-stream"
-            
-            # Return the image
-            return Response(
-                content=image_data,
-                media_type=content_type
-            )
-        
-        except Exception as e:
-            logging.error(f"Error serving context image: {e}")
-            traceback.print_exc()
-            
-            # Return an error placeholder SVG
-            placeholder_svg = """
-            <svg xmlns="http://www.w3.org/2000/svg" width="300" height="200" viewBox="0 0 300 200">
-                <rect width="300" height="200" fill="#fff0f0"/>
-                <text x="150" y="100" font-family="Arial" font-size="16" text-anchor="middle" fill="#ff0000">Error loading image</text>
-            </svg>
-            """
-            return Response(
-                content=placeholder_svg.encode("utf-8"),
-                media_type="image/svg+xml"
-            )
-        
     @rt("/api/classify", methods=["POST"])
     async def api_classify_image(request):
         """API endpoint to classify insect image using Claude with RAG"""
@@ -2437,7 +2816,37 @@ def serve():
             import traceback
             traceback.print_exc()
             return JSONResponse({"error": str(e)}, status_code=500)
-
+    
+    @rt("/analyze-document", methods=["POST"])
+    async def api_analyze_document(request):
+        """API endpoint to analyze document as a pure image using Claude's Vision API"""
+        try:
+            # Get image data and options from request JSON
+            data = await request.json()
+            image_data = data.get("image_data", "")
+            options = data.get("options", {})
+            
+            if not image_data:
+                return JSONResponse({"error": "No document image data provided"}, status_code=400)
+            
+            # Add document-specific options if not present
+            if "detailed_analysis" not in options:
+                options["detailed_analysis"] = True
+            if "extract_key_points" not in options:
+                options["extract_key_points"] = True
+            if "identify_document_type" not in options:
+                options["identify_document_type"] = True
+            
+            # Call the document classification function
+            result = classify_document_claude.remote(image_data, options)
+            
+            return JSONResponse(result)
+                
+        except Exception as e:
+            print(f"Error analyzing document: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
     
     @rt("/classify-batch", methods=["POST"])
     async def api_classify_batch(request):
@@ -2484,6 +2893,57 @@ def serve():
             import traceback
             traceback.print_exc()
             return JSONResponse({"error": str(e)}, status_code=500)
+            
+    # NEW: API Endpoints for Network Visualization
+    @rt("/api/insect-network")
+    async def get_insect_network(request):
+        """Get network data for insects and their plant relationships"""
+        try:
+            # Get query parameter for specific insect if provided
+            insect_filter = request.query_params.get("insect", None)
+            
+            # Build network data based on classified insects and RAG
+            network_data = await build_insect_plant_network(insect_filter)
+            
+            # Return as JSON
+            return JSONResponse(network_data)
+        except Exception as e:
+            logging.error(f"Error generating network: {e}")
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @rt("/api/relationship-details")
+    async def get_relationship_details(request):
+        """Get details about a specific insect-plant relationship"""
+        try:
+            # Get parameters
+            source = request.query_params.get("source")
+            target = request.query_params.get("target")
+            
+            if not source or not target:
+                return HTMLResponse("<p>Select a relationship to view details</p>")
+            
+            # Get relationship details from RAG
+            details = await get_relationship_from_rag(source, target)
+            
+            # Return HTML fragment for HTMX
+            return HTMLResponse(f"""
+                <div class="bg-accent text-accent-content p-4 rounded-lg">
+                    <h3 class="font-bold text-lg">{source} → {target}</h3>
+                    <div class="text-sm italic mb-3">
+                        Relationship: {details.get('type', 'interaction')}
+                    </div>
+                    <p>{details.get('description', 'No detailed information available.')}</p>
+                    {f'<p class="text-xs mt-2">Source: {details["source"]}</p>' if details.get('source') else ''}
+                </div>
+            """)
+        except Exception as e:
+            logging.error(f"Error getting relationship details: {e}")
+            return HTMLResponse(f"""
+                <div class="bg-error text-error-content p-4 rounded-lg">
+                    <p>Error loading relationship details: {str(e)}</p>
+                </div>
+            """)
     
     # Additional API routes for feedback, charts, etc.
     @rt("/api/feedback", methods=["POST"])
@@ -2782,6 +3242,334 @@ def serve():
                 media_type="image/svg+xml"
             )
     
+    #################################################
+    # Dashboard component for Plant-Insect Network visualization
+    #################################################
+    def build_network_visualization(stats):
+        """Create the network visualization component for the dashboard"""
+        return Div(
+            H2("Plant-Insect Relationship Network", cls="text-xl font-bold mb-4 text-bee-green"),
+            P("Explore connections between classified insects and plants in the ecosystem", cls="mb-4"),
+            
+            # Controls
+            Div(
+                Select(
+                    Option("All classified insects", value=""),
+                    *[
+                        Option(category, value=category)
+                        for category, _ in stats["category_counts"]
+                    ],
+                    cls="select select-bordered w-full max-w-xs",
+                    hx_get="/api/insect-network",
+                    hx_trigger="change",
+                    hx_target="#network-container",
+                    hx_indicator="#network-loading"
+                ),
+                
+                Button(
+                    "Refresh Network",
+                    cls="btn btn-sm",
+                    hx_get="/api/insect-network",
+                    hx_trigger="click",
+                    hx_target="#network-container",
+                    hx_indicator="#network-loading"
+                ),
+                
+                cls="flex flex-wrap gap-2 mb-4"
+            ),
+            
+            # Network visualization container
+            Div(
+                Div(id="network-svg", cls="w-full h-[450px]"),
+                
+                # Legend
+                Div(
+                    Div(
+                        Span(cls="w-3 h-3 inline-block mr-1 rounded-full bg-warning"),
+                        Span("Insects"),
+                        cls="flex items-center mb-1"
+                    ),
+                    Div(
+                        Span(cls="w-3 h-3 inline-block mr-1 rounded-full bg-success"),
+                        Span("Plants"),
+                        cls="flex items-center"
+                    ),
+                    cls="absolute bottom-2 right-2 bg-base-100 p-2 rounded-lg shadow-sm text-xs"
+                ),
+                
+                # Loading indicator
+                Div(
+                    Span(cls="loading loading-spinner loading-lg text-primary"),
+                    id="network-loading",
+                    cls="htmx-indicator absolute inset-0 flex items-center justify-center bg-base-100 bg-opacity-70"
+                ),
+                
+                id="network-container",
+                cls="relative bg-base-200 p-4 rounded-lg min-h-[450px]"
+            ),
+            
+            # Relationship details panel
+            Div(
+                P("Hover over connections in the network to see relationship details", 
+                  cls="text-center text-base-content/50 italic"),
+                id="relationship-details",
+                cls="mt-4 bg-base-200 p-4 rounded-lg"
+            ),
+            
+            # D3.js for visualization
+            Script(src="https://cdn.jsdelivr.net/npm/d3@7"),
+            
+            # Network visualization script
+            Script("""
+            document.addEventListener('DOMContentLoaded', function() {
+                // Initialize D3.js network visualization
+                setupNetworkVisualization();
+                
+                // Load initial data
+                fetchNetworkData();
+                
+                // Function to set up the network visualization
+                function setupNetworkVisualization() {
+                    const svg = d3.select("#network-svg")
+                        .append("svg")
+                        .attr("width", "100%")
+                        .attr("height", "100%");
+                        
+                    svg.append("text")
+                        .attr("x", "50%")
+                        .attr("y", "50%")
+                        .attr("text-anchor", "middle")
+                        .text("Loading network data...");
+                }
+                
+                // Function to fetch network data
+                function fetchNetworkData(filter = "") {
+                    const url = filter ? `/api/insect-network?insect=${filter}` : '/api/insect-network';
+                    
+                    fetch(url)
+                        .then(response => response.json())
+                        .then(data => {
+                            updateNetworkVisualization(data);
+                        })
+                        .catch(error => {
+                            console.error('Error fetching network data:', error);
+                            d3.select("#network-svg svg").html("");
+                            d3.select("#network-svg svg")
+                                .append("text")
+                                .attr("x", "50%")
+                                .attr("y", "50%")
+                                .attr("text-anchor", "middle")
+                                .text("Error loading network data. Please try again.");
+                        });
+                }
+                
+                // Function to update the network visualization with new data
+                function updateNetworkVisualization(data) {
+                    // Clear the SVG
+                    d3.select("#network-svg").html("");
+                    
+                    // Create new SVG
+                    const svg = d3.select("#network-svg")
+                        .append("svg")
+                        .attr("width", "100%")
+                        .attr("height", "100%");
+                        
+                    // Check if we have data
+                    if (!data.nodes || data.nodes.length === 0) {
+                        svg.append("text")
+                            .attr("x", "50%")
+                            .attr("y", "50%")
+                            .attr("text-anchor", "middle")
+                            .text("No network data available yet. Classify some insects to build the network!");
+                        return;
+                    }
+                    
+                    // Get dimensions
+                    const width = svg.node().getBoundingClientRect().width;
+                    const height = svg.node().getBoundingClientRect().height;
+                    
+                    // Create a group for the visualization
+                    const g = svg.append("g")
+                        .attr("transform", `translate(${width/2}, ${height/2})`);
+                        
+                    // Define node colors by group
+                    const color = d3.scaleOrdinal()
+                        .domain(["insect", "plant"])
+                        .range(["#F6AD55", "#68D391"]); // Warning and success colors
+                        
+                    // Create a tooltip
+                    const tooltip = d3.select("body").append("div")
+                        .attr("class", "tooltip")
+                        .style("position", "absolute")
+                        .style("background-color", "white")
+                        .style("border", "1px solid #ddd")
+                        .style("border-radius", "4px")
+                        .style("padding", "8px")
+                        .style("pointer-events", "none")
+                        .style("opacity", 0);
+                        
+                    // Create a force simulation
+                    const simulation = d3.forceSimulation(data.nodes)
+                        .force("link", d3.forceLink(data.links).id(d => d.id).distance(100))
+                        .force("charge", d3.forceManyBody().strength(-300))
+                        .force("center", d3.forceCenter(0, 0))
+                        .force("collision", d3.forceCollide().radius(d => Math.sqrt(d.value) * 2 + 10));
+                        
+                    // Define arrow markers for directional links
+                    g.append("defs").selectAll("marker")
+                        .data(["pollinates", "feeds_on", "habitat", "interacts"])
+                        .enter().append("marker")
+                        .attr("id", d => `arrow-${d}`)
+                        .attr("viewBox", "0 -5 10 10")
+                        .attr("refX", 20)
+                        .attr("refY", 0)
+                        .attr("markerWidth", 6)
+                        .attr("markerHeight", 6)
+                        .attr("orient", "auto")
+                        .append("path")
+                        .attr("fill", d => d === "pollinates" ? "#F6AD55" : "#68D391")
+                        .attr("d", "M0,-5L10,0L0,5");
+                        
+                    // Create the links
+                    const link = g.append("g")
+                        .selectAll("path")
+                        .data(data.links)
+                        .enter().append("path")
+                        .attr("stroke", d => d.type === "pollinates" ? "#F6AD55" : "#68D391")
+                        .attr("stroke-opacity", 0.6)
+                        .attr("stroke-width", d => Math.sqrt(d.value))
+                        .attr("marker-end", d => `url(#arrow-${d.type})`)
+                        .attr("fill", "none")
+                        .on("mouseover", function(event, d) {
+                            // Highlight the link
+                            d3.select(this)
+                                .attr("stroke-opacity", 1)
+                                .attr("stroke-width", d => Math.sqrt(d.value) + 2);
+                                
+                            // Show tooltip
+                            tooltip.transition()
+                                .duration(200)
+                                .style("opacity", .9);
+                            tooltip.html(`${d.source.id} ${d.type} ${d.target.id}`)
+                                .style("left", (event.pageX + 10) + "px")
+                                .style("top", (event.pageY - 28) + "px");
+                                
+                            // Fetch relationship details
+                            fetch(`/api/relationship-details?source=${encodeURIComponent(d.source.id)}&target=${encodeURIComponent(d.target.id)}`)
+                                .then(response => response.text())
+                                .then(html => {
+                                    document.getElementById('relationship-details').innerHTML = html;
+                                })
+                                .catch(error => {
+                                    console.error('Error fetching relationship details:', error);
+                                });
+                        })
+                        .on("mouseout", function() {
+                            d3.select(this)
+                                .attr("stroke-opacity", 0.6)
+                                .attr("stroke-width", d => Math.sqrt(d.value));
+                                
+                            tooltip.transition()
+                                .duration(500)
+                                .style("opacity", 0);
+                        });
+                        
+                    // Create the nodes
+                    const node = g.append("g")
+                        .selectAll("g")
+                        .data(data.nodes)
+                        .enter().append("g")
+                        .call(d3.drag()
+                            .on("start", dragstarted)
+                            .on("drag", dragged)
+                            .on("end", dragended))
+                        .on("mouseover", function(event, d) {
+                            // Show tooltip
+                            tooltip.transition()
+                                .duration(200)
+                                .style("opacity", .9);
+                            tooltip.html(`${d.id} (${d.group})`)
+                                .style("left", (event.pageX + 10) + "px")
+                                .style("top", (event.pageY - 28) + "px");
+                                
+                            // Highlight connected links
+                            link.attr("stroke-opacity", l => 
+                                l.source.id === d.id || l.target.id === d.id ? 1 : 0.1);
+                        })
+                        .on("mouseout", function() {
+                            tooltip.transition()
+                                .duration(500)
+                                .style("opacity", 0);
+                                
+                            // Reset link highlighting
+                            link.attr("stroke-opacity", 0.6);
+                        });
+                        
+                    // Add circles for the nodes
+                    node.append("circle")
+                        .attr("r", d => Math.sqrt(d.value))
+                        .attr("fill", d => color(d.group))
+                        .attr("stroke", "#fff")
+                        .attr("stroke-width", 1.5);
+                        
+                    // Add labels to the nodes
+                    node.append("text")
+                        .text(d => d.id)
+                        .attr("font-size", 10)
+                        .attr("dx", 12)
+                        .attr("dy", ".35em")
+                        .attr("text-anchor", "middle")
+                        .style("pointer-events", "none");
+                        
+                    // Update positions in simulation tick
+                    simulation.on("tick", () => {
+                        link.attr("d", d => {
+                            const dx = d.target.x - d.source.x;
+                            const dy = d.target.y - d.source.y;
+                            const dr = Math.sqrt(dx * dx + dy * dy);
+                            return `M${d.source.x},${d.source.y}A${dr},${dr} 0 0,1 ${d.target.x},${d.target.y}`;
+                        });
+                        
+                        node.attr("transform", d => `translate(${d.x},${d.y})`);
+                    });
+                    
+                    // Drag functions
+                    function dragstarted(event, d) {
+                        if (!event.active) simulation.alphaTarget(0.3).restart();
+                        d.fx = d.x;
+                        d.fy = d.y;
+                    }
+                    
+                    function dragged(event, d) {
+                        d.fx = event.x;
+                        d.fy = event.y;
+                    }
+                    
+                    function dragended(event, d) {
+                        if (!event.active) simulation.alphaTarget(0);
+                        d.fx = null;
+                        d.fy = null;
+                    }
+                }
+                
+                // Handle HTMX events
+                document.body.addEventListener('htmx:afterSwap', function(evt) {
+                    if (evt.detail.target.id === 'network-container') {
+                        // Parse the JSON from the response
+                        try {
+                            const data = JSON.parse(evt.detail.xhr.response);
+                            updateNetworkVisualization(data);
+                        } catch (e) {
+                            console.error('Error parsing network data:', e);
+                        }
+                    }
+                });
+            });
+            """),
+            
+            cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border mb-8"
+        )
+    
     # Include homepage and dashboard routes
     @rt("/dashboard")
     def dashboard():
@@ -2820,33 +3608,31 @@ def serve():
             Div(
                 Div(
                     Div(
-                        Div(
-                            H3("Total Classifications", cls="font-bold text-lg"),
-                            P(str(stats["total"]), cls="text-4xl font-semibold text-primary"),
-                            cls="p-6"
-                        ),
-                        cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                        H3("Total Classifications", cls="font-bold text-lg"),
+                        P(str(stats["total"]), cls="text-4xl font-semibold text-primary"),
+                        cls="p-6"
                     ),
-                    Div(
-                        Div(
-                            H3("Single Images", cls="font-bold text-lg"),
-                            P(str(stats["total_single"]), cls="text-3xl font-semibold"),
-                            cls="p-6"
-                        ),
-                        cls="bg-base-100 rounded-lg shadow-md border custom-border"
-                    ),
-                    Div(
-                        Div(
-                            H3("Batch Images", cls="font-bold text-lg"),
-                            P(str(stats["total_batch"]), cls="text-3xl font-semibold"),
-                            cls="p-6"
-                        ),
-                        cls="bg-base-100 rounded-lg shadow-md border custom-border"
-                    ),
-                    cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
                 ),
-                cls="mb-8"
-            )
+                Div(
+                    Div(
+                        H3("Single Images", cls="font-bold text-lg"),
+                        P(str(stats["total_single"]), cls="text-3xl font-semibold"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                Div(
+                    Div(
+                        H3("Batch Images", cls="font-bold text-lg"),
+                        P(str(stats["total_batch"]), cls="text-3xl font-semibold"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
+            ),
+            cls="mb-8"
         )
         
         # Calculate data for the donut chart
@@ -3181,7 +3967,7 @@ def serve():
             cls="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border"
         )
         
-        # Charts Section with added comparison chart and plant diversity chart
+        # Charts Section
         charts_section = Div(
             H2("Classification Overview", cls="text-xl font-bold mb-4 text-bee-green"),
             Div(
@@ -3193,105 +3979,12 @@ def serve():
                     line_chart,
                     cls="w-full lg:w-1/2"
                 ),
-                cls="flex flex-col lg:flex-row gap-6 w-full mb-6"
-            ),
-            
-            # New Time Comparison Chart (added)
-            Div(
-                NotStr("""
-                <div class="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border">
-                <div class="flex justify-between items-center mb-4">
-                    <div>
-                    <h3 class="text-xl font-semibold text-bee-green">Classification Comparison</h3>
-                    <p class="text-base-content/70 text-sm">Compare classifications over time</p>
-                    </div>
-                    <div class="flex items-center">
-                    <span id="comparison-growth" class="text-green-500 text-xl font-bold mr-1">23%</span>
-                    <svg id="comparison-growth-icon" class="w-3 h-3" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 10 14">
-                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13V1m0 0L1 5m4-4 4 4"/>
-                    </svg>
-                    </div>
-                </div>
-                
-                <div id="comparison-chart" class="w-full h-64"></div>
-                
-                <div class="flex justify-between items-center pt-5 border-t border-base-300 mt-4">
-                    <!-- Period selector dropdown -->
-                    <div class="dropdown">
-                    <button 
-                        id="comparison-dropdown-button"
-                        class="text-sm font-medium text-base-content/70 hover:text-base-content text-center inline-flex items-center"
-                        type="button">
-                        <span id="current-period-text">Week-over-Week</span>
-                        <svg class="w-2.5 m-2.5 ms-1.5" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 10 6">
-                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m1 1 4 4 4-4"/>
-                        </svg>
-                    </button>
-                    <div id="comparison-dropdown" class="dropdown-content hidden z-10 bg-base-100 shadow-lg rounded-lg w-44">
-                        <ul class="py-2 text-sm">
-                        <li><a href="#" data-period="year" class="block px-4 py-2 hover:bg-base-200">Year-over-Year</a></li>
-                        <li><a href="#" data-period="month" class="block px-4 py-2 hover:bg-base-200">Month-over-Month</a></li>
-                        <li><a href="#" data-period="week" class="block px-4 py-2 hover:bg-base-200">Week-over-Week</a></li>
-                        </ul>
-                    </div>
-                    </div>
-                    
-                    <!-- View detailed report link -->
-                    <a href="/detailed-comparison-report" class="uppercase text-sm font-semibold inline-flex items-center text-primary hover:underline">
-                    Detailed Report
-                    <svg class="w-2.5 h-2.5 ms-1.5" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 6 10">
-                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m1 9 4-4-4-4"/>
-                    </svg>
-                    </a>
-                </div>
-                </div>
-                """),
-                cls="w-full mb-6"
-            ),
-            
-            # New Plant Diversity Radial Chart (added)
-            Div(
-                NotStr("""
-                <div class="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border">
-                <div class="flex justify-between items-center mb-4">
-                    <h3 class="text-xl font-semibold text-bee-green">Plant Classification Diversity</h3>
-                    
-                    <!-- Information tooltip -->
-                    <div class="dropdown dropdown-end">
-                    <button class="text-base-content/50 hover:text-base-content">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                        </svg>
-                    </button>
-                    <div class="dropdown-content card compact bg-base-100 shadow-lg rounded-box w-64 p-2 text-sm">
-                        <div class="card-body">
-                        <h3 class="font-semibold">Plant Diversity Analysis</h3>
-                        <p>Shows the percentage distribution of plant types identified in insect habitat images.</p>
-                        </div>
-                    </div>
-                    </div>
-                </div>
-                
-                <!-- Radial chart container -->
-                <div id="plant-diversity-chart" class="w-full h-80"></div>
-                
-                <!-- Footer actions -->
-                <div class="flex justify-end mt-4 pt-4 border-t border-base-300">
-                    <a href="/plant-diversity-report" class="text-sm font-semibold text-primary hover:underline inline-flex items-center">
-                    View Full Biodiversity Report
-                    <svg class="w-2.5 h-2.5 ms-1.5" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 6 10">
-                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m1 9 4-4-4-4"/>
-                    </svg>
-                    </a>
-                </div>
-                </div>
-                """),
-                cls="w-full"
+                cls="flex flex-col lg:flex-row gap-6 w-full"
             ),
             cls="mb-8"
         )
-        
-        # Map Section
+
+        # Map Section - Add this after the charts_section and before network_visualization
         map_section = Div(
             H2("Conservation Project Map", cls="text-xl font-bold mb-4 text-bee-green"),
             Div(
@@ -3306,6 +3999,9 @@ def serve():
             ),
             cls="mb-8"
         )
+        
+        # Build plant-insect network visualization component
+        network_visualization = build_network_visualization(stats)
         
         # Confidence & Feedback Section
         confidence_feedback_section = Div(
@@ -3484,8 +4180,7 @@ def serve():
                             for id, category, confidence, feedback, created_at, context_source in stats["recent_classifications"]
                         ]
                     ),
-                    cls="table table-zebra w-full",
-                    id="recent-classifications-table"
+                    cls="table table-zebra w-full"
                 ),
                 id="classifications-table-container",
                 cls="overflow-x-auto"
@@ -3666,8 +4361,7 @@ def serve():
                         id="flowbite-table-body"
                     ),
                     
-                    cls="w-full text-sm text-left text-gray-500 dark:text-gray-400 flowbite-table",
-                    id="all-classifications-table"
+                    cls="w-full text-sm text-left text-gray-500 dark:text-gray-400 flowbite-table"
                 ),
                 # Pagination with HTMX
                 Nav(
@@ -3733,6 +4427,115 @@ def serve():
                 
                 cls="relative overflow-x-auto shadow-md sm:rounded-lg"
             ),
+            
+            # Image Modal for Detail View
+            Div(
+                Div(
+                    Div(
+                        H3("Classification Details", cls="text-lg leading-6 font-medium text-gray-900", id="modal-title"),
+                        Div(
+                            Div(
+                                # Placeholder image
+                                Svg(
+                                    Path(
+                                        stroke_linecap="round",
+                                        stroke_linejoin="round",
+                                        stroke_width="2",
+                                        d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+                                    ),
+                                    id="modal-image-placeholder",
+                                    cls="h-48 w-48 text-gray-400",
+                                    fill="none",
+                                    viewBox="0 0 24 24",
+                                    stroke="currentColor"
+                                ),
+                                Img(
+                                    id="modal-image",
+                                    cls="max-h-64 hidden",
+                                    src="",
+                                    alt="Classification Image"
+                                ),
+                                cls="bg-gray-100 p-4 rounded-lg flex items-center justify-center"
+                            ),
+                            Div(
+                                P(
+                                    Span("ID:", cls="font-semibold"),
+                                    Span(id="modal-id")
+                                ),
+                                P(
+                                    Span("Category:", cls="font-semibold"),
+                                    Span(id="modal-category")
+                                ),
+                                P(
+                                    Span("Confidence:", cls="font-semibold"),
+                                    Span(id="modal-confidence")
+                                ),
+                                P(
+                                    Span("Reference Source:", cls="font-semibold"),
+                                    Span(id="modal-source"),
+                                    id="modal-source-container",
+                                    cls="hidden"
+                                ),
+                                P(
+                                    Span("Description:", cls="font-semibold"),
+                                    Span(id="modal-description"),
+                                    id="modal-description-container",
+                                    cls="hidden"
+                                ),
+                                cls="mt-4 text-left"
+                            ),
+                            cls="mt-2 px-7 py-3"
+                        ),
+                        Div(
+                            Button(
+                                "Close",
+                                id="modal-close",
+                                cls="px-4 py-2 bg-gray-500 text-white text-base font-medium rounded-md w-full shadow-sm hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-300"
+                            ),
+                            cls="items-center px-4 py-3"
+                        ),
+                        cls="mt-3 text-center"
+                    ),
+                    cls="relative top-20 mx-auto p-5 border w-11/12 md:w-3/4 lg:w-1/2 shadow-lg rounded-md bg-white"
+                ),
+                id="image-modal",
+                cls="fixed hidden inset-0 bg-black bg-opacity-50 overflow-y-auto h-full w-full z-50"
+            ),
+            
+            # Modal handling script
+            Script("""
+            // Modal handling functions
+            function showImageModal(id, category, confidence) {
+                // Set modal content
+                document.getElementById('modal-id').textContent = id;
+                document.getElementById('modal-category').textContent = category;
+                
+                // Set confidence with appropriate color
+                const confidenceEl = document.getElementById('modal-confidence');
+                confidenceEl.textContent = confidence;
+                confidenceEl.className = confidence === 'High' ? 'text-green-600' : 
+                                        confidence === 'Medium' ? 'text-yellow-600' : 'text-red-600';
+                
+                // Show modal
+                document.getElementById('image-modal').classList.remove('hidden');
+                
+                // Optional: Fetch additional details with HTMX
+                htmx.ajax('GET', '/api/classification-details/' + id, {target: '#modal-description-container'});
+            }
+            
+            // Close modal when close button is clicked
+            document.getElementById('modal-close').addEventListener('click', function() {
+                document.getElementById('image-modal').classList.add('hidden');
+            });
+            
+            // Close modal when backdrop is clicked
+            document.getElementById('image-modal').addEventListener('click', function(e) {
+                if (e.target === this) {
+                    this.classList.add('hidden');
+                }
+            });
+            """),
+            
             cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border mb-8"
         )
         
@@ -3742,47 +4545,43 @@ def serve():
             Div(
                 # Tab navigation
                 Div(
-                    Div(
-                        Div(role="tablist", cls="tabs tabs-boxed bg-base-200 p-1 mb-6"),
-                        
-                        Button(
-                            "Recent Classifications", 
-                            cls="tab tab-active",
-                            id="tab-recent",
-                            onclick="showTab('recent')",
-                            role="tab",
-                            aria_selected="true"
-                        ),
-                        
-                        Button(
-                            "All Classifications", 
-                            cls="tab",
-                            id="tab-all",
-                            onclick="showTab('all')",
-                            role="tab",
-                            aria_selected="false"
-                        ),
-                        
-                        cls="flex justify-center"
+                    Div(role="tablist", cls="tabs tabs-boxed bg-base-200 p-1 mb-6"),
+                    
+                    Button(
+                        "Recent Classifications", 
+                        cls="tab tab-active",
+                        id="tab-recent",
+                        onclick="showTab('recent')",
+                        role="tab",
+                        aria_selected="true"
                     ),
                     
-                    # Tab content containers
+                    Button(
+                        "All Classifications", 
+                        cls="tab",
+                        id="tab-all",
+                        onclick="showTab('all')",
+                        role="tab",
+                        aria_selected="false"
+                    ),
+                    
+                    cls="flex justify-center"
+                ),
+                
+                # Tab content containers
+                Div(
+                    # DaisyUI Table Content
                     Div(
-                        # DaisyUI Table Content
-                        Div(
-                            daisyui_table,
-                            id="tab-content-recent",
-                            cls="block"
-                        ),
-                        
-                        # Flowbite Table Content
-                        Div(
-                            flowbite_table,
-                            id="tab-content-all",
-                            cls="hidden"
-                        ),
-                        
-                        cls="w-full"
+                        daisyui_table,
+                        id="tab-content-recent",
+                        cls="block"
+                    ),
+                    
+                    # Flowbite Table Content
+                    Div(
+                        flowbite_table,
+                        id="tab-content-all",
+                        cls="hidden"
                     ),
                     
                     # Simple tab switching script
@@ -3847,369 +4646,7 @@ def serve():
             cls="mb-8"
         )
         
-        # Add script for the charts and table export functionality
-        chart_scripts = Script("""
-        // Chart creation functions
-        document.addEventListener('DOMContentLoaded', function() {
-            // Time Comparison Chart
-            function createComparisonChart() {
-            // Initialize the ApexCharts with multiple data series
-            const comparisonChart = new ApexCharts(document.querySelector("#comparison-chart"), {
-                series: [
-                {
-                    name: "Current Period",
-                    data: [31, 40, 28, 51, 42, 82, 56]
-                },
-                {
-                    name: "Previous Period", 
-                    data: [11, 32, 45, 32, 34, 52, 41]
-                }
-                ],
-                chart: {
-                height: 300,
-                type: 'line',
-                fontFamily: 'inherit',
-                foreColor: 'inherit',
-                toolbar: {
-                    show: false
-                },
-                animations: {
-                    enabled: true,
-                    easing: 'easeinout',
-                    speed: 800
-                }
-                },
-                colors: ['oklch(47% 0.266 120.957)', 'oklch(74% 0.234 93.635)'], // Green and yellow bee colors
-                stroke: {
-                width: 3,
-                curve: 'smooth'
-                },
-                grid: {
-                show: true,
-                borderColor: 'var(--color-base-300)',
-                strokeDashArray: 5,
-                },
-                markers: {
-                size: 5,
-                strokeWidth: 0,
-                hover: {
-                    size: 7
-                }
-                },
-                xaxis: {
-                categories: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
-                labels: {
-                    style: {
-                    fontSize: '12px'
-                    }
-                }
-                },
-                yaxis: {
-                title: {
-                    text: 'Classifications'
-                },
-                min: 0,
-                forceNiceScale: true
-                },
-                legend: {
-                position: 'top',
-                horizontalAlign: 'right',
-                fontSize: '14px'
-                },
-                tooltip: {
-                shared: true,
-                intersect: false,
-                y: {
-                    formatter: function(value) {
-                    return value + " classifications";
-                    }
-                }
-                },
-                fill: {
-                type: 'gradient',
-                gradient: {
-                    shade: 'light',
-                    type: "vertical",
-                    shadeIntensity: 0.3,
-                    inverseColors: false,
-                    opacityFrom: 0.7,
-                    opacityTo: 0.2,
-                    stops: [0, 100]
-                }
-                }
-            });
-            
-            // Render the chart
-            comparisonChart.render();
-            
-            // Set up period comparison change handlers
-            document.querySelectorAll('#comparison-dropdown a').forEach(item => {
-                item.addEventListener('click', function(e) {
-                e.preventDefault();
-                const period = this.getAttribute('data-period');
-                const currentPeriodText = document.getElementById('current-period-text');
-                
-                // Update button text
-                currentPeriodText.textContent = this.textContent;
-                
-                // Sample data for different periods (would fetch from API in real app)
-                const periodData = {
-                    'year': {
-                    current: [120, 150, 180, 210, 250, 320, 410],
-                    previous: [100, 130, 160, 190, 220, 270, 350]
-                    },
-                    'month': {
-                    current: [45, 52, 38, 65, 72, 56, 81],
-                    previous: [38, 45, 32, 58, 61, 48, 72]
-                    },
-                    'week': {
-                    current: [31, 40, 28, 51, 42, 82, 56],
-                    previous: [11, 32, 45, 32, 34, 52, 41]
-                    }
-                };
-                
-                // Update chart with new data
-                comparisonChart.updateSeries([
-                    {
-                    name: "Current Period",
-                    data: periodData[period].current
-                    },
-                    {
-                    name: "Previous Period",
-                    data: periodData[period].previous
-                    }
-                ]);
-                
-                // Calculate growth percentage
-                const currentTotal = periodData[period].current.reduce((a, b) => a + b, 0);
-                const previousTotal = periodData[period].previous.reduce((a, b) => a + b, 0);
-                const growth = Math.round(((currentTotal - previousTotal) / previousTotal) * 100);
-                
-                // Update growth indicator
-                const growthIndicator = document.getElementById('comparison-growth');
-                growthIndicator.textContent = growth + '%';
-                
-                // Update growth icon and color
-                const growthIcon = document.getElementById('comparison-growth-icon');
-                if (growth > 0) {
-                    growthIndicator.classList.remove('text-red-500');
-                    growthIndicator.classList.add('text-green-500');
-                    growthIcon.innerHTML = '<path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13V1m0 0L1 5m4-4 4 4"/>';
-                } else {
-                    growthIndicator.classList.remove('text-green-500');
-                    growthIndicator.classList.add('text-red-500');
-                    growthIcon.innerHTML = '<path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 1v12m0 0 4-4m-4 4-4-4"/>';
-                }
-                });
-            });
-            }
-            
-            // Plant Diversity Radial Chart
-            function createPlantDiversityChart() {
-            const plantDiversityChart = new ApexCharts(document.querySelector("#plant-diversity-chart"), {
-                series: [76, 45, 32, 18, 10],
-                chart: {
-                height: 320,
-                type: 'radialBar',
-                },
-                plotOptions: {
-                radialBar: {
-                    dataLabels: {
-                    name: {
-                        fontSize: '14px',
-                        fontFamily: 'inherit',
-                        fontWeight: 'medium',
-                        color: 'var(--color-base-content)'
-                    },
-                    value: {
-                        fontSize: '16px',
-                        fontFamily: 'inherit',
-                        fontWeight: 'bold',
-                        formatter: function (val) {
-                        return val + '%';
-                        }
-                    },
-                    total: {
-                        show: true,
-                        label: 'Plant Types',
-                        formatter: function (w) {
-                        // Calculate the average of all values
-                        return Math.round(w.globals.seriesTotals.reduce((a, b) => a + b, 0) / w.globals.series.length) + '%';
-                        }
-                    }
-                    },
-                    track: {
-                    background: 'var(--color-base-200)',
-                    strokeWidth: '100%',
-                    margin: 5
-                    },
-                    hollow: {
-                    size: '35%'
-                    }
-                }
-                },
-                colors: [
-                'oklch(47% 0.266 120.957)',    // Green - primary
-                'oklch(74% 0.234 93.635)',     // Yellow - secondary
-                'oklch(41% 0.234 41.252)',     // Brown - accent
-                '#43A047',                     // Additional green
-                '#8D6E63'                      // Additional brown
-                ],
-                labels: ['Flowering Plants', 'Grasses', 'Shrubs', 'Trees', 'Other'],
-                legend: {
-                show: true,
-                position: 'bottom',
-                fontFamily: 'inherit',
-                fontSize: '13px',
-                offsetY: 10
-                }
-            });
-            
-            plantDiversityChart.render();
-            }
-            
-            // Table export functionality
-            function setupTableExports() {
-            // Function to export table data to CSV
-            function exportTableToCSV(tableId, filename = 'download') {
-                const table = document.getElementById(tableId);
-                if (!table) {
-                console.error(`Table with ID ${tableId} not found`);
-                return;
-                }
-                
-                // Get all table rows
-                const rows = table.querySelectorAll('tr');
-                
-                // Prepare CSV content
-                let csvContent = [];
-                
-                // Process header row
-                const headerRow = rows[0];
-                const headers = headerRow.querySelectorAll('th');
-                const headerValues = [];
-                
-                headers.forEach(header => {
-                // Extract text content without the sort icons
-                let headerText = header.textContent.trim();
-                // Remove any extra whitespace
-                headerText = headerText.replace(/\\s+/g, ' ');
-                headerValues.push(`"${headerText}"`);
-                });
-                
-                csvContent.push(headerValues.join(','));
-                
-                // Process data rows (skip header row)
-                for (let i = 1; i < rows.length; i++) {
-                const row = rows[i];
-                const cells = row.querySelectorAll('td');
-                const rowValues = [];
-                
-                cells.forEach(cell => {
-                    // Extract text and wrap in quotes to handle commas in data
-                    rowValues.push(`"${cell.textContent.trim()}"`);
-                });
-                
-                csvContent.push(rowValues.join(','));
-                }
-                
-                // Create a CSV string
-                const csvString = csvContent.join('\\n');
-                
-                // Create a download link and trigger it
-                const link = document.createElement('a');
-                link.setAttribute('href', 'data:text/csv;charset=utf-8,' + encodeURIComponent(csvString));
-                link.setAttribute('download', `${filename}.csv`);
-                link.style.display = 'none';
-                
-                document.body.appendChild(link);
-                link.click();
-                document.body.removeChild(link);
-            }
-            
-            // Add export buttons to each table
-            const tables = document.querySelectorAll('table');
-            tables.forEach((table, index) => {
-                const tableId = table.id || `table-${index}`;
-                
-                // Ensure the table has an ID
-                if (!table.id) {
-                table.id = tableId;
-                }
-                
-                // Create export controls container
-                const exportContainer = document.createElement('div');
-                exportContainer.className = 'flex justify-end mb-4';
-                
-                // Create dropdown for export options
-                exportContainer.innerHTML = `
-                <div class="dropdown dropdown-end">
-                    <button class="btn btn-sm btn-outline">
-                    Export
-                    <svg class="w-4 h-4 ml-1" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-                    </svg>
-                    </button>
-                    <ul class="dropdown-content menu p-2 shadow bg-base-100 rounded-box w-52">
-                    <li><a href="#" data-export="csv" data-table="${tableId}">Export as CSV</a></li>
-                    <li><a href="#" data-export="excel" data-table="${tableId}">Export as Excel</a></li>
-                    <li><a href="#" data-export="pdf" data-table="${tableId}">Export as PDF</a></li>
-                    </ul>
-                </div>
-                `;
-                
-                // Insert export controls before the table
-                table.parentNode.insertBefore(exportContainer, table);
-                
-                // Add event listeners for export buttons
-                exportContainer.querySelectorAll('[data-export]').forEach(button => {
-                button.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    const format = button.getAttribute('data-export');
-                    const targetTable = button.getAttribute('data-table');
-                    
-                    if (format === 'csv') {
-                    exportTableToCSV(targetTable, `table-export-${Date.now()}`);
-                    } else {
-                    // For other formats, you might need additional libraries
-                    // This is a placeholder for future implementation
-                    alert(`Export as ${format.toUpperCase()} will be implemented soon!`);
-                    }
-                });
-                });
-            });
-            }
-            
-            // Initialize everything
-            if (document.querySelector("#comparison-chart")) {
-                createComparisonChart();
-            }
-            
-            if (document.querySelector("#plant-diversity-chart")) {
-                createPlantDiversityChart();
-            }
-            
-            setupTableExports();
-            
-            // Set up dropdown toggles
-            document.getElementById('comparison-dropdown-button')?.addEventListener('click', function() {
-                document.getElementById('comparison-dropdown').classList.toggle('hidden');
-            });
-            
-            // Close dropdowns when clicking outside
-            document.addEventListener('click', function(e) {
-                if (!e.target.closest('#comparison-dropdown-button')) {
-                    const dropdown = document.getElementById('comparison-dropdown');
-                    if (dropdown && !dropdown.classList.contains('hidden')) {
-                        dropdown.classList.add('hidden');
-                    }
-                }
-            });
-        });
-        """)
-
         return Title("Dashboard - Insect Classifier"), Main(
-            chart_scripts,  # Add the scripts for charts and table export
             Div(
                 H1("Classification Dashboard", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
                 P("Statistics and insights from the Insect Classifier with RAG", cls="text-center mb-8 text-base-content/70"),
@@ -4217,6 +4654,7 @@ def serve():
                 summary_cards,
                 charts_section,
                 map_section,
+                network_visualization,  # Add the network visualization to the dashboard
                 confidence_feedback_section,
                 tables_section,
                 rag_section,
@@ -4230,6 +4668,28 @@ def serve():
     @rt("/")
     def homepage():
         """Render the unified classifier dashboard with enhanced carousel and RAG display"""
+        
+        # Navigation bar
+        navbar = Div(
+            Div(
+                A(
+                    Span("🐝", cls="text-xl"),
+                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
+                    href="/",
+                    cls="flex items-center"
+                ),
+                Div(
+                    A(
+                        "Dashboard",
+                        href="/dashboard",
+                        cls="btn btn-sm btn-ghost"
+                    ),
+                    cls="flex-none"
+                ),
+                cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
+            ),
+            cls="w-full"
+        )
         
         # Create toggle switches for classification options
         def create_toggle(name, label, checked=False, description=None):
@@ -4438,925 +4898,7 @@ def serve():
             cls="w-full bg-base-100 p-6 rounded-lg shadow-lg custom-border border"
         )
         
-        # Navigation bar
-        navbar = Div(
-            Div(
-                A(
-                    Span("🐝", cls="text-xl"),
-                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
-                    href="/",
-                    cls="flex items-center"
-                ),
-                Div(
-                    A(
-                        "Dashboard",
-                        href="/dashboard",
-                        cls="btn btn-sm btn-ghost"
-                    ),
-                    cls="flex-none"
-                ),
-                cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
-            ),
-            cls="w-full"
-        )
-        
-        # Add updated script for form handling with carousel and RAG display enhancements
-        form_script = Script("""
-        document.addEventListener('DOMContentLoaded', function() {
-            // Form elements - cache all DOM elements we'll need to reference
-            const imageInput = document.getElementById('image-input');
-            const singlePreview = document.getElementById('single-preview');
-            const batchPreviewsContainer = document.getElementById('batch-previews');
-            const countDisplay = document.getElementById('count-display');
-            const imageCountElem = document.getElementById('image-count');
-            const classifyButton = document.getElementById('classify-button');
-            
-            // Results elements - references to DOM elements for displaying results
-            const loadingIndicator = document.getElementById('loading-indicator').parentElement;
-            const resultsPlaceholder = document.getElementById('results-placeholder');
-            const resultsContent = document.getElementById('results-content');
-            const singleResult = document.getElementById('single-result');
-            const batchResults = document.getElementById('batch-results');
-            const resultActions = document.getElementById('result-actions');
-            const copyButton = document.getElementById('copy-button');
-            const newButton = document.getElementById('new-button');
-            
-            // RAG Context elements
-            const ragContextSection = document.getElementById('rag-context-section');
-            const ragContextDisplay = document.getElementById('rag-context-display');
-            
-            // Mode tracking variables
-            let isBatchMode = false;
-            const MAX_IMAGES = 5;
-            let selectedFiles = [];
-            let rawResponseText = '';
-            
-            // Debug elements on page load
-            console.log("DOM loaded - Bee Classifier Initialized");
-            console.log("Button state:", classifyButton ? (classifyButton.disabled ? "disabled" : "enabled") : "button not found");
-            
-            // Explicitly attach the change event listener
-            // This ensures the file input triggers our handler even if the HTML attribute binding fails
-            if (imageInput) {
-                console.log("Setting up file input change listener");
-                imageInput.addEventListener('change', function(event) {
-                    console.log("File input changed - files selected:", event.target.files.length);
-                    handleFileSelection(event);
-                });
-            } else {
-                console.error("Critical Error: Image input element not found");
-            }
-            
-            // Get options from the form controls - always include all processing steps
-            function getOptions() {
-                return {
-                    use_rag: document.querySelector('input[name="use_rag"]').checked,
-                    detailed_description: true,  // Always on
-                    plant_classification: true,  // Always on
-                    taxonomy: true               // Always on
-                };
-            }
-            
-            // Update the steps UI based on progress
-            function updateStepsUI(stage) {
-                // Reset all steps
-                document.getElementById('step-classify').classList.remove('step-primary');
-                document.getElementById('step-plants').classList.remove('step-primary');
-                document.getElementById('step-taxonomy').classList.remove('step-primary');
-                
-                // Update steps based on stage
-                switch(stage) {
-                    case 'classify':
-                        document.getElementById('step-classify').classList.add('step-primary');
-                        break;
-                    case 'plants':
-                        document.getElementById('step-classify').classList.add('step-primary');
-                        document.getElementById('step-plants').classList.add('step-primary');
-                        break;
-                    case 'taxonomy':
-                        document.getElementById('step-classify').classList.add('step-primary');
-                        document.getElementById('step-plants').classList.add('step-primary');
-                        document.getElementById('step-taxonomy').classList.add('step-primary');
-                        break;
-                    default:
-                        break;
-                }
-            }
-            
-            // Handle file selection - core function that processes selected files
-            window.handleFileSelection = function(event) {
-                console.log("handleFileSelection called");
-                const files = event.target.files;
-                
-                if (!files || files.length === 0) {
-                    console.log("No files selected");
-                    resetForm();
-                    return;
-                }
-                
-                console.log(`${files.length} files selected`);
-                
-                if (files.length > MAX_IMAGES) {
-                    alert(`Please select a maximum of ${MAX_IMAGES} images.`);
-                    resetForm();
-                    return;
-                }
-                
-                // Determine mode based on file count
-                isBatchMode = files.length > 1;
-                selectedFiles = Array.from(files);
-                
-                if (isBatchMode) {
-                    // Batch mode - show multiple previews
-                    console.log("Batch mode activated");
-                    singlePreview.classList.add('hidden');
-                    batchPreviewsContainer.classList.remove('hidden');
-                    batchPreviewsContainer.innerHTML = '';
-                    
-                    // Create preview for each image
-                    selectedFiles.forEach((file, index) => {
-                        const reader = new FileReader();
-                        
-                        reader.onload = function(e) {
-                            // Create preview container
-                            const previewDiv = document.createElement('div');
-                            previewDiv.className = 'preview-item';
-                            previewDiv.dataset.index = index;
-                            
-                            // Create image preview
-                            const img = document.createElement('img');
-                            img.src = e.target.result;
-                            img.className = 'preview-img';
-                            
-                            // Create remove button
-                            const removeBtn = document.createElement('div');
-                            removeBtn.className = 'remove-btn';
-                            removeBtn.innerHTML = '×';
-                            removeBtn.onclick = function() {
-                                // Remove this file
-                                selectedFiles.splice(index, 1);
-                                
-                                // Update UI
-                                if (selectedFiles.length === 0) {
-                                    resetForm();
-                                } else if (selectedFiles.length === 1) {
-                                    // Switch to single mode
-                                    isBatchMode = false;
-                                    showSinglePreview(selectedFiles[0]);
-                                } else {
-                                    // Stay in batch mode but update
-                                    updateBatchPreviews();
-                                }
-                            };
-                            
-                            // Add elements
-                            previewDiv.appendChild(img);
-                            previewDiv.appendChild(removeBtn);
-                            batchPreviewsContainer.appendChild(previewDiv);
-                        };
-                        
-                        reader.readAsDataURL(file);
-                    });
-                    
-                    // Update count display
-                    imageCountElem.textContent = `${selectedFiles.length} images selected`;
-                    countDisplay.classList.remove('hidden');
-                } else {
-                    // Single mode - show one preview
-                    console.log("Single image mode activated");
-                    showSinglePreview(selectedFiles[0]);
-                }
-                
-                // Enable classify button - with visual feedback
-                if (classifyButton) {
-                    classifyButton.disabled = false;
-                    classifyButton.classList.remove('opacity-50');
-                    classifyButton.classList.add('hover:bg-primary-focus');
-                    console.log("Classify button enabled");
-                } else {
-                    console.error("Critical Error: Classify button not found");
-                }
-            };
-            
-            // Show single image preview
-            function showSinglePreview(file) {
-                console.log("Showing single preview for file:", file.name);
-                const reader = new FileReader();
-                
-                reader.onload = function(e) {
-                    singlePreview.src = e.target.result;
-                    singlePreview.classList.remove('hidden');
-                    batchPreviewsContainer.classList.add('hidden');
-                    countDisplay.classList.add('hidden');
-                };
-                
-                reader.readAsDataURL(file);
-            }
-            
-            // Update batch previews
-            function updateBatchPreviews() {
-                console.log("Updating batch previews, count:", selectedFiles.length);
-                batchPreviewsContainer.innerHTML = '';
-                
-                selectedFiles.forEach((file, index) => {
-                    const reader = new FileReader();
-                    
-                    reader.onload = function(e) {
-                        // Create preview container
-                        const previewDiv = document.createElement('div');
-                        previewDiv.className = 'preview-item';
-                        previewDiv.dataset.index = index;
-                        
-                        // Create image preview
-                        const img = document.createElement('img');
-                        img.src = e.target.result;
-                        img.className = 'preview-img';
-                        
-                        // Create remove button
-                        const removeBtn = document.createElement('div');
-                        removeBtn.className = 'remove-btn';
-                        removeBtn.innerHTML = '×';
-                        removeBtn.onclick = function() {
-                            // Remove this file
-                            selectedFiles.splice(index, 1);
-                            
-                            // Update UI
-                            if (selectedFiles.length === 0) {
-                                resetForm();
-                            } else if (selectedFiles.length === 1) {
-                                // Switch to single mode
-                                isBatchMode = false;
-                                showSinglePreview(selectedFiles[0]);
-                            } else {
-                                // Stay in batch mode but update
-                                updateBatchPreviews();
-                            }
-                        };
-                        
-                        // Add elements
-                        previewDiv.appendChild(img);
-                        previewDiv.appendChild(removeBtn);
-                        batchPreviewsContainer.appendChild(previewDiv);
-                    };
-                    
-                    reader.readAsDataURL(file);
-                });
-                
-                // Update count
-                imageCountElem.textContent = `${selectedFiles.length} images selected`;
-                countDisplay.classList.remove('hidden');
-            }
-            
-            // Reset the form to initial state
-            function resetForm() {
-                console.log("Resetting form");
-                imageInput.value = '';
-                singlePreview.src = '';
-                singlePreview.classList.add('hidden');
-                batchPreviewsContainer.innerHTML = '';
-                batchPreviewsContainer.classList.add('hidden');
-                countDisplay.classList.add('hidden');
-                
-                // Reset button with visual indicators
-                if (classifyButton) {
-                    classifyButton.disabled = true;
-                    classifyButton.classList.add('opacity-50');
-                    classifyButton.classList.remove('hover:bg-primary-focus');
-                }
-                
-                selectedFiles = [];
-                isBatchMode = false;
-                
-                // Reset steps UI
-                updateStepsUI(null);
-            }
-            
-            // Handle classify button click
-            if (classifyButton) {
-                classifyButton.addEventListener('click', function() {
-                    console.log("Classify button clicked");
-                    
-                    // Show loading state
-                    loadingIndicator.classList.remove('hidden');
-                    resultsPlaceholder.classList.add('hidden');
-                    resultsContent.classList.add('hidden');
-                    resultActions.classList.add('hidden');
-                    ragContextSection.classList.add('hidden'); // Hide RAG context section
-                    classifyButton.disabled = true;
-                    classifyButton.classList.add('opacity-50');
-                    
-                    // Start with first step
-                    updateStepsUI('classify');
-                    
-                    if (isBatchMode) {
-                        // Batch mode - process multiple images
-                        console.log("Processing batch of", selectedFiles.length, "images");
-                        processBatchImages();
-                    } else {
-                        // Single mode - process one image
-                        console.log("Processing single image");
-                        processSingleImage();
-                    }
-                });
-            }
-            
-            // Process a single image
-            function processSingleImage() {
-                console.log("Starting single image processing");
-                
-                // Get the base64 image data
-                const base64Data = singlePreview.src.split(',')[1];
-                
-                // Send request to API
-                fetch('/api/classify', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        image_data: base64Data,
-                        options: getOptions()
-                    })
-                })
-                .then(response => {
-                    console.log("Received API response, status:", response.status);
-                    return response.json();
-                })
-                .then(data => {
-                    // Hide loading indicator
-                    loadingIndicator.classList.add('hidden');
-                    
-                    if (data.error) {
-                        console.error("Error from API:", data.error);
-                        // Show error message
-                        singleResult.innerHTML = `
-                            <div class="alert alert-error">
-                                <span>Error: ${data.error}</span>
-                            </div>
-                        `;
-                        singleResult.classList.remove('hidden');
-                        batchResults.classList.add('hidden');
-                        resultsContent.classList.remove('hidden');
-                        return;
-                    }
-                    
-                    console.log("Classification successful, displaying results");
-                    
-                    // Update steps UI based on result content
-                    updateStepsUI('classify'); // Initial classification always done
-                    
-                    // Check if plant identification is included
-                    if (data.details && 
-                    (data.details["Plant Identification"] || 
-                        data.details["Detailed Description"])) {
-                        updateStepsUI('plants');
-                        
-                        // Check if taxonomy is included
-                        if (data.details && data.details["Taxonomy"]) {
-                            updateStepsUI('taxonomy');
-                        }
-                    }
-                    
-                    // Display the result using the enhanced display function
-                    displaySingleResult(data);
-                    
-                    // Display RAG context if available
-                    displayRagContext(data);
-                    
-                    // Show containers
-                    singleResult.classList.remove('hidden');
-                    batchResults.classList.add('hidden');
-                    resultsContent.classList.remove('hidden');
-                    resultActions.classList.remove('hidden');
-                })
-                .catch(error => {
-                    console.error('Error classifying image:', error);
-                    loadingIndicator.classList.add('hidden');
-                    singleResult.innerHTML = `
-                        <div class="alert alert-error">
-                            <span>Error: Could not process your request. Please try again.</span>
-                        </div>
-                    `;
-                    singleResult.classList.remove('hidden');
-                    batchResults.classList.add('hidden');
-                    resultsContent.classList.remove('hidden');
-                    classifyButton.disabled = false;
-                    classifyButton.classList.remove('opacity-50');
-                    
-                    // Reset steps UI
-                    updateStepsUI(null);
-                });
-            }
-            
-            // Process batch of images
-            function processBatchImages() {
-                console.log("Starting batch image processing");
-                
-                // Create form data for file upload
-                const formData = new FormData();
-                
-                // Add all files
-                selectedFiles.forEach((file, index) => {
-                    formData.append(`image_${index}`, file);
-                    console.log(`Added image_${index} to form data:`, file.name);
-                });
-                
-                // Add options
-                const options = getOptions();
-                formData.append('options', JSON.stringify(options));
-                console.log("Added options to form data:", options);
-                
-                // Send batch request
-                fetch('/classify-batch', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => {
-                    console.log("Received batch API response, status:", response.status);
-                    return response.json();
-                })
-                .then(data => {
-                    // Hide loading indicator
-                    loadingIndicator.classList.add('hidden');
-                    
-                    if (data.error) {
-                        console.error("Error from batch API:", data.error);
-                        // Show error message
-                        batchResults.innerHTML = `
-                            <div class="alert alert-error">
-                                <span>Error: ${data.error}</span>
-                            </div>
-                        `;
-                        singleResult.classList.add('hidden');
-                        batchResults.classList.remove('hidden');
-                        resultsContent.classList.remove('hidden');
-                        return;
-                    }
-                    
-                    console.log("Batch classification successful, displaying results");
-                    
-                    // Update steps UI with final state
-                    updateStepsUI('taxonomy'); // For batch, assume all steps completed
-                    
-                    // Save raw response for copy button
-                    rawResponseText = data.raw_response;
-                    
-                    // Display batch results using the enhanced carousel display function
-                    displayBatchCarousel(data);
-                    
-                    // Display RAG context if available
-                    displayRagContext(data);
-                    
-                    // Show result sections
-                    singleResult.classList.add('hidden');
-                    batchResults.classList.remove('hidden');
-                    resultsContent.classList.remove('hidden');
-                    resultActions.classList.remove('hidden');
-                })
-                .catch(error => {
-                    console.error('Error in batch processing:', error);
-                    loadingIndicator.classList.add('hidden');
-                    batchResults.innerHTML = `
-                        <div class="alert alert-error">
-                            <span>Error: Could not process your request. Please try again.</span>
-                        </div>
-                    `;
-                    singleResult.classList.add('hidden');
-                    batchResults.classList.remove('hidden');
-                    resultsContent.classList.remove('hidden');
-                    classifyButton.disabled = false;
-                    classifyButton.classList.remove('opacity-50');
-                    
-                    // Reset steps UI
-                    updateStepsUI(null);
-                });
-            }
-            
-            // Setup copy button
-            if (copyButton) {
-                copyButton.addEventListener('click', function() {
-                    console.log("Copy button clicked");
-                    navigator.clipboard.writeText(rawResponseText);
-                    copyButton.innerHTML = 'Copied!';
-                    setTimeout(() => {
-                        copyButton.innerHTML = 'Copy Results';
-                    }, 2000);
-                });
-            }
-            
-            // Setup new button
-            if (newButton) {
-                newButton.addEventListener('click', function() {
-                    console.log("New classification button clicked");
-                    // Reset form
-                    resetForm();
-                    
-                    // Reset results
-                    resultsPlaceholder.classList.remove('hidden');
-                    resultsContent.classList.add('hidden');
-                    resultActions.classList.add('hidden');
-                    ragContextSection.classList.add('hidden'); // Hide RAG context
-                    singleResult.classList.add('hidden');
-                    batchResults.classList.add('hidden');
-                });
-            }
-            
-            // Display RAG context section
-            function displayRagContext(result) {
-                // Check if we have context data to display
-                if (result.context_source || 
-                    (result.context_paragraphs && result.context_paragraphs.length > 0) ||
-                    (result.top_sources && result.top_sources.length > 0)) {
-                    
-                    let contextHTML = '';
-                    
-                    // Add the source information
-                    if (result.context_source) {
-                        contextHTML += `
-                            <div class="mb-3">
-                                <span class="font-semibold">Source Document:</span>
-                                <span>${result.context_source}</span>
-                            </div>
-                        `;
-                    }
-                    
-                    // Add context paragraphs
-                    if (result.context_paragraphs && result.context_paragraphs.length > 0) {
-                        contextHTML += `
-                            <div class="mb-3">
-                                <div class="font-semibold mb-2">Reference Text:</div>
-                                <div class="text-sm bg-base-300 p-3 rounded-md max-h-40 overflow-y-auto">
-                                    ${result.context_paragraphs[0]}
-                                </div>
-                            </div>
-                        `;
-                        
-                        // If there are more paragraphs, add a collapsible section
-                        if (result.context_paragraphs.length > 1) {
-                            contextHTML += `
-                                <details class="collapse mb-3">
-                                    <summary class="collapse-title font-medium">Additional Reference Texts</summary>
-                                    <div class="collapse-content">
-                            `;
-                            
-                            for (let i = 1; i < result.context_paragraphs.length; i++) {
-                                contextHTML += `
-                                    <div class="mb-2 text-sm bg-base-300 p-3 rounded-md">
-                                        ${result.context_paragraphs[i]}
-                                    </div>
-                                `;
-                            }
-                            
-                            contextHTML += `
-                                    </div>
-                                </details>
-                            `;
-                        }
-                    }
-                    
-                    // Add top sources if available
-                    if (result.top_sources && result.top_sources.length > 0) {
-                        contextHTML += `
-                            <div class="mb-3">
-                                <div class="font-semibold mb-2">Top Reference Sources:</div>
-                                <ul class="list-disc pl-5">
-                        `;
-                        
-                        result.top_sources.forEach(source => {
-                            contextHTML += `
-                                <li>${source.filename || 'Unknown'}, page ${source.page || '?'}</li>
-                            `;
-                        });
-                        
-                        contextHTML += `
-                                </ul>
-                            </div>
-                        `;
-                    }
-                    
-                    // If we have any context to display, show the section
-                    if (contextHTML) {
-                        ragContextDisplay.innerHTML = contextHTML;
-                        ragContextSection.classList.remove('hidden');
-                    }
-                }
-            }
-            
-            // Function to display single classification result with context
-            function displaySingleResult(result) {
-                console.log("Displaying single result:", result.category);
-                const singleResult = document.getElementById('single-result');
-                
-                // Determine confidence class
-                let confidenceClass = 'badge-warning';
-                if (result.confidence === 'High') {
-                    confidenceClass = 'badge-success';
-                } else if (result.confidence === 'Low') {
-                    confidenceClass = 'badge-error';
-                }
-                
-                // Create result HTML
-                let resultHTML = `
-                    <div class="p-4 bg-base-200 rounded-lg mb-4">
-                        <div class="flex justify-between items-center mb-2">
-                            <h3 class="text-lg font-bold">${result.category}</h3>
-                            <span class="badge ${confidenceClass}">Confidence: ${result.confidence}</span>
-                        </div>
-                        <p class="mb-4">${result.description}</p>
-                `;
-                
-                // Add additional details if available
-                const details = result.details;
-                for (const key in details) {
-                    if (key !== 'Main Category' && key !== 'Confidence' && key !== 'Description') {
-                        resultHTML += `
-                            <div class="mb-2">
-                                <span class="font-semibold">${key}:</span>
-                                <span>${details[key]}</span>
-                            </div>
-                        `;
-                    }
-                }
-                
-                resultHTML += `</div>`;
-                
-                // Add feedback controls
-                resultHTML += `
-                    <div class="flex items-center mt-4 mb-4">
-                        <span class="text-sm mr-2">Rate this classification:</span>
-                        <button class="btn btn-outline btn-sm mr-2" id="thumbs-up-button" onclick="provideFeedback('${result.id}', 'positive')">
-                            👍
-                        </button>
-                        <button class="btn btn-outline btn-sm" id="thumbs-down-button" onclick="provideFeedback('${result.id}', 'negative')">
-                            👎
-                        </button>
-                        <span id="feedback-message" class="text-sm ml-4"></span>
-                    </div>
-                `;
-                
-                // Add raw response in collapsible section
-                resultHTML += `
-                    <details class="collapse bg-base-200">
-                        <summary class="collapse-title font-medium">Raw Response</summary>
-                        <div class="collapse-content">
-                            <pre class="text-xs whitespace-pre-wrap">${result.raw_response}</pre>
-                        </div>
-                    </details>
-                `;
-                
-                // Update the container
-                singleResult.innerHTML = resultHTML;
-                
-                // Save raw response for copy button
-                rawResponseText = result.raw_response;
-            }
-            
-            // Function to display batch results as a DaisyUI carousel
-            function displayBatchCarousel(batchResult) {
-                console.log("Displaying batch carousel for", batchResult.results.length, "images");
-                const batchResultsContainer = document.getElementById('batch-results');
-                
-                // Clear the container
-                batchResultsContainer.innerHTML = '';
-                
-                // Create carousel slides
-                batchResult.results.forEach((result, index) => {
-                    // Determine confidence class
-                    let confidenceClass = 'badge-warning';
-                    if (result.confidence === 'High') {
-                        confidenceClass = 'badge-success';
-                    } else if (result.confidence === 'Low') {
-                        confidenceClass = 'badge-error';
-                    }
-                    
-                    // Create a unique ID for the slide
-                    const slideId = `slide-${index + 1}`;
-                    
-                    // Create the carousel item - using DaisyUI carousel
-                    const carouselItem = document.createElement('div');
-                    carouselItem.id = slideId;
-                    carouselItem.className = 'carousel-item relative w-full';
-                    
-                    // Create the content for this slide
-                    carouselItem.innerHTML = `
-                        <div class="w-full px-4 py-6 bg-base-200 rounded-lg flex flex-col items-center">
-                            <div class="w-full max-w-3xl mx-auto">
-                                <div class="flex justify-between items-center mb-4">
-                                    <h3 class="text-lg font-medium">Result ${index + 1} of ${batchResult.results.length}</h3>
-                                    <span class="badge ${confidenceClass}">Confidence: ${result.confidence}</span>
-                                </div>
-                                
-                                <h4 class="text-xl font-bold mb-2">${result.category}</h4>
-                                <p class="mb-4">${result.description}</p>
-                                
-                                <!-- Additional details if available -->
-                                <div class="mb-4">
-                                    ${Object.entries(result.details || {})
-                                        .filter(([key]) => !['Main Category', 'Confidence', 'Description'].includes(key))
-                                        .map(([key, value]) => `
-                                            <div class="mb-2">
-                                                <span class="font-semibold">${key}:</span>
-                                                <span>${value}</span>
-                                            </div>
-                                        `).join('')
-                                    }
-                                </div>
-                                
-                                <!-- Feedback buttons -->
-                                <div class="flex items-center mt-4">
-                                    <span class="text-sm mr-2">Rate this classification:</span>
-                                    <button class="btn btn-outline btn-sm mr-2" id="thumbs-up-button-${index}" onclick="provideFeedback('${result.id}', 'positive', 'thumbs-up-button-${index}', 'thumbs-down-button-${index}', 'feedback-message-${index}')">
-                                        👍
-                                    </button>
-                                    <button class="btn btn-outline btn-sm" id="thumbs-down-button-${index}" onclick="provideFeedback('${result.id}', 'negative', 'thumbs-up-button-${index}', 'thumbs-down-button-${index}', 'feedback-message-${index}')">
-                                        👎
-                                    </button>
-                                    <span id="feedback-message-${index}" class="text-sm ml-4"></span>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <!-- Carousel navigation buttons -->
-                        <div class="absolute left-5 right-5 top-1/2 flex -translate-y-1/2 transform justify-between">
-                            <a href="#slide-${index === 0 ? batchResult.results.length : index}" class="btn btn-circle">❮</a>
-                            <a href="#slide-${index === batchResult.results.length - 1 ? 1 : index + 2}" class="btn btn-circle">❯</a>
-                        </div>
-                    `;
-                    
-                    // Add this slide to the carousel
-                    batchResultsContainer.appendChild(carouselItem);
-                });
-                
-                // Add carousel indicators at the bottom
-                const indicatorsContainer = document.createElement('div');
-                indicatorsContainer.className = 'flex justify-center w-full py-2 gap-2 mt-4';
-                
-                batchResult.results.forEach((_, index) => {
-                    const btnIndicator = document.createElement('a');
-                    btnIndicator.href = `#slide-${index + 1}`;
-                    btnIndicator.className = 'btn btn-xs';
-                    btnIndicator.textContent = (index + 1).toString();
-                    indicatorsContainer.appendChild(btnIndicator);
-                });
-                
-                batchResultsContainer.appendChild(indicatorsContainer);
-                
-                // Show the carousel
-                batchResultsContainer.classList.remove('hidden');
-                
-                // Save raw response for copy button
-                rawResponseText = batchResult.raw_response;
-            }
-            
-            // Global function for providing feedback
-            window.provideFeedback = function(resultId, feedbackType, upButtonId, downButtonId, messageId) {
-                console.log("Providing feedback:", feedbackType, "for result:", resultId);
-                
-                // Get button elements
-                const upButton = document.getElementById(upButtonId || 'thumbs-up-button');
-                const downButton = document.getElementById(downButtonId || 'thumbs-down-button');
-                const messageElement = document.getElementById(messageId || 'feedback-message');
-                
-                if (!upButton || !downButton) {
-                    console.error("Feedback buttons not found");
-                    return;
-                }
-                
-                // Update button UI state
-                if (feedbackType === 'positive') {
-                    upButton.classList.add('btn-success', 'btn-active');
-                    downButton.classList.remove('btn-error', 'btn-active');
-                } else {
-                    upButton.classList.remove('btn-success', 'btn-active');
-                    downButton.classList.add('btn-error', 'btn-active');
-                }
-                
-                // Show sending message
-                if (messageElement) {
-                    messageElement.textContent = 'Saving feedback...';
-                }
-                
-                // Send feedback to server
-                fetch('/api/feedback', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        id: resultId,
-                        feedback: feedbackType
-                    })
-                })
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error('Failed to save feedback');
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    console.log('Feedback saved successfully:', data);
-                    if (messageElement) {
-                        messageElement.textContent = 'Feedback saved!';
-                        
-                        // Clear message after a delay
-                        setTimeout(() => {
-                            messageElement.textContent = '';
-                        }, 3000);
-                    }
-                })
-                .catch(error => {
-                    console.error('Error saving feedback:', error);
-                    if (messageElement) {
-                        messageElement.textContent = 'Error saving feedback.';
-                    }
-                    
-                    // Reset buttons 
-                    upButton.classList.remove('btn-success', 'btn-active');
-                    downButton.classList.remove('btn-error', 'btn-active');
-                });
-            };
-        });
-        """)
-        
-        # Add enhanced styles for the carousel and RAG context display
-        enhanced_styles = Style("""
-        /* DaisyUI carousel improvements */
-        .carousel {
-            background: var(--color-base-200);
-            border-radius: 0.5rem;
-        }
-        
-        .carousel-item {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-        }
-        
-        /* Batch previews styling */
-        .batch-previews {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin: 15px 0;
-        }
-        
-        .preview-item {
-            position: relative;
-            width: 80px;
-            height: 80px;
-        }
-        
-        .preview-img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            border-radius: 0.5rem;
-            border: 2px solid var(--color-base-300);
-        }
-        
-        .remove-btn {
-            position: absolute;
-            top: -8px;
-            right: -8px;
-            background: var(--color-error);
-            color: white;
-            border-radius: 50%;
-            width: 20px;
-            height: 20px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 14px;
-            cursor: pointer;
-        }
-        
-        /* RAG context styling */
-        #rag-context-display {
-            max-height: 500px;
-            overflow-y: auto;
-        }
-        
-        /* Steps styling improvements */
-        .steps-horizontal .step {
-            min-width: 100px;
-        }
-        
-        .steps-horizontal {
-            overflow-x: auto;
-        }
-        
-        /* Responsive layout */
-        @media (min-width: 768px) {
-            #results-content, #rag-context-section {
-                max-height: none;
-                overflow-y: visible;
-            }
-        }
-        """)
-        
         return Title("Insect Classifier"), Main(
-            form_script,
-            enhanced_styles,
             Div(
                 H1("Insect Classification App", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
                 P("Powered by Claude's Vision AI with RAG", cls="text-center mb-8 text-base-content/70"),
@@ -5371,9 +4913,9 @@ def serve():
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
-    
-    # Return the FastHTML app
+            # Return the FastHTML app
     return fasthtml_app
+
 
 # When running locally
 if __name__ == "__main__":
